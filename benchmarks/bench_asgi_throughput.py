@@ -1,10 +1,13 @@
 import asyncio
 import hashlib
 import re
+import shutil
 import subprocess
 import threading
 import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
+from urllib.request import urlopen
 
 from gsyncio.asgi import GsyncioASGIWorker
 from gsyncio.pool import EventLoopThreadPool
@@ -53,10 +56,24 @@ async def fastapi_demo_app(scope, receive, send):
     )
 
 
-async def benchmark_client_ab(port: int, total_requests: int, concurrency: int):
-    """Use Apache Bench (ab) as the load testing client for accurate throughput."""
-    url = f"http://127.0.0.1:{port}/api/compute"
+def _http_get(url: str) -> int:
+    """One GET request; returns the HTTP status code (0 if the request failed).
 
+    The body is consumed before closing: leaving it unread makes close() send
+    an RST (macOS closes-with-unread-data), and the freed port can then be
+    reused by a fresh connection while the server is still tearing down the
+    old one — that race surfaces as spurious ConnectionResetErrors (~0.2%).
+    """
+    try:
+        with urlopen(url, timeout=30) as resp:
+            resp.read()
+            return resp.status
+    except Exception:
+        return 0
+
+
+def _benchmark_with_ab(url: str, total_requests: int, concurrency: int) -> tuple[float, float, int]:
+    """Use Apache Bench (ab) as the load testing client for accurate throughput."""
     # Warmup
     subprocess.run(  # noqa: ASYNC221
         ["ab", "-n", "50", "-c", "10", url],
@@ -99,6 +116,45 @@ async def benchmark_client_ab(port: int, total_requests: int, concurrency: int):
     return elapsed, qps, succ
 
 
+def _benchmark_with_python(
+    url: str, total_requests: int, concurrency: int
+) -> tuple[float, float, int]:
+    """Fallback load client for platforms without `ab` (e.g. Windows).
+
+    A thread pool of plain urllib requests keeps the benchmark dependency-free.
+    QPS here is not directly comparable to `ab`: no keep-alive and Python-side
+    overhead make the absolute numbers lower. The script only relies on the
+    ratio between its two phases (1-thread vs N-thread), which stays valid.
+    """
+
+    def run_batch(n: int, workers: int) -> int:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            statuses = list(pool.map(_http_get, [url] * n))
+        return sum(1 for s in statuses if s == 200)
+
+    run_batch(50, 10)  # warmup, mirrors the `ab` warmup above
+
+    start = time.perf_counter()
+    succ = run_batch(total_requests, concurrency)
+    elapsed = time.perf_counter() - start
+
+    return elapsed, total_requests / elapsed, succ
+
+
+async def benchmark_client(
+    port: int, total_requests: int, concurrency: int
+) -> tuple[float, float, int]:
+    """Load-test the server, preferring `ab` when it is installed.
+
+    Windows ships neither `ab` nor apache2-utils, so fall back to a stdlib
+    Python client there instead of failing with FileNotFoundError.
+    """
+    url = f"http://127.0.0.1:{port}/api/compute"
+    if shutil.which("ab") is not None:
+        return _benchmark_with_ab(url, total_requests, concurrency)
+    return _benchmark_with_python(url, total_requests, concurrency)
+
+
 async def main():
     total_requests = 500
     concurrency = 50
@@ -115,9 +171,7 @@ async def main():
         await worker.start()
 
         print("\n[1/2] Benchmarking FastAPI App on Single Thread Worker...")
-        elapsed_1, qps_1, succ_1 = await benchmark_client_ab(
-            worker.port, total_requests, concurrency
-        )
+        elapsed_1, qps_1, succ_1 = await benchmark_client(worker.port, total_requests, concurrency)
         print(
             f"  ➜ 1-Thread Elapsed: {elapsed_1:.4f} s | QPS: {qps_1:.2f} req/s (Success: {succ_1}/{total_requests})"
         )
@@ -131,9 +185,7 @@ async def main():
 
         print("\n[2/2] Benchmarking FastAPI App on 4-Thread Gsyncio ASGI Worker Pool...")
         thread_counter.clear()
-        elapsed_4, qps_4, succ_4 = await benchmark_client_ab(
-            worker.port, total_requests, concurrency
-        )
+        elapsed_4, qps_4, succ_4 = await benchmark_client(worker.port, total_requests, concurrency)
         print(
             f"  ➜ 4-Thread Elapsed: {elapsed_4:.4f} s | QPS: {qps_4:.2f} req/s (Success: {succ_4}/{total_requests})"
         )

@@ -21,6 +21,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **AGENTS.md**: root-directory quick-reference table and 8 mandatory rules
   before touching concurrency code (reproduction test required for bugs,
   no GitHub Actions debugging, request-before-code / green-before-merge).
+- **README Live Demo section**: points to
+  [gsyncio-fastapi-demo](https://github.com/hankaihong1/gsyncio-fastapi-demo),
+  a real FastAPI app served directly by `GsyncioASGIWorker` (no uvicorn)
+  whose page doubles as a live dashboard of `EventLoopThreadPool` metrics.
+  Added to both the English and Chinese README mirrors.
 
 ### Removed
 - **Root-directory cleanup**: dropped the unreferenced `test_build.sh` (a
@@ -63,6 +68,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   but their handlers never resumed, hanging clients (e.g. `httpx` GET) forever.
   macOS/Linux keep the multi-acceptor herd (Selector loops support shared-fd
   read registration).
+- **Windows benchmark compatibility** (`benchmarks/bench_asgi_throughput.py`):
+  the ASGI throughput benchmark now prefers `ab` when installed and falls
+  back to a stdlib-only Python client (urllib + `ThreadPoolExecutor`) when
+  it is not — `ab` ships with neither Windows nor apache2-utils equivalents,
+  so the script previously crashed with `FileNotFoundError` on Windows. The
+  fallback client also consumes the response body before closing; leaving it
+  unread made `close()` send an RST (macOS closes-with-unread-data), and the
+  freed port could then be reused while the server was still tearing down the
+  old socket — a race surfacing as ~0.2% spurious `ConnectionResetError`s in
+  the first wave of requests after warmup.
+- **ASGI responses now carry a correct Content-Length** (`asgi.py`): the
+  worker buffers the response until the final body message and emits
+  `Content-Length`, instead of close-delimited responses that rule out
+  keep-alive and force clients to read-to-EOF. Reason phrases now come from
+  `http.HTTPStatus` rather than a hardcoded `"OK"` (`HTTP/1.1 404 OK` is
+  now `HTTP/1.1 404 Not Found`).
+- **Server shutdown no longer orphans in-flight connections** (`server.py`):
+  `ConnectionPinningServer.close()` now cancels tracked connection-handler
+  tasks, round-tripping each worker loop so the cancellations land before
+  the pool stops — the `"Task was destroyed but it is pending!"` warnings
+  at shutdown are gone.
 
 ### Changed
 - **CI: docs-only changes skip the heavy matrix**: a `changes` job
