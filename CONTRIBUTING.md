@@ -186,6 +186,11 @@ uv run pytest
   checks pass (lint, type checks, tests). A red or incomplete PR is never
   merged; if a check fails, fix it in follow-up commits and wait for the
   checks to go green before requesting merge.
+- **Docs-only exception**: PRs touching only `*.md` files or `docs/**` skip
+  the heavy CI matrix — the `Docs Drift Check` job runs `tests/test_docs.py`
+  (EN/ZH mirror parity, code-block syntax, API coverage) instead. The
+  maintainer reviews the diff and merges once that check is green; there is
+  no need to run the full suite for documentation-only changes.
 - Keep PRs focused: one logical change per PR, with a clear title and a
   description of *what* and *why*.
 - **Label the PR** (`feature` / `fix` / `docs` / `chore` / `breaking`):

@@ -112,6 +112,12 @@ searches, never modify.
   file an issue/request first and wait for approval before writing code.
   A PR is merged only after all required CI checks pass (lint, type checks,
   tests) — never merge a red PR, and never ask a maintainer to.
+- **Docs-only exception to green-before-merge**: changes touching only
+  `*.md` files or `docs/**` skip the heavy lint/build/test matrix — the
+  `Docs Drift Check` job runs `tests/test_docs.py` (EN/ZH parity, code-block
+  syntax, API coverage) and the project lead reviews the diff before
+  merging or pushing. Anything else (code, config, CI files) runs the full
+  suite; a mixed change runs both gates.
 - **GitHub Actions is for CI, not debugging**: never use workflow runs as a
   debugging tool — no debug commits, no temporary diagnostic workflows, no
   bisecting platform-specific failures on remote runners (they pollute the
@@ -205,7 +211,9 @@ hold regardless:
    first; never push to trigger remote runs without explicit permission.
 8. **Request before code, green before merge** — file an issue/request and
    wait for approval before writing non-trivial code; a PR merges only after
-   all required CI checks pass.
+   all required CI checks pass. Exception: docs-only changes (`*.md`,
+   `docs/**`) skip the heavy matrix — `Docs Drift Check` runs
+   `tests/test_docs.py` and the project lead reviews the diff before merge.
 
 ---
 
