@@ -1,0 +1,195 @@
+"""Connection pinning TCP server."""
+
+from __future__ import annotations
+
+import asyncio
+import socket
+import sys
+from typing import TYPE_CHECKING, Any, Self
+
+if TYPE_CHECKING:
+    import concurrent.futures
+    import types
+    from collections.abc import Callable
+
+    from gsyncio.pool import EventLoopThreadPool
+
+
+class ConnectionPinningServer:
+    """TCP Server that pins incoming client connections to dedicated Worker Event Loop threads.
+
+    :param pool:
+        The `EventLoopThreadPool` instance to dispatch connections to.
+
+    :param host:
+        Host address to bind to. Defaults to `"127.0.0.1"`.
+    :type host: str
+
+    :param port:
+        Port number to listen on. Defaults to 0 (ephemeral port).
+    :type port: int
+
+    :param handler:
+        Optional connection handler coroutine function `(reader, writer)`.
+    :type handler: callable or None
+
+    """
+
+    port: int
+
+    def __init__(
+        self,
+        pool: EventLoopThreadPool,
+        host: str = "127.0.0.1",
+        port: int = 0,
+        handler: Callable[[asyncio.StreamReader, asyncio.StreamWriter], Any] | None = None,
+    ) -> None:
+        self.pool = pool
+        self.host = host
+        self.port = port
+        self.handler = handler
+        self._server_socket: socket.socket | None = None
+        self._accept_tasks: list[
+            concurrent.futures.Future[Any]
+        ] = []  # List of concurrent.futures.Future
+        self._running = False
+
+    @property
+    def is_running(self) -> bool:
+        """Return whether the server is running.
+
+        :returns: ``True`` if active, ``False`` otherwise.
+        :rtype: :class:`bool`
+
+        """
+        return self._running
+
+    def __repr__(self) -> str:
+        return (
+            f"<ConnectionPinningServer host={self.host} port={self.port} running={self.is_running}>"
+        )
+
+    async def start(
+        self,
+        handler: Callable[[asyncio.StreamReader, asyncio.StreamWriter], Any] | None = None,
+    ) -> None:
+        """Start listening for client connections.
+
+        :param handler:
+            Optional connection handler function `(reader, writer)`.
+
+        """
+        if handler is not None:
+            self.handler = handler
+
+        async def dummy_h(_r: asyncio.StreamReader, _w: asyncio.StreamWriter) -> None:
+            pass
+
+        active_handler = self.handler or dummy_h
+
+        # Using Shared Acceptor (Thundering Herd) architecture
+        # Bind one socket, and pass it to all worker loops to accept concurrently.
+        # This provides perfect cross-platform load balancing (unlike macOS SO_REUSEPORT bias).
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((self.host, self.port))
+        sock.listen(128)
+        sock.setblocking(False)
+
+        self.port = sock.getsockname()[1]
+        self._server_socket = sock
+        self._running = True
+        self._accept_tasks = []
+
+        # 多 acceptor 共享同一 listener socket（Thundering Herd）：
+        # macOS/Linux 的 Selector 支持多个 loop 对同一 fd 做 read 监听，
+        # accept 竞争由内核裁决（EWOULDBLOCK 重试）。但 Windows 的
+        # Proactor 里一个 socket 只能关联**一个** IOCP（CreateIoCompletionPort
+        # 对已关联句柄是 no-op），第二个 loop 的 AcceptEx 完成通知会投递到
+        # 第一个 loop 的 IOCP——跨线程完成 future 的调度有竞态：连接被 accept
+        # 但 handler 协程可能永不恢复，客户端连接挂起（实测 Windows 上
+        # httpx 请求永久挂起）。所以 Windows 上只启动一个 acceptor。
+        acceptor_count = 1 if sys.platform == "win32" else self.pool.num_threads
+        for i in range(acceptor_count):
+            fut = asyncio.run_coroutine_threadsafe(
+                self._worker_accept_loop(sock, active_handler), self.pool._get_loop(i)
+            )
+            self._accept_tasks.append(fut)
+
+    async def _worker_accept_loop(
+        self,
+        shared_sock: socket.socket,
+        handler: Callable[[asyncio.StreamReader, asyncio.StreamWriter], Any],
+    ) -> None:
+        """Dedicated acceptor running on a worker thread sharing the main socket."""
+        loop = asyncio.get_running_loop()
+        while self._running:
+            try:
+                client_sock, _addr = await loop.sock_accept(shared_sock)
+                client_sock.setblocking(False)
+                # Pure local execution on the worker's loop! Zero IPC!
+                loop.create_task(self._run_pinned_connection(client_sock, loop, handler))
+            except asyncio.CancelledError:
+                break
+            except (OSError, RuntimeError):
+                # EWOULDBLOCK / EAGAIN are handled internally by asyncio,
+                # so if we hit OSError here it's likely a real error or thundering herd race condition
+                await asyncio.sleep(0.001)
+
+    async def _run_pinned_connection(
+        self,
+        client_sock: socket.socket,
+        target_loop: asyncio.AbstractEventLoop,
+        handler: Callable[[asyncio.StreamReader, asyncio.StreamWriter], Any],
+    ) -> None:
+        """Run connection handler pinned on target_loop with silent disconnect handling."""
+        reader = asyncio.StreamReader(loop=target_loop)
+        protocol = asyncio.StreamReaderProtocol(reader, loop=target_loop)
+        transport: asyncio.BaseTransport | None = None
+
+        try:
+            transport, _ = await target_loop.connect_accepted_socket(lambda: protocol, client_sock)
+            writer = asyncio.StreamWriter(transport, protocol, reader, target_loop)
+
+            await handler(reader, writer)
+        except (
+            ConnectionResetError,
+            BrokenPipeError,
+            asyncio.IncompleteReadError,
+            OSError,
+        ):
+            pass
+        finally:
+            if transport and not transport.is_closing():
+                try:
+                    transport.close()
+                except OSError:
+                    pass
+
+    async def close(self) -> None:
+        """Stop server listening and close sockets."""
+        self._running = False
+
+        if getattr(self, "_accept_tasks", None):
+            for fut in self._accept_tasks:
+                fut.cancel()
+            self._accept_tasks.clear()
+
+        if getattr(self, "_server_socket", None) and self._server_socket:
+            try:
+                self._server_socket.close()
+            except OSError:
+                pass
+
+    async def __aenter__(self) -> Self:
+        if not self._running:
+            await self.start()
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: types.TracebackType | None,
+    ) -> None:
+        await self.close()

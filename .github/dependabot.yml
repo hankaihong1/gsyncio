@@ -1,0 +1,21 @@
+# Dependabot configuration for gsyncio
+#
+# Note: The pip ecosystem is intentionally NOT configured here.
+# All Python dependencies live in PEP 735 [dependency-groups] (see
+# pyproject.toml), which Dependabot's pip ecosystem does not support.
+# Adding a pip entry would silently do nothing, so it is deferred until
+# Dependabot gains PEP 735 support.
+
+version: 2
+updates:
+  # Rust workspace (gsyncio-core engine): pyo3, flume, parking_lot
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      rust-deps:
+        patterns:
+          - "pyo3"
+          - "flume"
+          - "parking_lot"

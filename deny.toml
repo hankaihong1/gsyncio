@@ -1,0 +1,14 @@
+[advisories]
+db-urls = ["https://github.com/RustSec/advisory-db"]
+db-path = "~/.cargo/advisory-dbs"
+yanked = "deny"
+unmaintained = "all"
+unsound = "workspace"
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "ISC",
+    "MPL-2.0",
+]

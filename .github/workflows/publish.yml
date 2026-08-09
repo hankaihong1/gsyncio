@@ -1,0 +1,264 @@
+name: Publish
+
+# 触发方式：正式发布 + 手动重跑。
+# 手动重跑由 publish 步骤的 skip-existing 兜底，不会撞同名文件（PyPI "File already exists"）。
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # ───────────────────────────── Linux ─────────────────────────────
+  linux:
+    name: Build Linux wheels (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v4
+
+      # 宿主只需要 uv（跑 uvx twine check）；构建在 manylinux 容器内完成，宿主 python 无关。
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Build wheels (manylinux 2_17 container)
+        uses: PyO3/maturin-action@v1
+        with:
+          # 固定 maturin 版本：uv 生产 pin 同款（v1.14.1），避免 auto 拉新版本引入隐式变化。
+          maturin-version: v1.14.1
+          target: ${{ matrix.target }}
+          # 显式 manylinux 2_17 替代 auto：
+          #   auto 时 action 不给 maturin 传 --manylinux，平台标签由 maturin 隐式计算；
+          #   显式 2_17 强制按 glibc 2.17 基线审计，不达标构建即失败（而非上传后被 PyPI 拒）。
+          #   x86_64  -> quay.io/pypa/manylinux2014_x86_64
+          #   aarch64 -> ghcr.io/rust-cross/manylinux2014-cross:aarch64（基于 pypa 镜像，自带 3.14t）
+          manylinux: 2_17
+          args: >-
+            --release
+            --locked
+            --out dist
+            --interpreter 3.14 3.14t
+            --compatibility pypi
+          # --locked：Cargo.lock 已提交，锁定依赖版本。
+          # --interpreter 3.14 3.14t：manylinux 容器自带 cp314/cp314t 且已在 PATH，无需任何 hack。
+          # --compatibility pypi：上传前预检，只允许 PyPI 接受的标签。
+          # 不再传 --features extension-module：Cargo.toml default feature 与 pyproject 已保证。
+
+      # 元数据预检（README 渲染、classifier 等），坏元数据在构建 job 就失败。
+      - name: Check wheel metadata
+        run: uvx twine check --strict dist/*
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-linux-${{ matrix.target }}
+          path: dist
+
+  # ───────────────────────────── macOS ─────────────────────────────
+  macos:
+    name: Build macOS wheels (${{ matrix.target }})
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v4
+
+      # 分架构替代 universal2：macos-latest 是 arm64，aarch64 原生构建、x86_64 跨编译。
+      # 多行安装 3.14 + 3.14t：macOS 上共存没有问题（Windows 才有同 minor 共存限制）。
+      - name: Set up Python 3.14 & 3.14t
+        uses: actions/setup-python@v6
+        with:
+          python-version: |
+            3.14
+            3.14t
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          maturin-version: v1.14.1
+          target: ${{ matrix.target }}
+          args: >-
+            --release
+            --locked
+            --out dist
+            --interpreter 3.14 3.14t
+            --compatibility pypi
+          # manylinux 输入在非 Linux 平台被 action 忽略；--compatibility pypi 对所有平台生效。
+
+      - name: Check wheel metadata
+        run: uvx twine check --strict dist/*
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-macos-${{ matrix.target }}
+          path: dist
+
+  # ───────────────────────────── Windows ─────────────────────────────
+  windows:
+    name: Build Windows wheels (Python ${{ matrix.python-version }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.14 与 3.14t 必须分 job：Windows 上同一 minor 的常规+free-threaded 解释器
+        # 共存于一个 setup-python 步骤会失败（python/cpython#127294）。
+        python-version: ["3.14", "3.14t"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          architecture: x64
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          maturin-version: v1.14.1
+          target: x86_64
+          args: >-
+            --release
+            --locked
+            --out dist
+            --interpreter ${{ matrix.python-version }}
+            --compatibility pypi
+
+      - name: Check wheel metadata
+        run: uvx twine check --strict dist/*
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-windows-${{ matrix.python-version }}
+          path: dist
+
+  # ───────────────────────────── sdist ─────────────────────────────
+  sdist:
+    name: Build source distribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+          # 宿主构建需要显式 rust-toolchain（action 文档要求）。
+          rust-toolchain: stable
+
+      - name: Check sdist metadata
+        run: uvx twine check --strict dist/*
+
+      - name: Upload sdist
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-sdist
+          path: dist
+
+  # ───────────────────────────── wheel 实测 ─────────────────────────────
+  # 构建产物先在真实 runner 上安装并跑测试套件，通过才允许发布
+  # （pydantic-core test-builds-os / uv 构建后冒烟测试同款思路）。
+  test_wheels:
+    name: Test wheel on ${{ matrix.os }} (Python ${{ matrix.python-version }})
+    needs: [linux, macos, windows]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.14", "3.14t"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv & Python ${{ matrix.python-version }}
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          python-version: ${{ matrix.python-version }}
+
+      # 装依赖（含项目 editable）；下一步用 wheel 强制覆盖它。
+      - name: Install test dependencies
+        run: uv sync --group dev
+
+      - name: Download built wheels
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
+
+      # 只从 dist 装、不碰 PyPI；pip 自动选匹配本机 arch/python 的 wheel，
+      # 某平台缺对应 wheel 时此步失败 → 缺口在上传前暴露。
+      - name: Install wheel (no index)
+        run: uv pip install gsyncio --no-index --no-deps --find-links dist --force-reinstall
+
+      # 冒烟：直接 import 扩展模块，跨编译/容器构建的坏产物在此暴露。
+      - name: Smoke test (extension import)
+        run: uv run python -c "import gsyncio._gsyncio_core as m; import gsyncio; assert gsyncio.__version__; print('ok:', m.__file__)"
+
+      # 完整测试套件跑在 wheel 上（addopts 自带 not slow）。
+      # free_threading 测试不再排除：CancelScope / CapacityLimiter 的并发
+      # bug 已修复，真 3.14t 上这 4 个测试现在必须真实运行并通过。
+      - name: Run test suite against installed wheel
+        run: uv run pytest -m "not slow"
+
+  # ───────────────────────────── 发布 ─────────────────────────────
+  publish:
+    name: Publish to PyPI
+    needs: [test_wheels, sdist]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+        # 版本校验需要读 pyproject.toml。
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
+
+      # tag 与 pyproject 版本一致性校验；仅 tag 触发时执行，手动 dispatch 以 pyproject 为准。
+      - name: Check version matches tag (release only)
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          PKG_VERSION="$(uv run python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          test "$TAG_VERSION" = "$PKG_VERSION" || { echo "Version mismatch: tag=$TAG_VERSION, pyproject=$PKG_VERSION"; exit 1; }
+
+      # 逐 wheel 验证 zip 完整性。
+      - name: Verify wheel integrity (zip check)
+        run: for whl in dist/*.whl; do unzip -qt "$whl"; done
+
+      - name: Publish package to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # 幂等重试：部分失败后重跑时，已上传的同名文件跳过而非报错。
+          # 构建期已有 --compatibility pypi + twine check + wheel 实测三道闸，
+          # skip-existing 只掩盖"文件名已存在"这一类无害冲突。
+          skip-existing: true

@@ -1,0 +1,593 @@
+import asyncio
+import threading
+
+import pytest
+
+from gsyncio import (
+    AsyncChannel,
+    AsyncContext,
+    AsyncOnce,
+    AsyncRWMutex,
+    AsyncWaitGroup,
+    ChannelClosedError,
+    FastChannel,
+    GsyncioError,
+    create_pool,
+    run_in_pool,
+)
+from gsyncio.exceptions import ThreadPoolClosedError
+from gsyncio.pool import EventLoopThreadPool, PoolOptions
+from gsyncio.testing import wait_all_tasks_blocked
+
+
+@pytest.mark.asyncio
+async def test_pool_valid_basic_submit():
+    """Valid 1: Basic coroutine dispatch and return value"""
+
+    async def add(a, b):
+        return a + b
+
+    async with EventLoopThreadPool(num_threads=2) as pool:
+        fut = pool.submit(add, 3, 5)
+        res = await fut
+        assert res == 8
+
+
+@pytest.mark.asyncio
+async def test_pool_valid_round_robin_thread_distribution():
+    """Valid 2: Round-Robin thread distribution verification"""
+
+    async def get_thread_id():
+        return threading.get_ident()
+
+    num_threads = 4
+    async with EventLoopThreadPool(num_threads=num_threads) as pool:
+        # Explicitly test multi-thread distribution and work-stealing
+        futs = [pool.submit(get_thread_id, loop=i % num_threads) for i in range(num_threads * 2)]
+        tids = [await f for f in futs]
+
+        unique_threads = set(tids)
+        assert len(unique_threads) == num_threads
+        assert threading.get_ident() not in unique_threads
+
+
+@pytest.mark.asyncio
+async def test_pool_valid_context_manager_lifecycle():
+    """Valid 3: Context manager lifecycle"""
+    pool = EventLoopThreadPool(num_threads=2)
+    assert not pool.is_running
+    async with pool:
+        assert pool.is_running
+    assert not pool.is_running
+
+
+@pytest.mark.asyncio
+async def test_pool_boundary_single_thread():
+    """Boundary 1: num_threads=1 boundary handling"""
+
+    async def echo(val):
+        return val
+
+    async with EventLoopThreadPool(num_threads=1) as pool:
+        fut = pool.submit(echo, "single")
+        assert await fut == "single"
+
+
+@pytest.mark.asyncio
+async def test_pool_boundary_high_concurrency_submit():
+    """Boundary 2: High-concurrency coroutine dispatch"""
+
+    async def square(x):
+        await asyncio.sleep(0.001)
+        return x * x
+
+    count = 100
+    async with EventLoopThreadPool(num_threads=4) as pool:
+        futs = [pool.submit(square, i) for i in range(count)]
+        results = await asyncio.gather(*futs)
+        assert results == [i * i for i in range(count)]
+
+
+@pytest.mark.asyncio
+async def test_pool_boundary_async_io_inside_coro():
+    """Boundary 3: Dispatched coroutine internally suspends via asyncio.sleep"""
+
+    async def delayed_val(v):
+        await asyncio.sleep(0.01)
+        return v * 2
+
+    async with EventLoopThreadPool(num_threads=2) as pool:
+        res = await pool.submit(delayed_val, 21)
+        assert res == 42
+
+
+@pytest.mark.asyncio
+async def test_pool_error_coro_exception_propagation():
+    """Error 1: Exception from cross-thread coroutine is correctly propagated and caught"""
+
+    async def failing_coro():
+        raise ValueError("custom error inside thread loop")
+
+    async with EventLoopThreadPool(num_threads=2) as pool:
+        fut = pool.submit(failing_coro)
+        with pytest.raises(ValueError, match="custom error inside thread loop"):
+            await fut
+
+
+@pytest.mark.asyncio
+async def test_pool_error_submit_after_close():
+    """Error 2: Submitting task after closing the thread pool raises RuntimeError"""
+
+    async def dummy():
+        return 1
+
+    pool = EventLoopThreadPool(num_threads=2)
+    await pool.start()
+    await pool.close()
+
+    with pytest.raises(RuntimeError, match="ThreadPool is not running"):
+        pool.submit(dummy)
+
+
+@pytest.mark.asyncio
+async def test_pool_error_invalid_num_threads():
+    """Error 3: Invalid thread count initialization raises ValueError"""
+    with pytest.raises(ValueError, match="num_threads must not be negative"):
+        EventLoopThreadPool(num_threads=-1)
+
+
+@pytest.mark.asyncio
+async def test_pool_race_close_vs_submit():
+    """Error 4: Concurrent close vs submit race condition must not leak raw RuntimeError (must be ThreadPoolClosedError)"""
+
+    async def dummy():
+        return 1
+
+    pool = EventLoopThreadPool(num_threads=4)
+    await pool.start()
+
+    leaked: list[RuntimeError] = []
+    stop = threading.Event()
+
+    async def submitter():
+        while not stop.is_set():
+            try:
+                pool.submit(dummy)
+            except ThreadPoolClosedError:
+                pass
+            except RuntimeError as exc:  # noqa: PERF203
+                leaked.append(exc)
+                return
+            await asyncio.sleep(0)
+
+    task = asyncio.create_task(submitter())
+    await pool.close()
+    stop.set()
+    await task
+
+    assert not leaked, f"submit() leaked raw RuntimeError under close race condition: {leaked}"
+
+
+@pytest.mark.asyncio
+async def test_create_pool_auto_starts():
+    """create_pool returns a pool that is already running."""
+    pool = await create_pool(num_threads=2)
+    try:
+        assert pool.is_running
+        assert pool.num_threads == 2
+    finally:
+        await pool.close()
+
+
+@pytest.mark.asyncio
+async def test_create_pool_custom_num_threads():
+    """create_pool with explicit num_threads creates correct number of workers."""
+    pool = await create_pool(num_threads=4)
+    try:
+        assert pool.num_threads == 4
+    finally:
+        await pool.close()
+
+
+@pytest.mark.asyncio
+async def test_create_pool_context_manager():
+    """create_pool works as an async context manager (auto-close on exit)."""
+    pool = await create_pool(num_threads=2)
+    async with pool:
+        assert pool.is_running
+        result = await pool.submit(asyncio.sleep, 0.001)
+        assert result is None
+    assert not pool.is_running
+
+
+@pytest.mark.asyncio
+async def test_pool_options_default_values():
+    """PoolOptions uses module-level defaults."""
+    opts = PoolOptions()
+    assert opts.num_threads == 0  # 0 = auto-detect
+    assert opts.loop_factory is None
+
+
+@pytest.mark.asyncio
+async def test_pool_options_num_threads_override():
+    """PoolOptions accepts a custom num_threads value."""
+    opts = PoolOptions(num_threads=8)
+    assert opts.num_threads == 8
+
+
+@pytest.mark.asyncio
+async def test_pool_options_loop_factory_override():
+    """PoolOptions accepts a custom loop_factory callable."""
+    opts = PoolOptions(loop_factory=asyncio.new_event_loop)
+    assert opts.loop_factory is asyncio.new_event_loop
+
+
+@pytest.mark.asyncio
+async def test_pool_metrics_and_pull_model_scheduling():
+    """Test thread pool metrics retrieval and normal task scheduling under Pull Model"""
+    async with EventLoopThreadPool(num_threads=2) as pool:
+        # 1. Verify get_metrics
+        metrics = pool.get_metrics()
+        assert metrics["thread_count"] == 2
+        assert len(metrics["completed_tasks"]) == 2
+        assert metrics["is_running"] is True
+
+        # 2. Normal task submission
+        async def work():
+            return 123
+
+        assert await pool.submit(work) == 123
+
+        # 3. Verify concurrent Pull Model
+        futs = [pool.submit(work) for _ in range(20)]
+        results = await asyncio.gather(*futs)
+        assert results == [123] * 20
+
+
+@pytest.mark.asyncio
+async def test_work_stealing_and_loop_pinning():
+    """Verify Pull Model work stealing and explicit submit(loop=...) binding capability"""
+    async with EventLoopThreadPool(num_threads=2) as pool:
+        # 1. Verify Work-Stealing global shared queue dispatch and execution
+        futs = [pool.submit(asyncio.sleep, 0.01) for _ in range(10)]
+        await asyncio.gather(*futs)
+
+        # 2. Verify explicit target Worker index binding
+        fut0 = pool.submit(asyncio.sleep, 0.01, loop=0)
+        fut1 = pool.submit(asyncio.sleep, 0.01, loop=1)
+
+        await asyncio.gather(fut0, fut1)
+
+        # 3. Verify out-of-range index raises ValueError
+        with pytest.raises(ValueError, match="out of range"):
+            pool.submit(print, "invalid", loop=99)
+
+        # 4. Verify explicit AbstractEventLoop instance binding
+        target_loop = pool._get_loop(1)
+        fut_target = pool.submit(asyncio.sleep, 0.01, loop=target_loop)
+        await fut_target
+
+        metrics = pool.get_metrics()
+        assert "completed_tasks" in metrics
+        assert metrics["thread_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_submit_group_all_succeed():
+    """Submit 3 tasks via pool.submit_group() — verify all complete with correct results."""
+
+    async def add(a: int, b: int) -> int:
+        return a + b
+
+    async def multiply(a: int, b: int) -> int:
+        return a * b
+
+    async def concat(a: str, b: str) -> str:
+        return a + b
+
+    async with EventLoopThreadPool(num_threads=2) as pool:
+        async with pool.submit_group() as group:
+            f1 = group.start_soon(add, 3, 5)
+            f2 = group.start_soon(multiply, 4, 7)
+            f3 = group.start_soon(concat, "hello", "world")
+
+        results = [await f1, await f2, await f3]
+        assert results == [8, 28, "helloworld"]
+
+
+@pytest.mark.asyncio
+async def test_submit_group_cancel_on_close():
+    """Close pool while a submit_group has slow tasks — verify futures are cancelled."""
+
+    async def slow_task(delay: float) -> str:
+        await asyncio.sleep(delay)
+        return "done"
+
+    pool = EventLoopThreadPool(num_threads=2)
+    await pool.start()
+
+    f1: asyncio.Future[str] | None = None
+    f2: asyncio.Future[str] | None = None
+
+    async def run_group() -> None:
+        nonlocal f1, f2
+        try:
+            async with pool.submit_group() as group:
+                f1 = group.start_soon(slow_task, 10.0)
+                f2 = group.start_soon(slow_task, 10.0)
+                # Block forever — pool.close() from another task will cancel the group.
+                await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            pass  # Expected: pool close cancels the hosting task.
+
+    group_task = asyncio.create_task(run_group())
+
+    # Give the group time to submit its tasks to workers.
+    await wait_all_tasks_blocked()
+
+    # Close the pool from outside the group — triggers cancel on all groups.
+    await pool.close()
+
+    await group_task
+
+    # Give call_soon_threadsafe callbacks time to settle on caller's loop.
+    await wait_all_tasks_blocked()
+
+    assert f1 is not None and f1.done()
+    assert f2 is not None and f2.done()
+
+
+@pytest.mark.asyncio
+async def test_pool_start_idempotent():
+    """pool.start() is a no-op when already running (line 250)."""
+    async with EventLoopThreadPool(num_threads=2) as pool:
+        await pool.start()  # pool is already running; should return immediately.
+
+
+@pytest.mark.asyncio
+async def test_pool_invalid_loop_targets():
+    """_resolve_target_worker raises ValueError for unmanaged loops and out-of-range indices,
+    and TypeError for invalid loop types (lines 360-362, 368-372)."""
+    async with EventLoopThreadPool(num_threads=2) as pool:
+        # Unmanaged AbstractEventLoop (the test's own loop)
+        with pytest.raises(ValueError, match="not managed"):
+            pool.submit(asyncio.sleep, 0, loop=asyncio.get_running_loop())
+
+        # Out-of-range worker index
+        with pytest.raises(ValueError, match="out of range"):
+            pool.submit(asyncio.sleep, 0, loop=99)
+
+        # Invalid type for loop parameter
+        with pytest.raises(TypeError, match="must be an AbstractEventLoop"):
+            pool.submit(asyncio.sleep, 0, loop="invalid")
+
+
+@pytest.mark.asyncio
+async def test_pool_submit_plain_values():
+    """submit() handles plain (non-coroutine, non-callable) values and
+    callables returning plain values (line 435, branch 432->437)."""
+    async with EventLoopThreadPool(num_threads=2) as pool:
+        # Plain value → covers line 435 (else branch of _execute_task)
+        result = await pool.submit(42)
+        assert result == 42
+
+        # Callable returning plain value → covers branch 432->437
+        def plain_func():
+            return 99
+
+        result = await pool.submit(plain_func)
+        assert result == 99
+
+
+@pytest.mark.asyncio
+async def test_pool_default_threads():
+    """pool.py line 94: num_threads=None triggers os.cpu_count() or 4 fallback."""
+    async with EventLoopThreadPool() as pool:
+        assert pool.num_threads > 0
+        result = await pool.submit(asyncio.sleep, 0.001)
+        assert result is None
+
+
+@pytest.mark.asyncio
+async def test_run_in_pool_basic_coroutine():
+    """run_in_pool executes a coroutine function and returns its result."""
+
+    async def add(a: int, b: int) -> int:
+        return a + b
+
+    result = await run_in_pool(add, 3, 5)
+    assert result == 8
+
+
+@pytest.mark.asyncio
+async def test_run_in_pool_with_args():
+    """run_in_pool passes positional and keyword args to the coroutine."""
+
+    async def echo(a: int, b: int, *, c: int = 0) -> tuple[int, int, int]:
+        return (a, b, c)
+
+    result = await run_in_pool(echo, 1, 2, c=3)
+    assert result == (1, 2, 3)
+
+
+@pytest.mark.asyncio
+async def test_run_in_pool_exception_propagation():
+    """run_in_pool propagates exceptions from the coroutine to the caller."""
+
+    async def failing() -> None:
+        raise ValueError("test error inside run_in_pool")
+
+    with pytest.raises(ValueError, match="test error inside run_in_pool"):
+        await run_in_pool(failing)
+
+
+@pytest.mark.asyncio
+async def test_resolve_target_worker_lock_concurrent():
+    """_resolve_target_worker holds self._lock during resolution.
+
+    Concurrent access from multiple threads must not crash or produce
+    inconsistent loop->index mappings.
+    """
+    pool = EventLoopThreadPool(num_threads=2)
+    await pool.start()
+
+    errors: list[Exception] = []
+    results: list[int] = []
+
+    def resolve_from_thread(idx: int) -> None:
+        try:
+            # Resolve a valid worker index — must not crash under lock.
+            info = pool._resolve_target_worker(idx)
+            if info is not None:
+                results.append(info[0])
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=resolve_from_thread, args=(i % 2,)) for i in range(10)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(errors) == 0, f"Unexpected errors: {errors}"
+    # All resolutions should have succeeded (pool is running, indices valid).
+    assert len(results) == 10
+
+    await pool.close()
+
+
+@pytest.mark.asyncio
+async def test_notify_all_workers_toctou():
+    """_notify_all_workers is safe when called concurrently with pool close.
+
+    The method captures loops/events under lock then calls
+    call_soon_threadsafe outside — must not raise AttributeError or
+    crash when close() clears the lists between capture and use.
+    """
+    pool = EventLoopThreadPool(num_threads=2)
+    await pool.start()
+
+    errors: list[Exception] = []
+
+    def hammer_notify() -> None:
+        try:
+            for _ in range(50):
+                pool._notify_all_workers()
+        except Exception as exc:
+            errors.append(exc)
+
+    t = threading.Thread(target=hammer_notify)
+    t.start()
+
+    # Close during hammering — exercises TOCTOU between list copy and loop access.
+    await pool.close()
+    t.join(timeout=5)
+
+    assert len(errors) == 0, f"TOCTOU errors: {errors}"
+
+
+@pytest.mark.asyncio
+async def test_repr_implementations():
+    """Verify friendly debug diagnostic output of __repr__ for core classes"""
+    async with EventLoopThreadPool(num_threads=2) as pool:
+        repr_pool = repr(pool)
+        assert "EventLoopThreadPool" in repr_pool
+        assert "threads=2" in repr_pool
+
+        # submit_daemon interface
+        fut = pool.submit_daemon(asyncio.sleep, 0.01)
+        await fut
+
+    ch = FastChannel()
+    assert "FastChannel" in repr(ch)
+
+    ach = AsyncChannel()
+    assert "AsyncChannel" in repr(ach)
+
+    ctx = AsyncContext()
+    assert "AsyncContext" in repr(ctx)
+
+    wg = AsyncWaitGroup()
+    assert "AsyncWaitGroup" in repr(wg)
+
+    once = AsyncOnce()
+    assert "AsyncOnce" in repr(once)
+
+    rw = AsyncRWMutex()
+    assert "AsyncRWMutex" in repr(rw)
+
+
+@pytest.mark.asyncio
+async def test_pool_closed_submission():
+    """Test exception on ThreadPool submission after close"""
+    pool = EventLoopThreadPool(num_threads=1)
+    await pool.start()
+    await pool.close()
+
+    assert not pool.is_running
+
+    with pytest.raises(ThreadPoolClosedError):
+        pool.submit(print, "hello")
+
+
+@pytest.mark.asyncio
+async def test_exception_hierarchy():
+    """Verify engineering standard 1: all gsyncio custom exceptions inherit from GsyncioError"""
+    assert issubclass(ChannelClosedError, GsyncioError)
+    assert issubclass(ThreadPoolClosedError, GsyncioError)
+
+
+@pytest.mark.asyncio
+async def test_pool_closed_error_type():
+    """Verify engineering standard 1b: submitting on a closed pool raises ThreadPoolClosedError"""
+    pool = EventLoopThreadPool(num_threads=1)
+    await pool.start()
+    metrics = pool.get_metrics()
+    assert "completed_tasks" in metrics
+    assert "active_tasks" in metrics
+    await pool.close()
+
+    async def dummy():
+        pass
+
+    with pytest.raises(ThreadPoolClosedError):
+        pool.submit(dummy)
+
+
+@pytest.mark.asyncio
+async def test_pool_closed_error_type_native_push_path():
+    """Verify engineering standard 1b: when native pool is closed (close race window), submit raises ThreadPoolClosedError, not leaking raw RuntimeError"""
+    pool = EventLoopThreadPool(num_threads=1)
+    await pool.start()
+
+    # Simulate close race window: _running is still True, but native pool already closed, push fails
+    assert pool._native_pool is not None
+    pool._native_pool.close()
+
+    async def dummy():
+        pass
+
+    with pytest.raises(ThreadPoolClosedError, match="ThreadPool is closed"):
+        pool.submit(dummy)
+    with pytest.raises(ThreadPoolClosedError, match="ThreadPool is closed"):
+        pool.submit(dummy, loop=0)
+
+    await pool.close()
+
+
+@pytest.mark.asyncio
+async def test_vulnerability_submit_coroutine_object():
+    """Vulnerability 2: Submit with an already-instantiated coroutine object should run normally instead of raising TypeError"""
+    async with EventLoopThreadPool(num_threads=2) as pool:
+
+        async def sample_coro(val):
+            await asyncio.sleep(0.01)
+            return val * 10
+
+        # Instantiate coroutine object
+        coro_obj = sample_coro(5)
+
+        # Directly submit coroutine object
+        fut = pool.submit(coro_obj)
+        res = await fut
+        assert res == 50

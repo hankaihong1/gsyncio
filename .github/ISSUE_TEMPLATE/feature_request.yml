@@ -1,0 +1,36 @@
+name: Feature Request
+description: Suggest an idea or enhancement for this project
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem statement
+      description: What problem are you trying to solve? Why is this feature needed?
+      placeholder: Describe the problem you are facing...
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: What should the feature do? How should it behave?
+      placeholder: Describe your proposed solution...
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What alternatives have you considered or tried?
+      placeholder: Describe any alternative approaches...
+    validations:
+      required: false
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Any other information, screenshots, or links that help explain the request.
+      placeholder: Add any additional context here...
+    validations:
+      required: false

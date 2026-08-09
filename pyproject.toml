@@ -1,0 +1,107 @@
+[project]
+name = "gsyncio"
+version = "0.1.0"
+description = "Multi-Event-Loop Engine & Concurrency Toolkit for Python 3.14t (Free-Threaded / No-GIL)"
+readme = "README.md"
+license = "MIT"
+authors = [
+    { name = "Han Kaihong", email = "hankaihong@outlook.com" }
+]
+requires-python = ">=3.14"
+keywords = ["asyncio", "concurrency", "multithreading", "free-threading", "no-gil", "golang", "channel"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Programming Language :: Rust",
+    "Operating System :: OS Independent",
+    "Topic :: System :: Networking",
+    "Framework :: AsyncIO",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/hankaihong1/gsyncio"
+Changelog = "https://github.com/hankaihong1/gsyncio/blob/main/CHANGELOG.md"
+Repository = "https://github.com/hankaihong1/gsyncio"
+Documentation = "https://github.com/hankaihong1/gsyncio/tree/main/docs"
+Issues = "https://github.com/hankaihong1/gsyncio/issues"
+
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+python-source = "src"
+module-name = "gsyncio._gsyncio_core"
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "maturin[zig]>=1.13.3",
+    "mypy>=2.3.0",
+    "pyright>=1.1.411",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "pytest-benchmark>=5.1.0",
+    "pytest-repeat>=0.9.4",
+    "pytest-timeout>=2.3.1",
+    "ruff>=0.16.1",
+]
+
+[tool.mypy]
+python_version = "3.14"
+strict = true
+disallow_untyped_defs = true
+check_untyped_defs = true
+warn_return_any = true
+warn_unused_configs = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "strict"
+addopts = "-m \"not slow\""
+filterwarnings = ["ignore::DeprecationWarning"]
+# WHY: 死锁/挂死必须以失败+线程栈 dump 结束，而不是让 CI job 空转数小时。
+# thread 方法超时时会打印所有线程的 traceback，精确定位卡住的 await 点。
+timeout = 180
+timeout_method = "thread"
+markers = [
+    "slow: performance tests (skip by default in CI)",
+    "repeat(n): run test n times for race detection",
+    "free_threading: stress tests for Python 3.14t (free-threaded) build",
+]
+
+[tool.ruff]
+# ruff 0.16 does not yet support "py314"; set to "py313" as best approximation for now
+target-version = "py313"
+line-length = 100
+lint.select = ["E", "F", "I", "N", "UP", "W", "B", "C4", "SIM", "TCH", "RUF"]
+lint.ignore = [
+    "E501",    # line-too-long
+    "E741",    # ambiguous-variable-name
+    "F821",    # undefined-name (self-referencing forward-ref types)
+    "B904",    # raise-from-err
+    "RUF002",  # ambiguous-unicode-character-docstring (Chinese punctuation)
+    "RUF003",  # ambiguous-unicode-character-comment (Chinese punctuation)
+    "RUF006",  # store-task-reference
+    "RUF100",  # unused-noqa
+    "SIM105",  # suppressible-exception
+    "TC001",   # typing-only-first-party-import
+    "TC003",   # typing-only-standard-library-import
+    "TC006",   # runtime-cast-value (add quotes in cast)
+    "W291",    # trailing-whitespace
+    "W293",    # blank-line-with-whitespace
+]
+
+[tool.pyright]
+typeCheckingMode = "strict"
+include = ["src/gsyncio"]
+exclude = ["**/__pycache__", "**/_gsyncio_core.*"]
+reportPrivateUsage = "none"
+
+

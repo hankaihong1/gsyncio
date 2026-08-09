@@ -1,0 +1,149 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint & Static Analysis
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Set up uv & Python 3.14t
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          python-version: "3.14t"
+
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      - name: Cargo Clippy & Format Check
+        run: |
+          cargo clippy -- -D warnings
+          cargo fmt --check
+
+      - name: Python Strict Static Analysis (Mypy, Pyright & Ruff)
+        run: |
+          uv run mypy --strict src/gsyncio
+          uv run pyright src/gsyncio
+          uv run ruff check .
+
+      - name: Cargo Deny Check
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories
+
+      - name: Rustdoc Check
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: |
+          cargo doc --no-deps --document-private-items
+
+  test:
+    name: Build & Test (Python ${{ matrix.python-version }}, ${{ matrix.os }})
+    needs: lint
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.14", "3.14t"]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up uv & Python ${{ matrix.python-version }}
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      - name: Build Rust Extension
+        run: |
+          uv run maturin develop --release
+
+      - name: Run Rust Unit Tests
+        shell: bash
+        run: |
+          # WHY: cargo test 的二进制是 standalone 构建（非 extension-module），
+          # 运行时需要加载 libpython。setup-uv 装的解释器不在系统 loader 路径里，
+          # 所以要在执行前把解释器目录加进 loader 路径（Linux 用 LD_LIBRARY_PATH，
+          # macOS 用 DYLD_FALLBACK_LIBRARY_PATH，Windows 用 PATH 找 python3xx.dll）。
+          # 注意 Windows 上 python3xx.dll 在**基础解释器**安装根（venv 的
+          # python.exe 是复制出来的，DLL 不复制）；sys.base_prefix 在 venv 中
+          # 指向基础解释器目录（sys.base_executable 并非跨平台属性，Windows
+          # 上不存在）；且 bash 的 PATH 用冒号分隔，Windows 路径里的冒号会被
+          # 拆断，必须先 cygpath -u 转成 Unix 风格（导出时 Git Bash 会自动
+          # 转回 Windows 格式）。
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            PYDIR="$(uv run python -c 'import sys; print(sys.base_prefix)')"
+            export PATH="$(cygpath -u "$PYDIR" 2>/dev/null || echo "$PYDIR"):$PATH"
+          elif [ "$RUNNER_OS" = "macOS" ]; then
+            export DYLD_FALLBACK_LIBRARY_PATH="$(uv run python -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))'):$DYLD_FALLBACK_LIBRARY_PATH"
+          else
+            export LD_LIBRARY_PATH="$(uv run python -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))'):$LD_LIBRARY_PATH"
+          fi
+          cargo test --lib --no-default-features --features test-init --locked
+
+      - name: Run Test Suite & Race Checks
+        run: |
+          uv run pytest
+
+  test_dev:
+    name: Build & Test (Python 3.15-dev, ubuntu-latest)
+    needs: lint
+    runs-on: ubuntu-latest
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # WHY: uv 的 Python 下载请求不认 "3.15-dev" 这种写法（uv 0.12 报 invalid
+      # request）；写 "3.15" 会自动解析到最新的 3.15 pre-release（当前 3.15.0b4）。
+      - name: Set up uv & Python 3.15-dev
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          python-version: "3.15"
+
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      - name: Build Rust Extension
+        run: |
+          uv run maturin develop --release
+
+      - name: Run Rust Unit Tests
+        shell: bash
+        run: |
+          # WHY: 同 test job——standalone 测试二进制运行时需要 libpython，
+          # 解释器 LIBDIR 不在系统 loader 路径里（test_dev 只跑 ubuntu，走 Linux 分支）。
+          export LD_LIBRARY_PATH="$(uv run python -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))'):$LD_LIBRARY_PATH"
+          cargo test --lib --no-default-features --features test-init --locked
+
+      - name: Run Test Suite & Race Checks
+        run: |
+          uv run pytest

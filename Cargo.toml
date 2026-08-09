@@ -1,0 +1,28 @@
+[package]
+name = "gsyncio-core"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "_gsyncio_core"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3 = "0.29"
+flume = "0.11"
+parking_lot = "0.12"
+
+[build-dependencies]
+pyo3-build-config = "0.29"
+
+[features]
+extension-module = ["pyo3/extension-module"]
+default = ["extension-module"]
+test-init = ["pyo3/auto-initialize"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "unwind"
+strip = true

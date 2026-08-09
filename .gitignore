@@ -1,0 +1,42 @@
+# Python-generated files & caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.dylib
+*.pyd
+build/
+dist/
+wheels/
+*.egg-info/
+.egg-info/
+
+# Testing & Linting Caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.hermes/
+
+# Virtual environments
+.venv/
+env/
+venv/
+ENV/
+
+# Rust / Cargo output
+/target/
+
+# Generated Documentation HTML
+docs/sphinx_html/
+
+# IDE & OS files
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+.benchmarks/
+.codegraph/
+.omo/

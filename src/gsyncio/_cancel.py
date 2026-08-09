@@ -1,0 +1,296 @@
+"""Task-local cancellation scopes (anyio / trio inspired) for gsyncio."""
+
+import asyncio
+import contextvars
+import threading
+from typing import Self
+
+from gsyncio.exceptions import TimeoutError
+
+_scope_stack_var: contextvars.ContextVar[list["CancelScope"]] = contextvars.ContextVar(
+    "_cancel_scope_stack"
+)
+
+
+def _get_scope_stack() -> list["CancelScope"]:
+    """Return the task-local scope stack, creating it on first access."""
+    try:
+        return _scope_stack_var.get()
+    except LookupError:
+        new_stack: list[CancelScope] = []
+        _scope_stack_var.set(new_stack)
+        return new_stack
+
+
+class CancelScope:
+    """A task-local cancellation scope that propagates cancellation hierarchically.
+
+    Each scope lives on a per-task stack managed via :data:`contextvars.ContextVar`.
+    Entered scopes track their own cancellation flag, an optional absolute deadline,
+    and a *shield* that blocks parent-scope cancellation from penetrating inward.
+
+    Typical use::
+
+        async with CancelScope(deadline=loop.time() + 5) as scope:
+            await do_work()
+            # scope.cancel_called is True if the deadline fired
+    """
+
+    def __init__(self, deadline: float = float("inf"), shield: bool = False) -> None:
+        self._cancel_called = False
+        self._cancel_lock = threading.Lock()
+        self._deadline = deadline
+        self._shield = shield
+        self._cancelled_caught = False
+        self._convert_to_timeout = False
+        self._task: asyncio.Task[object] | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._deadline_handle: asyncio.TimerHandle | None = None
+        self._reset_token: contextvars.Token[list[CancelScope]] | None = None
+        self._saved_cancel_count = 0
+
+    # -- inspectable properties ------------------------------------------------
+
+    @property
+    def cancel_called(self) -> bool:
+        """Return ``True`` after :meth:`cancel` has been called at least once."""
+        with self._cancel_lock:
+            return self._cancel_called
+
+    @property
+    def deadline(self) -> float:
+        """The absolute monotonic deadline (``float('inf')`` means no deadline)."""
+        return self._deadline
+
+    @property
+    def shield(self) -> bool:
+        """Return ``True`` if this scope blocks parent cancellation."""
+        return self._shield
+
+    @property
+    def cancelled_caught(self) -> bool:
+        """Return ``True`` if this scope silently absorbs cancellation (move-on-*)."""
+        return self._cancelled_caught
+
+    # -- cancellation ---------------------------------------------------------
+
+    def cancel(self) -> None:
+        """Mark this scope as cancelled and inject into the hosting task.
+
+        Idempotent — subsequent calls are no-ops.
+        """
+        with self._cancel_lock:
+            if self._cancel_called:
+                return
+            self._cancel_called = True
+
+        if self._task is not None and not self._task.done():
+            try:
+                current_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                current_loop = None
+            if self._loop is not None and current_loop is not self._loop:
+                self._loop.call_soon_threadsafe(self._task.cancel)
+            else:
+                self._task.cancel()
+
+    def _effectively_cancelled(self) -> bool:
+        """Whether *this* scope (or an unshielded ancestor) is cancelled.
+
+        A shielded scope blocks parent cancellation from entering, so a
+        shielded scope is never *effectively* cancelled by its ancestors
+        (though a direct :meth:`cancel` call still affects it).
+        """
+        if self._cancel_called:
+            return True
+        if self._shield:
+            return False
+        stack = _get_scope_stack()
+        try:
+            idx = stack.index(self)
+        except ValueError:
+            return False
+        for i in range(idx - 1, -1, -1):
+            if stack[i]._cancel_called:
+                return True
+            if stack[i]._shield:
+                return False
+        return False
+
+    # -- deadline scheduling --------------------------------------------------
+
+    def _deadline_callback(self) -> None:
+        """Event-loop callback fired when the deadline expires."""
+        self._deadline_handle = None
+        self.cancel()
+
+    # -- context manager protocol ---------------------------------------------
+
+    async def __aenter__(self) -> Self:
+        stack = _get_scope_stack()
+        stack.append(self)
+        self._reset_token = _scope_stack_var.set(stack)
+        self._task = asyncio.current_task()
+        self._loop = asyncio.get_running_loop()
+
+        # Shield: clear any pending cancellation injected by parent scopes.
+        # WHY: If a parent scope was cancelled before we entered, its injection is
+        # already counted on this task. Leaving it would make the first await inside
+        # the shield raise CancelledError and break the shield's promise. The count
+        # is restored in __aexit__ so cancellation fires right after the shield.
+        if self._shield:
+            task = self._task
+            if task is not None:
+                self._saved_cancel_count = task.cancelling()
+                for _ in range(self._saved_cancel_count):
+                    task.uncancel()
+
+        # Schedule a deadline timer when one is set.
+        if self._deadline != float("inf"):
+            loop = asyncio.get_running_loop()
+            delta = self._deadline - loop.time()
+            if delta <= 0:
+                self.cancel()
+            else:
+                self._deadline_handle = loop.call_later(delta, self._deadline_callback)
+
+        # If an ancestor is already cancelled (and we are not shielded),
+        # surface that cancellation immediately.
+        if self._effectively_cancelled():
+            raise asyncio.CancelledError()
+
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: object,
+    ) -> bool | None:
+        # Pop self from the task-local stack.
+        stack = _get_scope_stack()
+        if stack and stack[-1] is self:
+            stack.pop()
+        else:
+            # Belt-and-suspenders: remove from anywhere in the stack.
+            stack = [s for s in stack if s is not self]
+        _scope_stack_var.set(stack)
+
+        # Clean up the deadline timer.
+        if self._deadline_handle is not None:
+            self._deadline_handle.cancel()
+            self._deadline_handle = None
+
+        # Restore saved cancel count for shielded scopes.
+        if self._shield and self._saved_cancel_count > 0:
+            task = self._task
+            if task is not None:
+                for _ in range(self._saved_cancel_count):
+                    task.cancel()
+
+        # fail_after / fail_at: convert CancelledError → TimeoutError
+        # (only when this scope's own deadline fired / cancel was called).
+        if (
+            exc_type is not None
+            and issubclass(exc_type, asyncio.CancelledError)
+            and self._convert_to_timeout
+            and self._cancel_called
+        ):
+            raise TimeoutError() from exc_val
+
+        # move_on_* variants silently swallow CancelledError.
+        if (
+            exc_type is not None
+            and issubclass(exc_type, asyncio.CancelledError)
+            and self._cancelled_caught
+        ):
+            return True
+
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Convenience helpers
+# ---------------------------------------------------------------------------
+
+
+def fail_after(seconds: float) -> CancelScope:
+    """Return a :class:`CancelScope` that raises :class:`TimeoutError` on expiry.
+
+    Usage::
+
+        async with fail_after(5):
+            await long_operation()
+    """
+    loop = asyncio.get_running_loop()
+    scope = CancelScope(deadline=loop.time() + seconds)
+    scope._convert_to_timeout = True
+    return scope
+
+
+def move_on_after(seconds: float) -> CancelScope:
+    """Return a :class:`CancelScope` that silently exits on timeout.
+
+    The ``scope.cancelled_caught`` property will be ``True`` after the deadline
+    fires.
+
+    Usage::
+
+        async with move_on_after(5) as scope:
+            await maybe_slow()
+        if scope.cancelled_caught:
+            print("timed out silently")
+    """
+    loop = asyncio.get_running_loop()
+    scope = CancelScope(deadline=loop.time() + seconds)
+    scope._cancelled_caught = True
+    return scope
+
+
+def fail_at(deadline: float) -> CancelScope:
+    """Return a :class:`CancelScope` with an absolute deadline that raises
+    :class:`TimeoutError` on expiry."""
+    scope = CancelScope(deadline=deadline)
+    scope._convert_to_timeout = True
+    return scope
+
+
+def move_on_at(deadline: float) -> CancelScope:
+    """Return a :class:`CancelScope` with an absolute deadline that silently
+    exits on expiry."""
+    scope = CancelScope(deadline=deadline)
+    scope._cancelled_caught = True
+    return scope
+
+
+async def checkpoint() -> None:
+    """Check for effective cancellation and raise if needed.
+
+    Raises :exc:`asyncio.CancelledError` when the current scope — or any
+    unshielded ancestor — has been cancelled.
+
+    Call this periodically inside long-running synchronous code that cannot
+    ``await`` frequently.
+    """
+    stack = _get_scope_stack()
+    if not stack:
+        return
+    current = stack[-1]
+    if current._effectively_cancelled():
+        raise asyncio.CancelledError()
+
+
+def current_effective_deadline() -> float:
+    """Walk the task-local scope stack and return the tightest deadline.
+
+    Shielded scopes act as a barrier: deadlines from scopes outside a shielded
+    scope are invisible to code inside the shield.  Returns ``float('inf')``
+    when no deadline is active.
+    """
+    stack = _get_scope_stack()
+    min_deadline = float("inf")
+    for scope in reversed(stack):
+        min_deadline = min(min_deadline, scope._deadline)
+        if scope._shield:
+            break
+    return min_deadline
