@@ -80,6 +80,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Also fixed `cargo test` runtime libpython loading (Linux LD_LIBRARY_PATH,
   macOS DYLD_FALLBACK_LIBRARY_PATH, Windows base_prefix via cygpath) and the
   `3.15-dev` Python request (uv rejects it; `3.15` resolves to the 3.15 beta).
+- **`.python-version`**: `3.14` → `3.14t` — the file previously pinned the GIL
+  build, so a bare `uv sync` on a fresh clone created a GIL venv and every
+  benchmark silently ran single-threaded. The `t` suffix makes uv default to
+  the free-threaded interpreter locally, matching what CI already builds and
+  tests.
 - **Publish workflow**: wheel smoke tests re-run the full suite including
   `free_threading` tests (removed the `not free_threading` deselection that
   was hiding the two bugs fixed above).
