@@ -3,6 +3,7 @@
 import asyncio
 import types
 from collections.abc import Callable
+from http import HTTPStatus
 from typing import Any, Self
 
 from gsyncio.pool import EventLoopThreadPool
@@ -113,22 +114,46 @@ class GsyncioASGIWorker:
             async def receive() -> dict[str, Any]:
                 return {"type": "http.request", "body": body, "more_body": False}
 
+            # ASGI's start message carries no body length, and a response
+            # without Content-Length must be close-delimited — that forbids
+            # keep-alive and forces clients to read-to-EOF. So buffer the
+            # body per connection and emit Content-Length with the final
+            # body message (FastAPI/Starlette always send one, possibly empty).
+            resp_state: dict[str, Any] = {}
+
             async def send(message: dict[str, Any]) -> None:
                 if message["type"] == "http.response.start":
-                    status = message["status"]
-                    res_headers: list[tuple[bytes, bytes]] = message.get("headers", [])
-                    header_lines = [f"HTTP/1.1 {status} OK"]
-                    header_lines.extend(
-                        f"{k.decode('latin1')}: {v.decode('latin1')}" for k, v in res_headers
-                    )
-                    header_str = "\r\n".join(header_lines) + "\r\n\r\n"
-                    writer.write(header_str.encode("latin1"))
-                    await writer.drain()
+                    resp_state["status"] = message["status"]
+                    resp_state["headers"] = list(message.get("headers", []))
+                    resp_state["body"] = bytearray()
                 elif message["type"] == "http.response.body":
-                    res_body: bytes = message.get("body", b"")
-                    if res_body:
-                        writer.write(res_body)
-                        await writer.drain()
+                    body = message.get("body", b"")
+                    if body:
+                        resp_state["body"] += body
+                    if message.get("more_body", False):
+                        return
+
+                    status = resp_state["status"]
+                    # A real reason phrase instead of a hardcoded "OK":
+                    # "HTTP/1.1 404 OK" is wrong and confuses tools.
+                    try:
+                        reason = HTTPStatus(status).phrase
+                    except ValueError:
+                        reason = "OK"
+                    headers = resp_state["headers"]
+                    if not any(k.lower() == b"content-length" for k, _ in headers):
+                        headers = [
+                            *headers,
+                            (b"content-length", str(len(resp_state["body"])).encode("latin1")),
+                        ]
+                    header_lines = [f"HTTP/1.1 {status} {reason}"]
+                    header_lines.extend(
+                        f"{k.decode('latin1')}: {v.decode('latin1')}" for k, v in headers
+                    )
+                    writer.write(("\r\n".join(header_lines) + "\r\n\r\n").encode("latin1"))
+                    if resp_state["body"]:
+                        writer.write(bytes(resp_state["body"]))
+                    await writer.drain()
 
             # Call ASGI Application
             await self.app(scope, receive, send)
