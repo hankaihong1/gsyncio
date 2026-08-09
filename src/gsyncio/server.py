@@ -52,6 +52,11 @@ class ConnectionPinningServer:
         self._accept_tasks: list[
             concurrent.futures.Future[Any]
         ] = []  # List of concurrent.futures.Future
+        # In-flight connection handler tasks, one per accepted socket. They
+        # live on the worker loops and are awaited nowhere, so close() must
+        # cancel them explicitly or the pool shutdown orphans them
+        # ("Task was destroyed but it is pending!").
+        self._conn_tasks: set[asyncio.Task[Any]] = set()
         self._running = False
 
     @property
@@ -128,7 +133,14 @@ class ConnectionPinningServer:
                 client_sock, _addr = await loop.sock_accept(shared_sock)
                 client_sock.setblocking(False)
                 # Pure local execution on the worker's loop! Zero IPC!
-                loop.create_task(self._run_pinned_connection(client_sock, loop, handler))
+                conn_task = loop.create_task(
+                    self._run_pinned_connection(client_sock, loop, handler)
+                )
+                # Track so close() can cancel in-flight handlers; discard is
+                # invoked on the worker loop thread, and set ops are
+                # thread-safe under both GIL and free-threaded builds.
+                self._conn_tasks.add(conn_task)
+                conn_task.add_done_callback(self._conn_tasks.discard)
             except asyncio.CancelledError:
                 break
             except (OSError, RuntimeError):
@@ -167,13 +179,38 @@ class ConnectionPinningServer:
                     pass
 
     async def close(self) -> None:
-        """Stop server listening and close sockets."""
+        """Stop server listening, cancel in-flight connection handlers."""
         self._running = False
 
         if getattr(self, "_accept_tasks", None):
             for fut in self._accept_tasks:
                 fut.cancel()
             self._accept_tasks.clear()
+
+        # Cancel connection handlers before the pool stops its loops. Two
+        # passes with a per-loop round-trip between them: pass 1 cancels
+        # everything tracked so far, the round-trip lets the CancelledError
+        # actually unwind each handler (its finally closes the transport),
+        # pass 2 catches any task accepted in the shutdown window.
+        for _ in range(2):
+            tasks = list(self._conn_tasks)
+            if not tasks:
+                break
+            for task in tasks:
+                task.get_loop().call_soon_threadsafe(task.cancel)
+            for i in range(self.pool.num_threads):
+                loop = self.pool._get_loop(i)
+                if not loop.is_running():
+                    continue
+                try:
+                    await asyncio.wait_for(
+                        asyncio.wrap_future(
+                            asyncio.run_coroutine_threadsafe(asyncio.sleep(0), loop)
+                        ),
+                        timeout=2,
+                    )
+                except (Exception, TimeoutError):
+                    pass
 
         if getattr(self, "_server_socket", None) and self._server_socket:
             try:

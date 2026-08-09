@@ -13,6 +13,7 @@
 - [Architecture](#architecture)
 - [Core Features](#core-features)
 - [Examples](#examples)
+- [Live Demo](#live-demo)
 - [API Reference](#api-reference)
 - [Quality & Tests](#quality--tests)
 - [Community Docs](#community-docs)
@@ -232,6 +233,24 @@ if __name__ == "__main__":
 ```
 
 More runnable examples: [`examples/`](examples/README.md)
+
+---
+
+## Live Demo
+
+Want to see it running without writing code?
+[gsyncio-fastapi-demo](https://github.com/hankaihong1/gsyncio-fastapi-demo) is
+a real FastAPI application served directly by `GsyncioASGIWorker` — no
+uvicorn involved. Its page doubles as a live dashboard: every 2 seconds it
+pulls real metrics from `EventLoopThreadPool.get_metrics()` and shows which
+of the 4 event-loop threads handled each request.
+
+```bash
+git clone https://github.com/hankaihong1/gsyncio-fastapi-demo
+cd gsyncio-fastapi-demo
+uv sync
+uv run python app.py        # then open http://127.0.0.1:8000
+```
 
 ---
 
