@@ -11,8 +11,47 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Classify every push/PR before anything heavy runs. Docs-only changes
+  # skip the lint + build/test matrix (their jobs report "skipped", which
+  # GitHub counts as success for required checks) and run only the Docs
+  # Drift Check; anything touching code runs the full suite. The two
+  # filters are exact complements, so a mixed change sets both to true
+  # and gets both gates.
+  changes:
+    name: Detect Changed Files
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+      docs: ${{ steps.filter.outputs.docs }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          base: main
+          # '!' exclusions only take effect with 'some-with-excludes';
+          # under the default 'some' they are ignored, and a filter made
+          # of negations only never matches anything.
+          predicate-quantifier: 'some-with-excludes'
+          filters: |
+            docs:
+              - '**/*.md'
+              - 'docs/**'
+            code:
+              - '**'
+              - '!**/*.md'
+              - '!docs/**'
+
   lint:
     name: Lint & Static Analysis
+    needs: changes
+    # Skipped on docs-only changes; runs when the classifier itself failed
+    # (fail-closed: an unknown change set must not sail through unverified).
+    if: needs.changes.outputs.code == 'true' || needs.changes.result != 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -55,7 +94,12 @@ jobs:
 
   test:
     name: Build & Test (Python ${{ matrix.python-version }}, ${{ matrix.os }})
-    needs: lint
+    needs: [changes, lint]
+    # The explicit if replaces the implicit success(): (code == 'true' &&
+    # success()) preserves the old "no matrix when lint failed" behavior,
+    # while the || result != 'success' branch keeps the run fail-closed
+    # when the classifier job itself failed.
+    if: (needs.changes.outputs.code == 'true' && success()) || needs.changes.result != 'success'
     strategy:
       fail-fast: false
       matrix:
@@ -111,7 +155,8 @@ jobs:
 
   test_dev:
     name: Build & Test (Python 3.15-dev, ubuntu-latest)
-    needs: lint
+    needs: [changes, lint]
+    if: (needs.changes.outputs.code == 'true' && success()) || needs.changes.result != 'success'
     runs-on: ubuntu-latest
     continue-on-error: true
 
@@ -147,3 +192,27 @@ jobs:
       - name: Run Test Suite & Race Checks
         run: |
           uv run pytest
+
+  # Docs-only changes skip the heavy matrix and are gated by this single
+  # cheap job (no Rust build: test_docs.py only imports gsyncio from src/,
+  # which works without the extension via graceful fallback).
+  docs:
+    name: Docs Drift Check
+    needs: changes
+    if: needs.changes.outputs.docs == 'true' || needs.changes.result != 'success'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv & Python 3.14t
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          python-version: "3.14t"
+
+      - name: Install dev dependencies (skip project build)
+        run: uv sync --no-install-project --group dev
+
+      - name: Run docs drift guard
+        run: PYTHONPATH=src uv run --no-sync pytest tests/test_docs.py -q
