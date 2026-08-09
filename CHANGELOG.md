@@ -91,6 +91,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   at shutdown are gone.
 
 ### Changed
+- **CI: docs-only changes skip the heavy matrix**: a `changes` job
+  (`dorny/paths-filter`, `some-with-excludes` with exact-complement
+  filters) classifies every push/PR. Changes touching only `*.md` /
+  `docs/**` skip lint and the 6 build/test matrix — their jobs report
+  "skipped", which GitHub counts as success for required checks — and run
+  only the new `Docs Drift Check` job (`tests/test_docs.py`, no Rust build:
+  `uv sync --no-install-project` + `PYTHONPATH=src`). Code and mixed
+  changes run the full suite; a failed classifier fails closed (everything
+  runs). Branch protection now requires `Docs Drift Check` in addition to
+  the existing checks.
 - **`get_best_loop_factory()` no longer probes for third-party loops**:
   it returns `asyncio.new_event_loop` unconditionally, matching asyncio's
   policy philosophy (the framework never goes looking for user-installed
