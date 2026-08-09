@@ -13,6 +13,7 @@
 - [架构设计图](#架构设计图-architecture)
 - [核心特性](#核心特性-core-features)
 - [示例](#示例-examples)
+- [在线演示](#在线演示-live-demo)
 - [API 参考](#api-参考-api-reference)
 - [质量与单元测试](#质量与单元测试-quality--tests)
 - [社区文档](#社区文档-community-docs)
@@ -231,6 +232,24 @@ if __name__ == "__main__":
 ```
 
 更多可运行示例见 [`examples/`](examples/README_ZH.md)。
+
+---
+
+## 🎮 在线演示 (Live Demo)
+
+不想写代码就想先玩一玩？
+[gsyncio-fastapi-demo](https://github.com/hankaihong1/gsyncio-fastapi-demo)
+是一个真实运行在 `GsyncioASGIWorker` 上的 FastAPI 应用——刻意不用
+uvicorn。它的页面本身就是一块实时仪表盘：每 2 秒从
+`EventLoopThreadPool.get_metrics()` 拉取真实指标，展示 4 个事件循环线程
+各自处理了多少请求。
+
+```bash
+git clone https://github.com/hankaihong1/gsyncio-fastapi-demo
+cd gsyncio-fastapi-demo
+uv sync
+uv run python app.py        # 然后打开 http://127.0.0.1:8000
+```
 
 ---
 
