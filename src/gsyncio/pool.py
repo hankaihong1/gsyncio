@@ -38,6 +38,10 @@ class _WorkerPoolProtocol(Protocol):
 NativeWorkerPool: type[_WorkerPoolProtocol] | None = _try_import_rust_class(
     "gsyncio._gsyncio_core", "NativeWorkerPool"
 )
+# WHY: the Rust core raises its own ThreadPoolClosedError type; we translate
+# it to the public gsyncio.exceptions type by isinstance (PRA-1 — type
+# discrimination, never message matching).
+_RustPoolClosedError = _try_import_rust_class("gsyncio._gsyncio_core", "ThreadPoolClosedError")
 
 
 class EventLoopThreadPool:
@@ -109,7 +113,10 @@ class EventLoopThreadPool:
         # get_metrics() reads.
         if self._native_pool is not None and self._metrics_collector._metrics is not None:
             self._native_pool.set_metrics(self._metrics_collector._metrics)
-        self._closed_event = asyncio.Event()
+        # WHY: a threading.Event — asyncio.Event.set() from a foreign loop is
+        # a data race on free-threaded builds (W19); wait_closed() polls it
+        # via asyncio.to_thread.
+        self._closed_event = threading.Event()
 
     def __repr__(self) -> str:
         return (
@@ -133,9 +140,14 @@ class EventLoopThreadPool:
 
         :param index: Worker index (0-based).
         :returns: The :class:`asyncio.AbstractEventLoop` for that worker.
-        :raises IndexError: If `index` is out of range.
+        :raises RuntimeError: If the pool is not running (TS-1: the shared
+            ``_loops`` list is cleared by close(), so reads must be locked —
+            a bare read raced with close() on free-threaded builds).
         """
-        return self._loops[index]
+        with self._lock:
+            if not self._running or index >= len(self._loops):
+                raise RuntimeError("pool is not running")
+            return self._loops[index]
 
     def get_metrics(self) -> dict[str, Any]:
         """Return JSON-serializable health & performance metrics of the pool.
@@ -244,6 +256,9 @@ class EventLoopThreadPool:
                 task.cancel()
             if pending:
                 loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            # WHY: close() relies on this thread exiting; a loop that is never
+            # closed leaks its selector/file-descriptor set (C1).
+            loop.close()
 
     async def start(self) -> None:
         """Start all worker threads and work-stealing queue dispatchers."""
@@ -255,6 +270,11 @@ class EventLoopThreadPool:
                     "gsyncio Rust extension (_gsyncio_core) is not installed. "
                     "Install the package with the compiled extension."
                 )
+            if self._native_pool.is_closed():
+                # WHY: the native pool is consumed by close(); restarting the
+                # pool after close() would silently accept tasks that can
+                # never run (BUG-7).
+                raise RuntimeError("pool cannot be restarted after close()")
             self._running = True
             self._notify_events = [asyncio.Event() for _ in range(self.num_threads)]
 
@@ -268,13 +288,19 @@ class EventLoopThreadPool:
                 )
                 self._loops.append(loop)
                 self._threads.append(t)
-                t.start()
 
-            _logger.info(
-                "EventLoopThreadPool started with %d threads",
-                self.num_threads,
-                extra={"event": "pool_start", "thread_count": self.num_threads},
-            )
+        # WHY: start the threads outside the lock (TS-11).  Thread.start()
+        # has a happens-before edge, so workers observe the state published
+        # under the lock above; starting inside the lock made each fresh
+        # thread immediately contend for the same lock.
+        for t in self._threads:
+            t.start()
+
+        _logger.info(
+            "EventLoopThreadPool started with %d threads",
+            self.num_threads,
+            extra={"event": "pool_start", "thread_count": self.num_threads},
+        )
 
     def _notify_worker(self, worker_idx: int) -> None:
         """Trigger instant Pipe/EventFD wakeup on the target worker's event loop."""
@@ -382,7 +408,8 @@ class EventLoopThreadPool:
 
         Returns immediately if the pool is not running or is already closed.
         """
-        await self._closed_event.wait()
+        # WHY: to_thread — the event is a threading.Event (see __init__).
+        await asyncio.to_thread(self._closed_event.wait)
 
     async def __aenter__(self) -> Self:
         await self.start()
@@ -488,7 +515,13 @@ class EventLoopThreadPool:
                     return
                 if not fut.done():
                     if caller_loop and not caller_loop.is_closed():
-                        caller_loop.call_soon_threadsafe(fut.set_result, res)
+                        try:
+                            caller_loop.call_soon_threadsafe(fut.set_result, res)
+                        except RuntimeError:
+                            # WHY: the caller loop closed between the
+                            # is_closed() check and the delivery (TS-12) —
+                            # nobody will ever consume the future.
+                            fut.set_result(res)
                     else:
                         fut.set_result(res)
             except BaseException as exc:  # noqa: BLE001
@@ -496,7 +529,10 @@ class EventLoopThreadPool:
                     return
                 if not fut.done():
                     if caller_loop and not caller_loop.is_closed():
-                        caller_loop.call_soon_threadsafe(fut.set_exception, exc)
+                        try:
+                            caller_loop.call_soon_threadsafe(fut.set_exception, exc)
+                        except RuntimeError:
+                            fut.set_exception(exc)
                     else:
                         fut.set_exception(exc)
 
@@ -507,8 +543,8 @@ class EventLoopThreadPool:
                 try:
                     self._native_pool.push_local(target_idx, _execute_task)
                     self._notify_worker(target_idx)
-                except RuntimeError as exc:
-                    if "Pool is closed" in str(exc):
+                except Exception as exc:  # noqa: BLE001
+                    if _RustPoolClosedError is not None and isinstance(exc, _RustPoolClosedError):
                         raise ThreadPoolClosedError("ThreadPool is closed") from exc
                     raise
         else:
@@ -516,8 +552,8 @@ class EventLoopThreadPool:
             if self._native_pool:
                 try:
                     self._native_pool.push_global(_execute_task)
-                except RuntimeError as exc:
-                    if "Pool is closed" in str(exc):
+                except Exception as exc:  # noqa: BLE001
+                    if _RustPoolClosedError is not None and isinstance(exc, _RustPoolClosedError):
                         raise ThreadPoolClosedError("ThreadPool is closed") from exc
                     raise
 

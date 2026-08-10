@@ -6,13 +6,6 @@ import asyncio
 class GsyncioError(Exception):
     """Base exception class for all gsyncio errors."""
 
-    def __init__(
-        self, message: str = "", *, code: int | None = None, reason: str | None = None
-    ) -> None:
-        super().__init__(message)
-        self.code = code
-        self.reason = reason
-
 
 class WouldBlock(GsyncioError):  # noqa: N818
     """Raised when a non-blocking channel operation would block."""

@@ -1,10 +1,17 @@
 use parking_lot::Mutex;
+use pyo3::create_exception;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+
+create_exception!(
+    _gsyncio_core,
+    ThreadPoolClosedError,
+    pyo3::exceptions::PyException
+);
 
 /// Bounded capacity of each per-worker local queue.
 const _LOCAL_QUEUE_CAPACITY: usize = 256;
@@ -248,17 +255,17 @@ impl NativeWorkerPool {
         }
         // Fast path: check advisory flag before acquiring lock — Acquire observes close store
         if self.is_closed.load(Ordering::Acquire) {
-            return Err(PyRuntimeError::new_err("Pool is closed"));
+            return Err(ThreadPoolClosedError::new_err("Pool is closed"));
         }
         let guard = self.global_sender.lock();
         match guard.as_ref() {
             Some(sender) => {
                 sender
                     .send(task)
-                    .map_err(|_| PyRuntimeError::new_err("Pool is closed"))?;
+                    .map_err(|_| ThreadPoolClosedError::new_err("Pool is closed"))?;
                 Ok(())
             }
-            None => Err(PyRuntimeError::new_err("Pool is closed")),
+            None => Err(ThreadPoolClosedError::new_err("Pool is closed")),
         }
     }
 
@@ -270,7 +277,7 @@ impl NativeWorkerPool {
         }
         // Fast path: check advisory flag before acquiring lock — Acquire observes close store
         if self.is_closed.load(Ordering::Acquire) {
-            return Err(PyRuntimeError::new_err("Pool is closed"));
+            return Err(ThreadPoolClosedError::new_err("Pool is closed"));
         }
         let guard = self.local_senders.lock();
         if index >= guard.len() {
@@ -290,7 +297,7 @@ impl NativeWorkerPool {
                 self.push_global(py, task)
             }
             Err(flume::TrySendError::Disconnected(_)) => {
-                Err(PyRuntimeError::new_err("Pool is closed"))
+                Err(ThreadPoolClosedError::new_err("Pool is closed"))
             }
         }
     }
@@ -351,7 +358,7 @@ impl NativeWorkerPool {
 
         // 3. Nothing available.
         if self.is_closed() {
-            Err(PyRuntimeError::new_err("Pool is closed"))
+            Err(ThreadPoolClosedError::new_err("Pool is closed"))
         } else {
             // Worker idle — increment park count.
             if let Some(ref metrics) = *self.metrics.lock() {
@@ -505,6 +512,7 @@ impl RawAsyncWaitGroup {
 
 #[pymodule]
 fn _gsyncio_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add("ThreadPoolClosedError", m.py().get_type::<ThreadPoolClosedError>())?;
     m.add_class::<AtomicMetrics>()?;
     m.add_class::<NativeWorkerPool>()?;
     m.add_class::<FastChannel>()?;
@@ -563,7 +571,8 @@ mod tests {
             let recv_result = ch.try_recv(py);
             assert!(recv_result.is_ok(), "try_recv should succeed");
             let recv_val = recv_result.unwrap();
-            assert!(recv_val.is_some(), "try_recv should return Some(item)");
+            assert!(recv_val.0, "try_recv should report has_item=true");
+            assert!(recv_val.1.is_some(), "try_recv should return Some(item)");
         });
     }
 

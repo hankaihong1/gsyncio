@@ -299,6 +299,36 @@ async def test_pool_close_cancels_submitted_slow_tasks():
     assert f2.done() and isinstance(f2.exception(), asyncio.CancelledError)
 
 
+# ---------------------------------------------------------------------------
+# FIX-7 regression tests (BUG-7 restart, TS-1 _get_loop after close) — 2026-08-10
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_restart_after_close_raises() -> None:
+    """BUG-7: start() after close() must fail loudly instead of silently
+    accepting tasks that can never run."""
+    pool = EventLoopThreadPool(num_threads=1)
+    await pool.start()
+    await pool.close()
+
+    with pytest.raises(RuntimeError, match="restart"):
+        await pool.start()
+
+
+@pytest.mark.asyncio
+async def test_get_loop_after_close_raises_runtime_error() -> None:
+    """TS-1: _get_loop after close must raise RuntimeError, not IndexError
+    from a bare unlocked read of the cleared _loops list."""
+    pool = EventLoopThreadPool(num_threads=2)
+    await pool.start()
+    assert pool._get_loop(1) is not None
+    await pool.close()
+
+    with pytest.raises(RuntimeError, match="not running"):
+        pool._get_loop(0)
+
+
 @pytest.mark.asyncio
 async def test_pool_start_idempotent():
     """pool.start() is a no-op when already running (line 250)."""

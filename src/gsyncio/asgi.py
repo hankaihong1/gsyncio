@@ -9,6 +9,12 @@ from typing import Any, Self
 from gsyncio.pool import EventLoopThreadPool
 from gsyncio.server import ConnectionPinningServer
 
+# WHY: hard ceiling for request bodies — the worker reads the whole body
+# before invoking the app, so an unbounded content-length would let a
+# client exhaust worker memory (C4).
+_MAX_REQUEST_BODY = 1024 * 1024
+_HEADER_TIMEOUT = 30.0
+
 
 class GsyncioASGIWorker:
     """ASGI 3.0 Worker adapter for mounting FastAPI/Starlette applications.
@@ -65,10 +71,15 @@ class GsyncioASGIWorker:
         self.port = self._server.port
 
     async def _handle_connection(
-        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        client_addr: tuple[str, int] | None = None,
     ) -> None:
         try:
-            req_line = await reader.readline()
+            # WHY: a slow-loris client that never finishes its header would
+            # pin the worker connection forever — bound the read (C4).
+            req_line = await asyncio.wait_for(reader.readline(), timeout=_HEADER_TIMEOUT)
             if not req_line:
                 return
 
@@ -79,7 +90,7 @@ class GsyncioASGIWorker:
             headers: list[tuple[bytes, bytes]] = []
             content_length = 0
             while True:
-                line = await reader.readline()
+                line = await asyncio.wait_for(reader.readline(), timeout=_HEADER_TIMEOUT)
                 if not line or line == b"\r\n":
                     break
                 if b":" in line:
@@ -93,9 +104,19 @@ class GsyncioASGIWorker:
                             content_length = 0
                     headers.append((k_str.encode("latin1"), v_str.encode("latin1")))
 
+            if content_length > _MAX_REQUEST_BODY:
+                writer.write(
+                    b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\n"
+                    b"Connection: close\r\n\r\n"
+                )
+                await writer.drain()
+                return
+
             body = b""
             if content_length > 0:
-                body = await reader.readexactly(content_length)
+                body = await asyncio.wait_for(
+                    reader.readexactly(content_length), timeout=_HEADER_TIMEOUT
+                )
 
             # Build ASGI 3.0 Scope
             scope: dict[str, Any] = {
@@ -107,8 +128,11 @@ class GsyncioASGIWorker:
                 "raw_path": path.encode("latin1"),
                 "query_string": b"",
                 "headers": headers,
-                "client": ("127.0.0.1", 0),
-                "server": (self.host, self.port),
+                "client": client_addr or (self.host, 0),
+                # WHY: read the bound port from the server, not self.port —
+                # start() assigns self.port after server.start() returns, while
+                # handlers may already run on worker loops (TS-7).
+                "server": (self.host, self._server.port),
             }
 
             async def receive() -> dict[str, Any]:
@@ -146,6 +170,11 @@ class GsyncioASGIWorker:
                             *headers,
                             (b"content-length", str(len(resp_state["body"])).encode("latin1")),
                         ]
+                    # WHY: this worker serves one request per connection and
+                    # never reuses it — advertise close so clients (browsers
+                    # in particular) don't serialize requests waiting for a
+                    # keep-alive that never comes (S-3).
+                    headers = [*headers, (b"connection", b"close")]
                     header_lines = [f"HTTP/1.1 {status} {reason}"]
                     header_lines.extend(
                         f"{k.decode('latin1')}: {v.decode('latin1')}" for k, v in headers
