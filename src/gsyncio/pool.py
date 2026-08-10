@@ -6,8 +6,7 @@ import asyncio
 import os
 import threading
 import types
-from collections.abc import AsyncGenerator, Callable
-from contextlib import asynccontextmanager
+from collections.abc import Callable
 from typing import Any, Protocol, Self
 
 from gsyncio._cancel import CancelScope
@@ -39,66 +38,10 @@ class _WorkerPoolProtocol(Protocol):
 NativeWorkerPool: type[_WorkerPoolProtocol] | None = _try_import_rust_class(
     "gsyncio._gsyncio_core", "NativeWorkerPool"
 )
-
-
-class _PoolGroup:
-    """TaskGroup-like context manager that submits tasks to pool workers.
-
-    Routes through :meth:`EventLoopThreadPool.submit` instead of
-    :func:`asyncio.create_task` so child tasks execute on pool worker
-    event loops rather than the caller's event loop.
-    """
-
-    def __init__(self, pool: EventLoopThreadPool) -> None:
-        self._pool = pool
-        self._futures: list[asyncio.Future[Any]] = []
-        self._cancel_scope = CancelScope()
-
-    def start_soon(self, coro_fn: Callable[..., Any], *args: Any) -> asyncio.Future[Any]:
-        """Submit a task to the pool (like :meth:`TaskGroup.start_soon` but via pool.submit)."""
-        fut = self._pool.submit(coro_fn, *args)
-        self._futures.append(fut)
-        return fut
-
-    async def __aenter__(self) -> Self:
-        await self._cancel_scope.__aenter__()
-        return self
-
-    async def __aexit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc_val: BaseException | None,
-        exc_tb: object,
-    ) -> bool | None:
-        if not self._futures:
-            return await self._cancel_scope.__aexit__(exc_type, exc_val, exc_tb)
-
-        # Wait for all submitted futures.
-        # If the hosting task was cancelled (e.g. pool close), gather raises
-        # CancelledError — catch it so we can still run CancelScope.__aexit__.
-        try:
-            results = await asyncio.gather(*self._futures, return_exceptions=True)
-        except asyncio.CancelledError:
-            results = [asyncio.CancelledError() for _ in self._futures]
-
-        # Collect real exceptions (not CancelledError from sibling-cancel).
-        exceptions: list[BaseException] = [
-            r
-            for r in results
-            if isinstance(r, BaseException) and not isinstance(r, asyncio.CancelledError)
-        ]
-
-        if exceptions:
-            self._cancel_scope.cancel()
-
-        await self._cancel_scope.__aexit__(exc_type, exc_val, exc_tb)
-
-        if len(exceptions) == 1:
-            raise exceptions[0]
-        if len(exceptions) > 1:
-            raise BaseExceptionGroup("pool group crashed", exceptions)
-
-        return None
+# WHY: the Rust core raises its own ThreadPoolClosedError type; we translate
+# it to the public gsyncio.exceptions type by isinstance (PRA-1 — type
+# discrimination, never message matching).
+_RustPoolClosedError = _try_import_rust_class("gsyncio._gsyncio_core", "ThreadPoolClosedError")
 
 
 class EventLoopThreadPool:
@@ -170,9 +113,10 @@ class EventLoopThreadPool:
         # get_metrics() reads.
         if self._native_pool is not None and self._metrics_collector._metrics is not None:
             self._native_pool.set_metrics(self._metrics_collector._metrics)
-        self._closed_event = asyncio.Event()
-        self._active_groups: set[_PoolGroup] = set()
-        self._groups_lock = threading.Lock()
+        # WHY: a threading.Event — asyncio.Event.set() from a foreign loop is
+        # a data race on free-threaded builds (W19); wait_closed() polls it
+        # via asyncio.to_thread.
+        self._closed_event = threading.Event()
 
     def __repr__(self) -> str:
         return (
@@ -196,9 +140,14 @@ class EventLoopThreadPool:
 
         :param index: Worker index (0-based).
         :returns: The :class:`asyncio.AbstractEventLoop` for that worker.
-        :raises IndexError: If `index` is out of range.
+        :raises RuntimeError: If the pool is not running (TS-1: the shared
+            ``_loops`` list is cleared by close(), so reads must be locked —
+            a bare read raced with close() on free-threaded builds).
         """
-        return self._loops[index]
+        with self._lock:
+            if not self._running or index >= len(self._loops):
+                raise RuntimeError("pool is not running")
+            return self._loops[index]
 
     def get_metrics(self) -> dict[str, Any]:
         """Return JSON-serializable health & performance metrics of the pool.
@@ -307,6 +256,9 @@ class EventLoopThreadPool:
                 task.cancel()
             if pending:
                 loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            # WHY: close() relies on this thread exiting; a loop that is never
+            # closed leaks its selector/file-descriptor set (C1).
+            loop.close()
 
     async def start(self) -> None:
         """Start all worker threads and work-stealing queue dispatchers."""
@@ -318,6 +270,11 @@ class EventLoopThreadPool:
                     "gsyncio Rust extension (_gsyncio_core) is not installed. "
                     "Install the package with the compiled extension."
                 )
+            if self._native_pool.is_closed():
+                # WHY: the native pool is consumed by close(); restarting the
+                # pool after close() would silently accept tasks that can
+                # never run (BUG-7).
+                raise RuntimeError("pool cannot be restarted after close()")
             self._running = True
             self._notify_events = [asyncio.Event() for _ in range(self.num_threads)]
 
@@ -331,13 +288,19 @@ class EventLoopThreadPool:
                 )
                 self._loops.append(loop)
                 self._threads.append(t)
-                t.start()
 
-            _logger.info(
-                "EventLoopThreadPool started with %d threads",
-                self.num_threads,
-                extra={"event": "pool_start", "thread_count": self.num_threads},
-            )
+        # WHY: start the threads outside the lock (TS-11).  Thread.start()
+        # has a happens-before edge, so workers observe the state published
+        # under the lock above; starting inside the lock made each fresh
+        # thread immediately contend for the same lock.
+        for t in self._threads:
+            t.start()
+
+        _logger.info(
+            "EventLoopThreadPool started with %d threads",
+            self.num_threads,
+            extra={"event": "pool_start", "thread_count": self.num_threads},
+        )
 
     def _notify_worker(self, worker_idx: int) -> None:
         """Trigger instant Pipe/EventFD wakeup on the target worker's event loop."""
@@ -375,12 +338,6 @@ class EventLoopThreadPool:
             threads = list(self._threads)
             self._loops.clear()
             self._threads.clear()
-
-        # Cancel all active submit groups before closing the native pool.
-        with self._groups_lock:
-            groups = list(self._active_groups)
-        for g in groups:
-            g._cancel_scope.cancel()
 
         if self._native_pool:
             self._native_pool.close()
@@ -451,7 +408,8 @@ class EventLoopThreadPool:
 
         Returns immediately if the pool is not running or is already closed.
         """
-        await self._closed_event.wait()
+        # WHY: to_thread — the event is a threading.Event (see __init__).
+        await asyncio.to_thread(self._closed_event.wait)
 
     async def __aenter__(self) -> Self:
         await self.start()
@@ -466,34 +424,34 @@ class EventLoopThreadPool:
         await self.close()
 
     def _resolve_target_worker(
-        self, loop_target: asyncio.AbstractEventLoop | int | None
+        self, pin_target: asyncio.AbstractEventLoop | int | None
     ) -> tuple[int, asyncio.AbstractEventLoop] | None:
         with self._lock:
             loops = self._loops
             if not self._running or not loops:
                 raise ThreadPoolClosedError("ThreadPool is not running")
 
-            if loop_target is None:
+            if pin_target is None:
                 return None
 
-            if isinstance(loop_target, int):
-                if 0 <= loop_target < len(loops):
-                    return loop_target, loops[loop_target]
-                raise ValueError(f"Worker index {loop_target} out of range (0-{len(loops) - 1})")
+            if isinstance(pin_target, int):
+                if 0 <= pin_target < len(loops):
+                    return pin_target, loops[pin_target]
+                raise ValueError(f"Worker index {pin_target} out of range (0-{len(loops) - 1})")
 
-            if isinstance(loop_target, asyncio.AbstractEventLoop):  # pyright: ignore[reportUnnecessaryIsInstance]
+            if isinstance(pin_target, asyncio.AbstractEventLoop):  # pyright: ignore[reportUnnecessaryIsInstance]
                 for idx, l in enumerate(loops):
-                    if l is loop_target:
+                    if l is pin_target:
                         return idx, l
                 raise ValueError("Target AbstractEventLoop is not managed by this thread pool")
 
-            raise TypeError("loop argument must be an AbstractEventLoop, int index, or None")
+            raise TypeError("pin_to argument must be an AbstractEventLoop, int index, or None")
 
     def submit(
         self,
         target: Callable[..., Any],
         *args: Any,
-        loop: asyncio.AbstractEventLoop | int | None = None,
+        pin_to: asyncio.AbstractEventLoop | int | None = None,
         cancel_scope: CancelScope | None = None,
         **kwargs: Any,
     ) -> asyncio.Future[Any]:
@@ -506,11 +464,11 @@ class EventLoopThreadPool:
         :param args:
             Positional arguments to pass to `target`.
 
-        :param loop:
+        :param pin_to:
             Optional target event loop instance or worker index `int` for explicit pinning
             (e.g. for `asyncssh` connection affinity). If ``None``, pushed to the global
             shared queue for idle workers to pull instantly.
-        :type loop: asyncio.AbstractEventLoop or int or None
+        :type pin_to: asyncio.AbstractEventLoop or int or None
 
         :param kwargs:
             Keyword arguments to pass to `target`.
@@ -521,10 +479,10 @@ class EventLoopThreadPool:
         :raises ThreadPoolClosedError:
             If task submission is attempted on a closed or unstarted pool.
         :raises ValueError:
-            If `loop` is an invalid worker index or unmanaged event loop.
+            If `pin_to` is an invalid worker index or unmanaged event loop.
 
         """
-        pinned_info = self._resolve_target_worker(loop)
+        pinned_info = self._resolve_target_worker(pin_to)
 
         try:
             caller_loop: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
@@ -557,7 +515,13 @@ class EventLoopThreadPool:
                     return
                 if not fut.done():
                     if caller_loop and not caller_loop.is_closed():
-                        caller_loop.call_soon_threadsafe(fut.set_result, res)
+                        try:
+                            caller_loop.call_soon_threadsafe(fut.set_result, res)
+                        except RuntimeError:
+                            # WHY: the caller loop closed between the
+                            # is_closed() check and the delivery (TS-12) —
+                            # nobody will ever consume the future.
+                            fut.set_result(res)
                     else:
                         fut.set_result(res)
             except BaseException as exc:  # noqa: BLE001
@@ -565,7 +529,10 @@ class EventLoopThreadPool:
                     return
                 if not fut.done():
                     if caller_loop and not caller_loop.is_closed():
-                        caller_loop.call_soon_threadsafe(fut.set_exception, exc)
+                        try:
+                            caller_loop.call_soon_threadsafe(fut.set_exception, exc)
+                        except RuntimeError:
+                            fut.set_exception(exc)
                     else:
                         fut.set_exception(exc)
 
@@ -576,8 +543,8 @@ class EventLoopThreadPool:
                 try:
                     self._native_pool.push_local(target_idx, _execute_task)
                     self._notify_worker(target_idx)
-                except RuntimeError as exc:
-                    if "Pool is closed" in str(exc):
+                except Exception as exc:  # noqa: BLE001
+                    if _RustPoolClosedError is not None and isinstance(exc, _RustPoolClosedError):
                         raise ThreadPoolClosedError("ThreadPool is closed") from exc
                     raise
         else:
@@ -585,8 +552,8 @@ class EventLoopThreadPool:
             if self._native_pool:
                 try:
                     self._native_pool.push_global(_execute_task)
-                except RuntimeError as exc:
-                    if "Pool is closed" in str(exc):
+                except Exception as exc:  # noqa: BLE001
+                    if _RustPoolClosedError is not None and isinstance(exc, _RustPoolClosedError):
                         raise ThreadPoolClosedError("ThreadPool is closed") from exc
                     raise
 
@@ -605,51 +572,6 @@ class EventLoopThreadPool:
                 loop.call_soon_threadsafe(event.set)
 
         return fut
-
-    def submit_daemon(
-        self,
-        target: Callable[..., Any],
-        *args: Any,
-        loop: asyncio.AbstractEventLoop | int | None = None,
-        **kwargs: Any,
-    ) -> asyncio.Future[Any]:
-        """Submit a long-running daemon task to a worker event loop.
-
-        :param target:
-            A coroutine function or callable daemon task.
-        :type target: callable or coroutine
-
-        :param loop:
-            Optional target event loop instance or worker index `int` for explicit pinning.
-        :type loop: asyncio.AbstractEventLoop or int or None
-
-        :returns: An :class:`asyncio.Future` representing the pending daemon task.
-        :rtype: :class:`asyncio.Future`
-
-        """
-        return self.submit(target, *args, loop=loop, **kwargs)
-
-    @asynccontextmanager
-    async def submit_group(self) -> AsyncGenerator[_PoolGroup]:
-        """Create a :class:`_PoolGroup` context manager for batch task submission.
-
-        Child tasks registered via :meth:`_PoolGroup.start_soon` are routed
-        through :meth:`submit` so they execute on pool worker event loops.
-        All children are automatically cancelled when the pool is closed.
-
-        :returns: An async iterator yielding a :class:`_PoolGroup` instance.
-        :rtype: :class:`_PoolGroup`
-
-        """
-        group = _PoolGroup(self)
-        with self._groups_lock:
-            self._active_groups.add(group)
-        try:
-            async with group:
-                yield group
-        finally:
-            with self._groups_lock:
-                self._active_groups.discard(group)
 
 
 async def create_pool(

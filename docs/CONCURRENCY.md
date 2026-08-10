@@ -304,8 +304,6 @@ intent with `pytest.mark.repeat` when deterministic.
 - `yielder` fixture → `wait_all_tasks_blocked()`: wait until all tasks are
   blocked before asserting — eliminates "asserted before it started"
   timing false-positives.
-- `checkpoints` fixture → `assert_checkpoints(...)`: event-ordering context
-  manager that verifies the expected interleaving.
 
 ### 5.4 Local resource constraints (measured on M1 8GB)
 

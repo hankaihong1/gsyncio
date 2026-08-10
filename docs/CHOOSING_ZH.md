@@ -14,13 +14,12 @@
 | 把异步任务派到多线程池并行执行 | `EventLoopThreadPool.submit()` / `run_in_pool()` | 唯一能跨线程执行协程的入口；池生命周期用 `async with` 管理 |
 | 显式创建池对象（延迟启动/自定义选项） | `create_pool(num_threads=..., **PoolOptions)` | 比 `run_in_pool` 更可控，返回可复用的池 |
 | 一次提交多个任务、统一收结果 | `pool.submit_group()`（配合 `group.start_soon()`） | 批量分发 + 批量等待；池关闭时自动取消子任务 |
-| 提交长驻后台任务（语义标注） | `pool.submit_daemon(target, ...)` | submit 的别名，表达"daemon"意图 |
-| 指定任务跑在某个固定 worker（有状态连接亲和） | `pool.submit(..., loop=N)` | 本地专用队列，确定性路由 |
+| 指定任务跑在某个固定 worker（有状态连接亲和） | `pool.submit(..., pin_to=N)` | 本地专用队列，确定性路由 |
 | 任务间通信（Go channel 风格） | `FastChannel` | Rust flume 无锁通道，跨线程最快 |
 | 多通道竞争取数（Go select 风格） | `select_channel(*channels)` | 最先就绪的通道胜出 |
 | 只发/只收，接口上显式隔离方向 | `SendChannel` / `ReceiveChannel`（`ch.split()`） | 编译期/接口层防误用 |
 | 优雅迭代数据流（直到 close） | `AsyncChannel` 或 `FastChannel`（`async for item in ch:`） | 迭代协议 + close 自动终止 |
-| 只要一个现成通道（asyncssh 风格零配置） | `open_channel()` | 顶层 facade，免建池 |
+| 只要一个现成通道（asyncssh 风格零配置） | `FastChannel()` | 直接构造，免建池 |
 | 互斥访问共享资源 | `Lock` | 公平 FIFO，跨 loop/线程安全 |
 | 限制并发数（N 个许可） | `Semaphore` | 固定许可池，FIFO 等待 |
 | 动态调整并发上限 | `CapacityLimiter` | 可在运行期 resize 总额度 |
@@ -46,7 +45,7 @@
 ## 原语速览（核心思想，一行一个）
 
 - **`EventLoopThreadPool`** — 线程池 = N 个独立 asyncio loop；`submit` 走全局
-  无锁队列 + 工作窃取；`loop=` 参数走本地专用队列。池是**异步上下文管理器**：
+  无锁队列 + 工作窃取；`pin_to=` 参数走本地专用队列。池是**异步上下文管理器**：
   `async with EventLoopThreadPool(num_threads=4) as pool:`。
 - **`FastChannel`** — 数据面在 Rust（flume），等待面在 Python（双检锁）。
   有界（`maxsize=N`）或无界（默认）。跨线程可 send/recv。
@@ -76,6 +75,7 @@
 import asyncio
 import gsyncio
 
+
 async def main():
     # 池：提交 + 收结果
     async with gsyncio.EventLoopThreadPool(num_threads=4) as pool:
@@ -92,6 +92,7 @@ async def main():
     wg.add(1)
     wg.done()
     await wg.wait()
+
 
 asyncio.run(main())
 ```

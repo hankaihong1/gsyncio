@@ -18,22 +18,6 @@ async def wait_all_tasks_blocked(cushion: float = 0.0) -> None:
         await asyncio.sleep(cushion)
 
 
-class _CheckpointContext:
-    def __init__(self) -> None:
-        self._entered = False
-
-    async def __aenter__(self) -> None:
-        self._entered = True
-
-    async def __aexit__(self, *args: object) -> None:
-        if not self._entered:
-            raise AssertionError("assert_checkpoints block did not yield")
-
-
-def assert_checkpoints() -> _CheckpointContext:
-    return _CheckpointContext()
-
-
 def rust_available() -> bool:
     """Return True if the Rust _gsyncio_core extension is loaded."""
     try:

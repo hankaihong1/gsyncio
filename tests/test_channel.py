@@ -6,11 +6,9 @@ import pytest
 from gsyncio import (
     EventLoopThreadPool,
     TimeoutError,
-    open_channel,
     select_channel,
 )
-from gsyncio.channel import AsyncChannel, ChannelClosedError
-from gsyncio.exceptions import GsyncioError, WouldBlock
+from gsyncio.exceptions import ChannelClosedError, GsyncioError, WouldBlock
 from gsyncio.primitives import FastChannel
 from gsyncio.testing import wait_all_tasks_blocked
 
@@ -18,7 +16,7 @@ from gsyncio.testing import wait_all_tasks_blocked
 @pytest.mark.asyncio
 async def test_channel_valid_basic_send_recv():
     """Valid 1: Basic send and receive"""
-    ch = AsyncChannel()
+    ch = FastChannel()
     await ch.send("hello")
     res = await ch.recv()
     assert res == "hello"
@@ -27,7 +25,7 @@ async def test_channel_valid_basic_send_recv():
 @pytest.mark.asyncio
 async def test_channel_valid_multiple_items():
     """Valid 2: Sequential send and receive of multiple items"""
-    ch = AsyncChannel()
+    ch = FastChannel()
     items = [1, 2, 3, "test", {"key": "val"}]
     for item in items:
         await ch.send(item)
@@ -41,7 +39,7 @@ async def test_channel_valid_multiple_items():
 @pytest.mark.asyncio
 async def test_channel_valid_concurrent_producers_consumers():
     """Valid 3: Multi-coroutine concurrent send/receive data integrity"""
-    ch = AsyncChannel()
+    ch = FastChannel()
     count = 50
 
     async def producer(n):
@@ -60,7 +58,7 @@ async def test_channel_valid_concurrent_producers_consumers():
 @pytest.mark.asyncio
 async def test_channel_boundary_none_and_empty_payloads():
     """Boundary 1: None / empty bytes / empty data structure passing"""
-    ch = AsyncChannel()
+    ch = FastChannel()
     payloads = [None, b"", {}, [], 0, False]
     for p in payloads:
         await ch.send(p)
@@ -71,7 +69,7 @@ async def test_channel_boundary_none_and_empty_payloads():
 @pytest.mark.asyncio
 async def test_channel_boundary_capacity_limit():
     """Boundary 2: Capacity-limited (capacity=1) send and blocking unlock"""
-    ch = AsyncChannel(maxsize=1)
+    ch = FastChannel(maxsize=1)
     await ch.send("first")
 
     # The second send should suspend, waiting for consumption
@@ -91,7 +89,7 @@ async def test_channel_boundary_capacity_limit():
 @pytest.mark.asyncio
 async def test_channel_boundary_recv_blocks_until_send():
     """Boundary 3: recv suspends on empty channel, unblocks after send"""
-    ch = AsyncChannel()
+    ch = FastChannel()
 
     recv_task = asyncio.create_task(ch.recv())
     await asyncio.sleep(0.01)
@@ -105,7 +103,7 @@ async def test_channel_boundary_recv_blocks_until_send():
 @pytest.mark.asyncio
 async def test_channel_error_send_to_closed_channel():
     """Error 1: Sending data to a closed channel raises ChannelClosedError"""
-    ch = AsyncChannel()
+    ch = FastChannel()
     ch.close()
     with pytest.raises(ChannelClosedError):
         await ch.send("fail")
@@ -114,7 +112,7 @@ async def test_channel_error_send_to_closed_channel():
 @pytest.mark.asyncio
 async def test_channel_error_recv_from_closed_empty_channel():
     """Error 2: Receiving from a closed and empty channel raises ChannelClosedError"""
-    ch = AsyncChannel()
+    ch = FastChannel()
     ch.close()
     with pytest.raises(ChannelClosedError):
         await ch.recv()
@@ -123,7 +121,7 @@ async def test_channel_error_recv_from_closed_empty_channel():
 @pytest.mark.asyncio
 async def test_channel_error_recv_timeout():
     """Error 3: Timed recv raises asyncio.TimeoutError"""
-    ch = AsyncChannel()
+    ch = FastChannel()
     with pytest.raises(asyncio.TimeoutError):
         await ch.recv(timeout=0.02)
 
@@ -185,22 +183,22 @@ def test_fast_channel_try_send_closed_raises():
 
 
 def test_async_channel_try_send_recv_roundtrip():
-    """try_send + try_recv on AsyncChannel should round-trip a value."""
-    ch = AsyncChannel()
+    """try_send + try_recv on FastChannel should round-trip a value."""
+    ch = FastChannel()
     assert ch.try_send("world")
     assert ch.try_recv() == "world"
 
 
 def test_async_channel_try_recv_empty_raises_wouldblock():
-    """try_recv on an empty AsyncChannel should raise WouldBlock."""
-    ch = AsyncChannel()
+    """try_recv on an empty FastChannel should raise WouldBlock."""
+    ch = FastChannel()
     with pytest.raises(WouldBlock):
         ch.try_recv()
 
 
 def test_async_channel_qsize():
     """qsize() should reflect the number of buffered items."""
-    ch = AsyncChannel()
+    ch = FastChannel()
     assert ch.qsize() == 0
     ch.try_send("a")
     assert ch.qsize() == 1
@@ -211,23 +209,23 @@ def test_async_channel_qsize():
 
 
 def test_async_channel_try_send_full_bounded():
-    """try_send on a full bounded AsyncChannel should return False."""
-    ch = AsyncChannel(maxsize=1)
+    """try_send on a full bounded FastChannel should return False."""
+    ch = FastChannel(maxsize=1)
     assert ch.try_send("first")
     assert not ch.try_send("second")
 
 
 def test_async_channel_try_recv_closed_raises():
-    """try_recv on a closed empty AsyncChannel should raise ChannelClosedError."""
-    ch = AsyncChannel()
+    """try_recv on a closed empty FastChannel should raise ChannelClosedError."""
+    ch = FastChannel()
     ch.close()
     with pytest.raises(ChannelClosedError):
         ch.try_recv()
 
 
 def test_async_channel_try_send_closed_raises():
-    """try_send on a closed AsyncChannel should raise ChannelClosedError."""
-    ch = AsyncChannel()
+    """try_send on a closed FastChannel should raise ChannelClosedError."""
+    ch = FastChannel()
     ch.close()
     with pytest.raises(ChannelClosedError):
         ch.try_send("nope")
@@ -309,27 +307,9 @@ async def test_channel_close_with_blocked_waiters():
 
 
 @pytest.mark.asyncio
-async def test_open_channel_basic():
-    """open_channel returns a FastChannel instance."""
-    ch = await open_channel()
-    assert isinstance(ch, FastChannel)
-
-
-@pytest.mark.asyncio
-async def test_open_channel_close_behavior():
-    """Closing an open_channel raises ChannelClosedError on send/recv."""
-    ch = await open_channel()
-    ch.close()
-    with pytest.raises(ChannelClosedError):
-        await ch.send("x")
-    with pytest.raises(ChannelClosedError):
-        await ch.recv()
-
-
-@pytest.mark.asyncio
 async def test_async_channel_timeout_and_errors():
-    """Test AsyncChannel timeout and close edge paths"""
-    ch = AsyncChannel(maxsize=1)
+    """Test FastChannel timeout and close edge paths"""
+    ch = FastChannel(maxsize=1)
     await ch.send("item1")
 
     with pytest.raises(asyncio.TimeoutError):
@@ -412,7 +392,7 @@ async def test_race_high_concurrency_channel_send_recv():
 @pytest.mark.asyncio
 async def test_channel_async_for_iteration():
     """1. Go parity range ch: Validate async for item in ch loop consumption and graceful exit on close"""
-    ch = AsyncChannel()
+    ch = FastChannel()
 
     async def producer():
         for i in range(3):
@@ -452,8 +432,8 @@ async def test_fast_channel_async_for_iteration():
 @pytest.mark.asyncio
 async def test_select_channel_multi_branch():
     """2. Go parity select: Validate select_channel listening on multiple channels simultaneously"""
-    ch1 = AsyncChannel()
-    ch2 = AsyncChannel()
+    ch1 = FastChannel()
+    ch2 = FastChannel()
 
     async def send_to_ch2():
         await asyncio.sleep(0.02)
@@ -464,3 +444,107 @@ async def test_select_channel_multi_branch():
     selected_ch, val = await select_channel(ch1, ch2, timeout=1.0)
     assert selected_ch is ch2
     assert val == "from_ch2"
+
+
+# ---------------------------------------------------------------------------
+# FIX-2 regression tests (BUG-2: PyO3 Option<Py<PyAny>> boundary loses None
+# payloads) — 2026-08-10 audit
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_fastchannel_none_payload() -> None:
+    """BUG-2: FastChannel must transport None payloads end to end.
+
+    Before the fix `send(None)` consumed the item but `recv()` saw the
+    channel as empty and registered a waiter that nobody would wake —
+    a permanent hang.
+    """
+    ch = FastChannel()
+    await ch.send(None)
+    # wait_for guards against the historical permanent hang.
+    assert await asyncio.wait_for(ch.recv(), timeout=1.0) is None
+
+    # try_send/try_recv must distinguish "None payload" from "empty".
+    assert ch.try_send(None) is True
+    assert ch.try_recv() is None  # None payload, NOT WouldBlock
+
+    # The channel is now truly empty: WouldBlock must be raised.
+    with pytest.raises(WouldBlock):
+        ch.try_recv()
+
+
+@pytest.mark.asyncio
+async def test_fastchannel_none_after_regular_items() -> None:
+    """None must not disturb the FIFO order of surrounding items."""
+    ch = FastChannel()
+    await ch.send(1)
+    await ch.send(None)
+    await ch.send(2)
+    assert await ch.recv() == 1
+    assert await ch.recv() is None
+    assert await ch.recv() == 2
+
+
+def test_pop_work_rejects_none() -> None:
+    """FIX-2 hardening: pushing a None task into the native pool is a type error."""
+    import gsyncio._gsyncio_core as core
+
+    pool = core.NativeWorkerPool(2)
+    try:
+        with pytest.raises(TypeError):
+            pool.push_global(None)
+        with pytest.raises(TypeError):
+            pool.push_local(0, None)
+    finally:
+        pool.close()
+
+
+# ---------------------------------------------------------------------------
+# FIX-4 regression tests (BUG-4: select_channel must only consume the winner)
+# — 2026-08-10 audit
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_select_no_item_loss_simultaneous() -> None:
+    """BUG-4: both channels ready at once — the unselected item stays buffered."""
+    ch1 = FastChannel()
+    ch2 = FastChannel()
+    await ch1.send("a")
+    await ch2.send("b")
+
+    selected_ch, val = await select_channel(ch1, ch2, timeout=1.0)
+
+    # The loser's item must still be receivable; the winner's was consumed.
+    if selected_ch is ch1:
+        assert val == "a"
+        assert await asyncio.wait_for(ch2.recv(), timeout=1.0) == "b"
+    else:
+        assert val == "b"
+        assert await asyncio.wait_for(ch1.recv(), timeout=1.0) == "a"
+
+
+@pytest.mark.asyncio
+async def test_select_timeout_no_loss() -> None:
+    """W4: an item sent at the timeout boundary must never vanish."""
+
+    async def delayed_send(ch: FastChannel, delay: float, value: str) -> None:
+        await asyncio.sleep(delay)
+        await ch.send(value)
+
+    for i in range(100):
+        ch = FastChannel()
+        sender = asyncio.create_task(delayed_send(ch, 0.005, f"v{i}"))
+        consumed = 0
+        try:
+            await select_channel(ch, timeout=0.01)
+            consumed = 1
+        except TimeoutError:
+            pass
+        await sender
+        # Accounting: exactly one item was sent — it was either consumed by
+        # the select winner or is still buffered.  Zero means it was dropped.
+        assert ch.qsize() + consumed == 1, (
+            f"round {i}: item lost (qsize={ch.qsize()}, consumed={consumed})"
+        )

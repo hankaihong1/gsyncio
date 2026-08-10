@@ -4,7 +4,6 @@ import threading
 import pytest
 
 from gsyncio import (
-    AsyncChannel,
     AsyncContext,
     AsyncOnce,
     AsyncRWMutex,
@@ -43,7 +42,7 @@ async def test_pool_valid_round_robin_thread_distribution():
     num_threads = 4
     async with EventLoopThreadPool(num_threads=num_threads) as pool:
         # Explicitly test multi-thread distribution and work-stealing
-        futs = [pool.submit(get_thread_id, loop=i % num_threads) for i in range(num_threads * 2)]
+        futs = [pool.submit(get_thread_id, pin_to=i % num_threads) for i in range(num_threads * 2)]
         tids = [await f for f in futs]
 
         unique_threads = set(tids)
@@ -246,25 +245,25 @@ async def test_pool_metrics_and_pull_model_scheduling():
 
 @pytest.mark.asyncio
 async def test_work_stealing_and_loop_pinning():
-    """Verify Pull Model work stealing and explicit submit(loop=...) binding capability"""
+    """Verify Pull Model work stealing and explicit submit(pin_to=...) binding capability"""
     async with EventLoopThreadPool(num_threads=2) as pool:
         # 1. Verify Work-Stealing global shared queue dispatch and execution
         futs = [pool.submit(asyncio.sleep, 0.01) for _ in range(10)]
         await asyncio.gather(*futs)
 
         # 2. Verify explicit target Worker index binding
-        fut0 = pool.submit(asyncio.sleep, 0.01, loop=0)
-        fut1 = pool.submit(asyncio.sleep, 0.01, loop=1)
+        fut0 = pool.submit(asyncio.sleep, 0.01, pin_to=0)
+        fut1 = pool.submit(asyncio.sleep, 0.01, pin_to=1)
 
         await asyncio.gather(fut0, fut1)
 
         # 3. Verify out-of-range index raises ValueError
         with pytest.raises(ValueError, match="out of range"):
-            pool.submit(print, "invalid", loop=99)
+            pool.submit(print, "invalid", pin_to=99)
 
         # 4. Verify explicit AbstractEventLoop instance binding
         target_loop = pool._get_loop(1)
-        fut_target = pool.submit(asyncio.sleep, 0.01, loop=target_loop)
+        fut_target = pool.submit(asyncio.sleep, 0.01, pin_to=target_loop)
         await fut_target
 
         metrics = pool.get_metrics()
@@ -273,31 +272,8 @@ async def test_work_stealing_and_loop_pinning():
 
 
 @pytest.mark.asyncio
-async def test_submit_group_all_succeed():
-    """Submit 3 tasks via pool.submit_group() — verify all complete with correct results."""
-
-    async def add(a: int, b: int) -> int:
-        return a + b
-
-    async def multiply(a: int, b: int) -> int:
-        return a * b
-
-    async def concat(a: str, b: str) -> str:
-        return a + b
-
-    async with EventLoopThreadPool(num_threads=2) as pool:
-        async with pool.submit_group() as group:
-            f1 = group.start_soon(add, 3, 5)
-            f2 = group.start_soon(multiply, 4, 7)
-            f3 = group.start_soon(concat, "hello", "world")
-
-        results = [await f1, await f2, await f3]
-        assert results == [8, 28, "helloworld"]
-
-
-@pytest.mark.asyncio
-async def test_submit_group_cancel_on_close():
-    """Close pool while a submit_group has slow tasks — verify futures are cancelled."""
+async def test_pool_close_cancels_submitted_slow_tasks():
+    """Close pool while slow tasks are running — verify futures are cancelled."""
 
     async def slow_task(delay: float) -> str:
         await asyncio.sleep(delay)
@@ -306,35 +282,51 @@ async def test_submit_group_cancel_on_close():
     pool = EventLoopThreadPool(num_threads=2)
     await pool.start()
 
-    f1: asyncio.Future[str] | None = None
-    f2: asyncio.Future[str] | None = None
+    f1 = pool.submit(slow_task, 10.0)
+    f2 = pool.submit(slow_task, 10.0)
 
-    async def run_group() -> None:
-        nonlocal f1, f2
-        try:
-            async with pool.submit_group() as group:
-                f1 = group.start_soon(slow_task, 10.0)
-                f2 = group.start_soon(slow_task, 10.0)
-                # Block forever — pool.close() from another task will cancel the group.
-                await asyncio.Event().wait()
-        except asyncio.CancelledError:
-            pass  # Expected: pool close cancels the hosting task.
-
-    group_task = asyncio.create_task(run_group())
-
-    # Give the group time to submit its tasks to workers.
+    # Give the tasks time to be pulled by the workers.
     await wait_all_tasks_blocked()
 
-    # Close the pool from outside the group — triggers cancel on all groups.
+    # Close drains for up to ~5s, then stops the worker loops — the still
+    # running 10s tasks are cancelled and their futures resolve.
     await pool.close()
 
-    await group_task
-
-    # Give call_soon_threadsafe callbacks time to settle on caller's loop.
+    # Let the call_soon_threadsafe result deliveries land on this loop.
     await wait_all_tasks_blocked()
 
-    assert f1 is not None and f1.done()
-    assert f2 is not None and f2.done()
+    assert f1.done() and isinstance(f1.exception(), asyncio.CancelledError)
+    assert f2.done() and isinstance(f2.exception(), asyncio.CancelledError)
+
+
+# ---------------------------------------------------------------------------
+# FIX-7 regression tests (BUG-7 restart, TS-1 _get_loop after close) — 2026-08-10
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_restart_after_close_raises() -> None:
+    """BUG-7: start() after close() must fail loudly instead of silently
+    accepting tasks that can never run."""
+    pool = EventLoopThreadPool(num_threads=1)
+    await pool.start()
+    await pool.close()
+
+    with pytest.raises(RuntimeError, match="restart"):
+        await pool.start()
+
+
+@pytest.mark.asyncio
+async def test_get_loop_after_close_raises_runtime_error() -> None:
+    """TS-1: _get_loop after close must raise RuntimeError, not IndexError
+    from a bare unlocked read of the cleared _loops list."""
+    pool = EventLoopThreadPool(num_threads=2)
+    await pool.start()
+    assert pool._get_loop(1) is not None
+    await pool.close()
+
+    with pytest.raises(RuntimeError, match="not running"):
+        pool._get_loop(0)
 
 
 @pytest.mark.asyncio
@@ -351,15 +343,15 @@ async def test_pool_invalid_loop_targets():
     async with EventLoopThreadPool(num_threads=2) as pool:
         # Unmanaged AbstractEventLoop (the test's own loop)
         with pytest.raises(ValueError, match="not managed"):
-            pool.submit(asyncio.sleep, 0, loop=asyncio.get_running_loop())
+            pool.submit(asyncio.sleep, 0, pin_to=asyncio.get_running_loop())
 
         # Out-of-range worker index
         with pytest.raises(ValueError, match="out of range"):
-            pool.submit(asyncio.sleep, 0, loop=99)
+            pool.submit(asyncio.sleep, 0, pin_to=99)
 
-        # Invalid type for loop parameter
+        # Invalid type for pin_to parameter
         with pytest.raises(TypeError, match="must be an AbstractEventLoop"):
-            pool.submit(asyncio.sleep, 0, loop="invalid")
+            pool.submit(asyncio.sleep, 0, pin_to="invalid")
 
 
 @pytest.mark.asyncio
@@ -494,15 +486,8 @@ async def test_repr_implementations():
         assert "EventLoopThreadPool" in repr_pool
         assert "threads=2" in repr_pool
 
-        # submit_daemon interface
-        fut = pool.submit_daemon(asyncio.sleep, 0.01)
-        await fut
-
     ch = FastChannel()
     assert "FastChannel" in repr(ch)
-
-    ach = AsyncChannel()
-    assert "AsyncChannel" in repr(ach)
 
     ctx = AsyncContext()
     assert "AsyncContext" in repr(ctx)
@@ -570,7 +555,7 @@ async def test_pool_closed_error_type_native_push_path():
     with pytest.raises(ThreadPoolClosedError, match="ThreadPool is closed"):
         pool.submit(dummy)
     with pytest.raises(ThreadPoolClosedError, match="ThreadPool is closed"):
-        pool.submit(dummy, loop=0)
+        pool.submit(dummy, pin_to=0)
 
     await pool.close()
 

@@ -1,10 +1,16 @@
 use parking_lot::Mutex;
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::create_exception;
+use pyo3::exceptions::{PyRuntimeError, PyTypeError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+
+create_exception!(
+    _gsyncio_core,
+    ThreadPoolClosedError,
+    pyo3::exceptions::PyException
+);
 
 /// Bounded capacity of each per-worker local queue.
 const _LOCAL_QUEUE_CAPACITY: usize = 256;
@@ -14,7 +20,7 @@ const _LOCAL_QUEUE_CAPACITY: usize = 256;
 #[repr(align(64))]
 struct PaddedAtomic(AtomicUsize);
 
-#[pyclass]
+#[pyclass(module = "gsyncio._gsyncio_core")]
 pub struct AtomicMetrics {
     active: Vec<PaddedAtomic>,
     completed: Vec<PaddedAtomic>,
@@ -142,26 +148,6 @@ impl AtomicMetrics {
             0
         }
     }
-
-    fn get_metrics(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let n = self.active.len();
-        let active: Vec<usize> = (0..n).map(|i| self.get_active(i)).collect();
-        let completed: Vec<usize> = (0..n).map(|i| self.get_completed(i)).collect();
-        let global_pull: Vec<usize> = (0..n).map(|i| self.get_global_pull(i)).collect();
-        let park: Vec<usize> = (0..n).map(|i| self.get_park(i)).collect();
-        let injection_depth: Vec<usize> =
-            (0..n).map(|i| self.get_injection_queue_depth(i)).collect();
-        let remote_schedule: Vec<usize> = (0..n).map(|i| self.get_remote_schedule(i)).collect();
-
-        let dict = PyDict::new(py);
-        dict.set_item("active_tasks", PyList::new(py, active)?)?;
-        dict.set_item("completed_tasks", PyList::new(py, completed)?)?;
-        dict.set_item("global_pull_count", PyList::new(py, global_pull)?)?;
-        dict.set_item("park_count", PyList::new(py, park)?)?;
-        dict.set_item("injection_queue_depth", PyList::new(py, injection_depth)?)?;
-        dict.set_item("remote_schedule_count", PyList::new(py, remote_schedule)?)?;
-        Ok(dict.unbind().into())
-    }
 }
 
 /// RAII guard that decrements an `AtomicUsize` counter on drop.
@@ -176,7 +162,7 @@ impl Drop for PollerGuard<'_> {
 }
 
 /// Native Rust Worker Pool Core for zero-overhead task queueing and work stealing.
-#[pyclass]
+#[pyclass(module = "gsyncio._gsyncio_core")]
 pub struct NativeWorkerPool {
     global_sender: Mutex<Option<flume::Sender<Py<PyAny>>>>,
     global_receiver: flume::Receiver<Py<PyAny>>,
@@ -239,27 +225,38 @@ impl NativeWorkerPool {
             .is_none_or(|s| s.is_disconnected())
     }
 
-    fn push_global(&self, task: Py<PyAny>) -> PyResult<()> {
+    fn push_global(&self, py: Python<'_>, task: Py<PyAny>) -> PyResult<()> {
+        // WHY: pop_work() signals "no work" with Ok(None).  A None task pushed
+        // here would therefore be silently swallowed by every worker — reject
+        // it at the boundary instead of losing work.
+        if task.is_none(py) {
+            return Err(PyTypeError::new_err("pool task cannot be None"));
+        }
         // Fast path: check advisory flag before acquiring lock — Acquire observes close store
         if self.is_closed.load(Ordering::Acquire) {
-            return Err(PyRuntimeError::new_err("Pool is closed"));
+            return Err(ThreadPoolClosedError::new_err("Pool is closed"));
         }
         let guard = self.global_sender.lock();
         match guard.as_ref() {
             Some(sender) => {
                 sender
                     .send(task)
-                    .map_err(|_| PyRuntimeError::new_err("Pool is closed"))?;
+                    .map_err(|_| ThreadPoolClosedError::new_err("Pool is closed"))?;
                 Ok(())
             }
-            None => Err(PyRuntimeError::new_err("Pool is closed")),
+            None => Err(ThreadPoolClosedError::new_err("Pool is closed")),
         }
     }
 
     fn push_local(&self, index: usize, task: Py<PyAny>, py: Python<'_>) -> PyResult<()> {
+        // Same None rejection as push_global: a None "task" would be read by
+        // pop_work() as "no work" and dropped.
+        if task.is_none(py) {
+            return Err(PyTypeError::new_err("pool task cannot be None"));
+        }
         // Fast path: check advisory flag before acquiring lock — Acquire observes close store
         if self.is_closed.load(Ordering::Acquire) {
-            return Err(PyRuntimeError::new_err("Pool is closed"));
+            return Err(ThreadPoolClosedError::new_err("Pool is closed"));
         }
         let guard = self.local_senders.lock();
         if index >= guard.len() {
@@ -276,10 +273,10 @@ impl NativeWorkerPool {
             Err(flume::TrySendError::Full(task)) => {
                 // Local queue full — fall back to global (drop lock first)
                 drop(guard);
-                self.push_global(task)
+                self.push_global(py, task)
             }
             Err(flume::TrySendError::Disconnected(_)) => {
-                Err(PyRuntimeError::new_err("Pool is closed"))
+                Err(ThreadPoolClosedError::new_err("Pool is closed"))
             }
         }
     }
@@ -340,7 +337,7 @@ impl NativeWorkerPool {
 
         // 3. Nothing available.
         if self.is_closed() {
-            Err(PyRuntimeError::new_err("Pool is closed"))
+            Err(ThreadPoolClosedError::new_err("Pool is closed"))
         } else {
             // Worker idle — increment park count.
             if let Some(ref metrics) = *self.metrics.lock() {
@@ -353,7 +350,7 @@ impl NativeWorkerPool {
     }
 }
 
-#[pyclass]
+#[pyclass(module = "gsyncio._gsyncio_core")]
 pub struct FastChannel {
     sender: flume::Sender<Py<PyAny>>,
     receiver: flume::Receiver<Py<PyAny>>,
@@ -397,14 +394,19 @@ impl FastChannel {
         }
     }
 
-    fn try_recv(&self, _py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+    /// Non-blocking receive.
+    ///
+    /// Returns `(has_item, item)`: `has_item` distinguishes "channel empty"
+    /// from "item is None" — PyO3 maps both `Ok(None)` and `Ok(Some(None))`
+    /// to Python `None`, so a bare `Option` return would lose None payloads.
+    fn try_recv(&self, _py: Python<'_>) -> PyResult<(bool, Option<Py<PyAny>>)> {
         match self.receiver.try_recv() {
-            Ok(item) => Ok(Some(item)),
+            Ok(item) => Ok((true, Some(item))),
             Err(flume::TryRecvError::Empty) => {
                 if self.is_closed() {
                     Err(PyRuntimeError::new_err("Channel is closed"))
                 } else {
-                    Ok(None)
+                    Ok((false, None))
                 }
             }
             Err(flume::TryRecvError::Disconnected) => {
@@ -418,11 +420,14 @@ impl FastChannel {
     }
 }
 
-#[pyclass]
-#[allow(clippy::type_complexity)]
+/// A registered waiter: (event loop, future) pair used to wake a suspended
+/// `wait()` coroutine from whichever thread calls `done()`.
+type Waiter = (Py<PyAny>, Py<PyAny>);
+
+#[pyclass(module = "gsyncio._gsyncio_core")]
 pub struct RawAsyncWaitGroup {
     counter: Arc<AtomicUsize>,
-    waiters: Arc<Mutex<Vec<(Py<PyAny>, Py<PyAny>)>>>,
+    waiters: Arc<Mutex<Vec<Waiter>>>,
 }
 
 #[pymethods]
@@ -435,12 +440,49 @@ impl RawAsyncWaitGroup {
         }
     }
 
-    fn add(&self, delta: usize) {
-        self.counter.fetch_add(delta, Ordering::Release); // add(): Release makes increment visible to done's AcqRel
+    /// Add `delta` to the counter (Go `sync.WaitGroup.Add` semantics).
+    ///
+    /// Negative deltas are legal, but the counter must never go below zero:
+    /// an `add()` that would underflow raises `RuntimeError` (mirroring Go's
+    /// panic on a negative counter). The update is a CAS loop so concurrent
+    /// `add()`/`done()` calls are never lost and the underflow check is
+    /// race-free.
+    fn add(&self, delta: isize) -> PyResult<()> {
+        let mut prev = self.counter.load(Ordering::Acquire); // add(): Acquire pairs with done()'s AcqRel
+        loop {
+            let new_val = if delta < 0 {
+                let magnitude = delta.unsigned_abs();
+                if prev < magnitude {
+                    return Err(PyRuntimeError::new_err(
+                        "WaitGroup counter went negative: add() with negative delta",
+                    ));
+                }
+                prev - magnitude
+            } else {
+                match prev.checked_add(delta as usize) {
+                    Some(v) => v,
+                    None => {
+                        return Err(PyRuntimeError::new_err(
+                            "WaitGroup counter overflowed: add() with positive delta",
+                        ));
+                    }
+                }
+            };
+            match self.counter.compare_exchange_weak(
+                prev,
+                new_val,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                // AcqRel: Release makes the increment visible to done()/register_waiter,
+                // Acquire observes done()'s decrements racing with this add().
+                Ok(_) => return Ok(()),
+                Err(actual) => prev = actual,
+            }
+        }
     }
 
-    #[allow(clippy::type_complexity)]
-    fn done(&self) -> PyResult<Option<Vec<(Py<PyAny>, Py<PyAny>)>>> {
+    fn done(&self) -> PyResult<Option<Vec<Waiter>>> {
         let prev = self.counter.fetch_sub(1, Ordering::AcqRel); // done(): AcqRel — Acquire observes add()s, Release so register_waiter sees decrement
         if prev == 0 {
             return Err(PyRuntimeError::new_err(
@@ -470,7 +512,7 @@ impl RawAsyncWaitGroup {
     /// the waiter is pushed, the waiter will never be woken. Callers must
     /// ensure all `add()` calls with a positive delta happen-before
     /// `register_waiter()`.
-    fn register_waiter(&self, waiter: (Py<PyAny>, Py<PyAny>)) -> bool {
+    fn register_waiter(&self, waiter: Waiter) -> bool {
         if self.counter.load(Ordering::Acquire) == 0 {
             // register_waiter: Acquire sees done()'s decrement
             true
@@ -489,6 +531,10 @@ impl RawAsyncWaitGroup {
 
 #[pymodule]
 fn _gsyncio_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add(
+        "ThreadPoolClosedError",
+        m.py().get_type::<ThreadPoolClosedError>(),
+    )?;
     m.add_class::<AtomicMetrics>()?;
     m.add_class::<NativeWorkerPool>()?;
     m.add_class::<FastChannel>()?;
@@ -515,7 +561,7 @@ mod tests {
     fn test_waitgroup_double_check() {
         Python::attach(|py| {
             let wg = RawAsyncWaitGroup::new();
-            wg.add(1);
+            wg.add(1).unwrap();
             // done() decrements from 1 → 0, returns the waiters list.
             let result = wg.done();
             assert!(result.is_ok(), "done() on counter=1 should succeed");
@@ -528,11 +574,34 @@ mod tests {
             assert!(waiters.is_empty(), "waiters list should be empty");
             // After done(), counter is 0, so register_waiter should return true
             // (meaning "already done, wake immediately").
-            let waiter: (Py<PyAny>, Py<PyAny>) = (Py::from(py.None()), Py::from(py.None()));
+            let waiter: Waiter = (Py::from(py.None()), Py::from(py.None()));
             assert!(
                 wg.register_waiter(waiter),
                 "register_waiter after done should return true"
             );
+        });
+    }
+
+    #[test]
+    fn test_waitgroup_add_negative() {
+        Python::attach(|_py| {
+            let wg = RawAsyncWaitGroup::new();
+            // add(-1) on a zero counter must error (Go panics on a negative
+            // counter; we mirror that with RuntimeError).
+            assert!(
+                wg.add(-1).is_err(),
+                "add(-1) on counter=0 should return Err"
+            );
+            wg.add(2).unwrap();
+            // add(-3) would drive 2 → -1: must error.
+            assert!(
+                wg.add(-3).is_err(),
+                "add(-3) on counter=2 should return Err"
+            );
+            // add(-2) brings 2 → 0: legal, mirrors done().
+            wg.add(-2).unwrap();
+            // Counter is 0 again: a positive add is legal.
+            wg.add(1).unwrap();
         });
     }
 
@@ -547,7 +616,8 @@ mod tests {
             let recv_result = ch.try_recv(py);
             assert!(recv_result.is_ok(), "try_recv should succeed");
             let recv_val = recv_result.unwrap();
-            assert!(recv_val.is_some(), "try_recv should return Some(item)");
+            assert!(recv_val.0, "try_recv should report has_item=true");
+            assert!(recv_val.1.is_some(), "try_recv should return Some(item)");
         });
     }
 

@@ -12,7 +12,6 @@ from gsyncio._channel_base import (
     _discard_waiter,
     _wake_all,
 )
-from gsyncio._channel_wrappers import ReceiveChannel, SendChannel
 from gsyncio._rust import _try_import_rust_class
 from gsyncio._taskgroup import TaskGroup
 from gsyncio.exceptions import ChannelClosedError, TimeoutError, WouldBlock
@@ -104,10 +103,11 @@ class FastChannel(_BaseChannel):
             if result:
                 with self._lock:
                     self._wakeup_next(self._getters)
+                    self._wakeup_notifiers()
                 return True
             return False
-        except RuntimeError:
-            raise ChannelClosedError(_CHANNEL_CLOSED_MSG)
+        except RuntimeError as e:
+            raise ChannelClosedError(_CHANNEL_CLOSED_MSG) from e
 
     def try_recv(self) -> Any:
         """Non-blocking recv. Returns an item or raises :class:`WouldBlock`.
@@ -118,15 +118,17 @@ class FastChannel(_BaseChannel):
         :raises ChannelClosedError: If the channel is closed and empty.
 
         """
-        result: Any
         try:
-            result = self._inner.try_recv()
-        except RuntimeError:
-            raise ChannelClosedError(_CHANNEL_CLOSED_MSG)
-        if result is not None:
+            # WHY: the native boundary returns (has_item, item) — a bare
+            # Option<Py<PyAny>> cannot distinguish a None payload from an
+            # empty channel (BUG-2).
+            has_item, item = self._inner.try_recv()
+        except RuntimeError as e:
+            raise ChannelClosedError(_CHANNEL_CLOSED_MSG) from e
+        if has_item:
             with self._lock:
                 self._wakeup_next(self._putters)
-            return result
+            return item
         raise WouldBlock("Channel is empty")
 
     def qsize(self) -> int:
@@ -137,16 +139,6 @@ class FastChannel(_BaseChannel):
 
         """
         return int(self._inner.qsize())
-
-    def split(self) -> tuple[SendChannel, ReceiveChannel]:
-        """Split the channel into send-only and receive-only halves.
-
-        :returns: A tuple of ``(SendChannel, ReceiveChannel)`` that share the
-                  same underlying channel.
-        :rtype: :class:`tuple`
-
-        """
-        return SendChannel(self), ReceiveChannel(self)
 
     async def send(self, item: Any) -> None:
         """Send an item into the channel.
@@ -166,8 +158,8 @@ class FastChannel(_BaseChannel):
         loop = asyncio.get_running_loop()
         while True:
             try:
-                item = self._inner.try_recv()
-                if item is not None:
+                has_item, item = self._inner.try_recv()
+                if has_item:
                     with self._lock:
                         self._wakeup_next(self._putters)
                     return item
@@ -177,8 +169,8 @@ class FastChannel(_BaseChannel):
             # Double-check inside lock before queueing future to prevent Lost-Wakeup race
             with self._lock:
                 try:
-                    item = self._inner.try_recv()
-                    if item is not None:
+                    has_item, item = self._inner.try_recv()
+                    if has_item:
                         self._wakeup_next(self._putters)
                         return item
                 except RuntimeError as e:
@@ -206,7 +198,7 @@ async def select_channel(
     """Select the first ready channel from multiple channel instances.
 
     :param channels:
-        One or more :class:`FastChannel` or :class:`AsyncChannel` instances to poll.
+        One or more :class:`FastChannel` instances to poll.
 
     :param timeout:
         Optional maximum time in seconds to wait for a channel to become ready.
@@ -245,30 +237,67 @@ async def select_channel(
     result: list[tuple[Any, Any]] = []
     _tg: TaskGroup | None = None
 
-    async def _read_one(ch: Any) -> None:
-        val = await ch.recv()
-        result.append((ch, val))
+    async def _notify_one(ch: Any, ready: list[Any]) -> None:
+        """Report channel readiness WITHOUT consuming — only the winner consumes.
+
+        Loops on spurious/raced wakeups (a concurrent consumer may steal the
+        item between the send and this task running).
+        """
+        while True:
+            loop = asyncio.get_running_loop()
+            event = ch._register_notifier(loop)
+            if event is None:
+                break  # already non-empty — report ready
+            try:
+                await event.wait()
+            except asyncio.CancelledError:
+                ch._discard_notifier(loop, event)
+                raise
+            break
+        ready.append(ch)
         # WHY: TaskGroup only exits early when a child fails. Raising CancelledError
-        # is the soft failure that cancels the sibling readers and unwinds the group
-        # the moment the first channel delivers; a normal return would make the
-        # group wait for every channel to produce data.
+        # is the soft failure that cancels the sibling notifiers and unwinds the
+        # group the moment the first channel reports; a normal return would make
+        # the group wait for every channel to produce data.
         raise asyncio.CancelledError()
 
     async def _select() -> None:
         nonlocal _tg
-        try:
-            async with TaskGroup() as tg:
-                _tg = tg
-                for ch in channels:
-                    tg.start_soon(_read_one, ch)
-        except BaseExceptionGroup as eg:
-            for exc in eg.exceptions:
-                if not isinstance(exc, asyncio.CancelledError):
-                    raise
-        except asyncio.CancelledError:
-            pass
-        finally:
-            _tg = None
+        while not result:
+            ready: list[Any] = []
+            try:
+                async with TaskGroup() as tg:
+                    _tg = tg
+                    for ch in channels:
+                        tg.start_soon(_notify_one, ch, ready)
+            except BaseExceptionGroup as eg:
+                for exc in eg.exceptions:
+                    if not isinstance(exc, asyncio.CancelledError):
+                        raise
+            except asyncio.CancelledError:
+                cur = asyncio.current_task()
+                if cur is not None and cur.cancelling() > 0:
+                    raise  # the select task itself was cancelled — exit
+                # Soft-failure signal from the first reporting notifier —
+                # unwind and re-arbitrate.
+                pass
+            finally:
+                _tg = None
+
+            # Arbitration: only the winner consumes.  The notifiers never
+            # consumed, so items on non-winner channels stay buffered and can
+            # be received later (BUG-4).
+            for ch in ready:
+                try:
+                    val = ch.try_recv()
+                    result.append((ch, val))
+                    return
+                except (ChannelClosedError, WouldBlock):
+                    # A concurrent consumer stole the item after readiness was
+                    # reported — try the next ready channel.
+                    continue
+            # Every reported channel was stolen — re-register and wait again.
+            await asyncio.sleep(0)
 
     select_task = asyncio.create_task(_select())
 
@@ -294,6 +323,12 @@ async def select_channel(
     except (BaseExceptionGroup, asyncio.CancelledError):
         pass
 
+    if result:
+        # WHY: the winner was decided in the same instant the timeout fired —
+        # the item was already consumed by the arbitration, so surface it
+        # instead of losing it (W4).
+        return result[0]
+
     raise TimeoutError("select_channel timed out")
 
 
@@ -314,11 +349,16 @@ class AsyncWaitGroup:
         return "<AsyncWaitGroup>"
 
     def add(self, delta: int = 1) -> None:
-        """Increment the internal counter.
+        """Adjust the internal counter by ``delta`` (Go ``sync.WaitGroup`` semantics).
+
+        Negative deltas are allowed but must not drive the counter below zero.
 
         :param delta:
             Amount to add to the counter. Defaults to 1.
         :type delta: int
+
+        :raises RuntimeError:
+            If the counter would go negative.
 
         """
         self._inner.add(delta)

@@ -4,7 +4,7 @@ A high-performance, Go-like concurrency library for free-threaded Python,
 built around a Rust core. Key capabilities:
 
 - EventLoopThreadPool with round-robin scheduling and work stealing
-- FastChannel / AsyncChannel and select_channel for Go-style communication
+- FastChannel and select_channel for Go-style communication
 - CancelScope and TaskGroup for structured concurrency
 - AsyncContext, AsyncWaitGroup, AsyncOnce, AsyncRWMutex primitives
 - ASGI worker (GsyncioASGIWorker) for FastAPI-style servers
@@ -23,7 +23,6 @@ from gsyncio._cancel import (
     move_on_after,
     move_on_at,
 )
-from gsyncio._channel_wrappers import ReceiveChannel, SendChannel
 from gsyncio._logging import get_logger, set_log_level
 from gsyncio._sync import (
     Barrier,
@@ -36,7 +35,6 @@ from gsyncio._sync import (
 )
 from gsyncio._taskgroup import TaskGroup, TaskHandle, TaskStatus
 from gsyncio.asgi import GsyncioASGIWorker
-from gsyncio.channel import AsyncChannel
 from gsyncio.context import AsyncContext
 from gsyncio.exceptions import (
     ChannelClosedError,
@@ -62,11 +60,6 @@ from gsyncio.server import ConnectionPinningServer
 __version__ = "0.1.0"
 
 
-async def open_channel() -> FastChannel:
-    """Create and return a new FastChannel (asyncssh-style facade)."""
-    return FastChannel()
-
-
 async def run_in_pool(coro: Any, *args: Any, num_threads: int = 0, **kwargs: Any) -> Any:
     """Run a coroutine in a freshly-created pool (one-shot convenience)."""
     pool = EventLoopThreadPool(num_threads=num_threads)
@@ -79,7 +72,6 @@ async def run_in_pool(coro: Any, *args: Any, num_threads: int = 0, **kwargs: Any
 
 
 __all__ = [
-    "AsyncChannel",
     "AsyncContext",
     "AsyncOnce",
     "AsyncRWMutex",
@@ -98,9 +90,7 @@ __all__ = [
     "GsyncioError",
     "Lock",
     "PoolOptions",
-    "ReceiveChannel",
     "Semaphore",
-    "SendChannel",
     "TaskGroup",
     "TaskHandle",
     "TaskStatus",
@@ -116,7 +106,6 @@ __all__ = [
     "get_logger",
     "move_on_after",
     "move_on_at",
-    "open_channel",
     "run_in_pool",
     "select_channel",
     "set_log_level",

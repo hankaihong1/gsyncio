@@ -21,7 +21,7 @@ class AsyncContext:
     """
 
     def __init__(self, parent: AsyncContext | None = None) -> None:
-        self.parent = parent
+        self._parent = parent
         self._cancelled = False
         self._lock = threading.Lock()
         self._cancel_scope = CancelScope()
@@ -33,6 +33,14 @@ class AsyncContext:
 
     def __repr__(self) -> str:
         return f"<AsyncContext cancelled={self.is_cancelled}>"
+
+    @property
+    def parent(self) -> AsyncContext | None:
+        """Return the parent context, or ``None`` for a root context.
+
+        Read-only: the parent is fixed at construction time.
+        """
+        return self._parent
 
     def _add_child(self, child: AsyncContext) -> None:
         with self._lock:

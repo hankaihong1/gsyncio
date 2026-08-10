@@ -12,11 +12,9 @@
 - [快速示例](#快速示例-quick-examples)
 - [核心引擎](#核心引擎-core-engine)
   - [`EventLoopThreadPool`](#eventloopthreadpool)
-    - [`submit_group`](#submit_group)
   - [`PoolOptions`](#pooloptions)
 - [顶层函数](#顶层函数-top-level-functions)
   - [`create_pool`](#create_pool)
-  - [`open_channel`](#open_channel)
   - [`run_in_pool`](#run_in_pool)
   - [`checkpoint`](#checkpoint)
   - [`fail_after`](#fail_after)
@@ -28,9 +26,6 @@
   - [`set_log_level`](#set_log_level)
 - [Golang 风格通道与多路复用](#golang-风格通道与多路复用-golang-style-channels--multiplexing)
   - [`FastChannel`](#fastchannel)
-  - [`SendChannel`](#sendchannel)
-  - [`ReceiveChannel`](#receivechannel)
-  - [`AsyncChannel`](#asynchchannel)
   - [`select_channel`](#select_channel)
 - [任务管理](#任务管理-task-management)
   - [`TaskGroup`](#taskgroup)
@@ -81,7 +76,7 @@ async def heavy_task(x: int) -> int:
 async def main():
     async with gsyncio.EventLoopThreadPool(num_threads=2) as pool:
         fut1 = pool.submit(heavy_task, 21)
-        fut2 = pool.submit(heavy_task, 21, loop=0)  # pinned to worker 0
+        fut2 = pool.submit(heavy_task, 21, pin_to=0)  # pinned to worker 0
         results = await asyncio.gather(fut1, fut2)
         print(results)  # [42, 42]
 
@@ -358,25 +353,24 @@ EventLoopThreadPool(
 ##### `async close()` -> `None`
 优雅停止所有 worker 循环：排空待处理任务、join 所有 worker 线程。
 
+排空有上限：`close()` 最多等待约 5 秒让进行中的任务完成，之后强制停止所有 worker 循环——届时仍在运行的任务会被取消，不保证完成。
+
 ##### `async abort()` -> `None`
 强制停止所有 worker 循环，**不**排空待处理任务。已排队未执行的工作被丢弃。
 
 ##### `async wait_closed()` -> `None`
 等待池完全停止。池未运行时立即返回。
 
-##### `submit(target: Callable[..., Any], *args: Any, loop: asyncio.AbstractEventLoop | int | None = None, cancel_scope: CancelScope | None = None, **kwargs: Any)` -> `asyncio.Future`
+##### `submit(target: Callable[..., Any], *args: Any, pin_to: asyncio.AbstractEventLoop | int | None = None, cancel_scope: CancelScope | None = None, **kwargs: Any)` -> `asyncio.Future`
 把协程函数、协程对象或可调用对象提交到共享工作队列。worker 空闲时拉取
 执行。返回解析为任务结果的 `asyncio.Future`。
 
-- **`loop`**：可选地把任务钉到指定 worker 循环（`int` worker 下标或池管理
+- **`pin_to`**：可选地把任务钉到指定 worker 循环（`int` worker 下标或池管理
   的 `AbstractEventLoop`）。为 `None` 时任务进全局共享队列。
 - **`cancel_scope`**：可选地把任务绑定到 `CancelScope`；已取消的 scope
   会抑制任务结果。
-- **抛出**：池已关闭时抛 `ThreadPoolClosedError`，非法 `loop` 下标抛
+- **抛出**：池已关闭时抛 `ThreadPoolClosedError`，非法 `pin_to` 下标抛
   `ValueError`。
-
-##### `submit_daemon(target: Callable[..., Any], *args: Any, **kwargs: Any)` -> `asyncio.Future`
-提交长驻的 daemon 协程任务到池。
 
 ##### `get_metrics()` -> `dict[str, Any]`
 返回可 JSON 序列化的健康指标字典：
@@ -389,17 +383,7 @@ EventLoopThreadPool(
 }
 ```
 
-##### `async submit_group()` -> `AsyncIterator[_PoolGroup]`
-批量提交任务的异步上下文管理器。通过 `group.start_soon(coro_fn, *args)`
-注册的子任务经 `submit()` 路由，在池的 worker 事件循环上执行（而不是
-调用方的循环）。池关闭时，所有待处理子任务被自动取消。
 
-```python
-async with pool.submit_group() as group:
-    group.start_soon(worker, "a")
-    group.start_soon(worker, "b")
-# All submitted tasks are guaranteed finished here.
-```
 
 ##### 上下文管理器
 支持 `async with EventLoopThreadPool(...) as pool:` 自动启动
@@ -439,14 +423,6 @@ async def create_pool(
 创建并**启动**一个池，返回可直接使用的池（`asyncssh` 风格 facade）。
 `num_threads=0` 时通过 `os.cpu_count()` 自动检测。可作异步上下文管理器
 使用，或完成后手动调用 `close()`。
-
-### `open_channel`
-
-```text
-async def open_channel() -> FastChannel
-```
-
-创建并返回一个新的无界 `FastChannel`（`asyncssh` 风格 facade）。
 
 ### `run_in_pool`
 
@@ -617,8 +593,7 @@ FastChannel(maxsize: int = 0)
 ##### `qsize()` -> `int`
 返回当前缓冲在通道中的元素数量。
 
-##### `split()` -> `tuple[SendChannel, ReceiveChannel]`
-把通道拆成只发/只收两半，共享同一底层通道。
+
 
 ##### `close()` -> `None`
 关闭通道。所有挂起的发送者/接收者以 `ChannelClosedError` 被唤醒。
@@ -628,67 +603,6 @@ FastChannel(maxsize: int = 0)
 
 ##### `__aiter__()` & `__anext__()`
 支持 `async for item in ch:` 迭代。通道关闭且为空时自动终止。
-
----
-
-### `SendChannel`
-
-拆分通道的只写半部，由 `channel.split()` 产生。只暴露发送操作；在发送侧
-调用 `close()` 会关闭底层通道。
-
-#### 方法
-
-##### `async send(item: Any)` -> `None`
-向通道发送元素。满时挂起。
-- **抛出**：通道已关闭时抛 `ChannelClosedError`。
-
-##### `try_send(item: Any)` -> `bool`
-非阻塞发送。成功返回 `True`，满返回 `False`。
-
-##### `close()` -> `None`
-关闭底层通道。所有挂起的发送者/接收者以 `ChannelClosedError` 被唤醒。
-
----
-
-### `ReceiveChannel`
-
-拆分通道的只读半部，由 `channel.split()` 产生。只暴露接收操作；
-`close()` 是 no-op——关闭底层通道由发送侧负责。
-
-#### 方法
-
-##### `async recv(timeout: float | None = None)` -> `Any`
-从通道接收元素。为空时挂起。
-- **`timeout`** (*float | None*)：超时秒数。
-- **抛出**：关闭且为空抛 `ChannelClosedError`，超时抛 `TimeoutError`。
-
-##### `try_recv()` -> `Any`
-非阻塞接收。
-- **抛出**：为空抛 `WouldBlock`，关闭且为空抛 `ChannelClosedError`。
-
-##### `qsize()` -> `int`
-当前缓冲的元素数量。
-
-##### `__aiter__()` & `__anext__()`
-支持 `async for item in recv_ch:` 迭代。关闭且为空时自动终止。
-
-##### `close()` -> `None`
-No-op——关闭底层通道由发送侧负责。
-
----
-
-### `AsyncChannel`
-
-纯 Python 跨线程通道。
-
-```python
-ch = AsyncChannel(maxsize=10)
-await ch.send("data")
-val = await ch.recv()
-```
-
-与 `FastChannel` 接口相同（含 `try_send`、`try_recv`、`qsize`、
-`split`）。支持 `async for item in ch:`。
 
 ---
 
@@ -702,7 +616,7 @@ async def select_channel(
 ) -> Any
 ```
 
-从多个 `FastChannel` 或 `AsyncChannel` 中选择第一个就绪的通道（Go
+从多个 `FastChannel` 中选择第一个就绪的通道（Go
 `select` 风格）。
 
 - **返回**：`(selected_channel, value)`。
@@ -853,8 +767,7 @@ CapacityLimiter(total_tokens: float)
   请用此方法而不是分别读三个属性——分开读可能混入针对不同总额计算出的
   值。
 - **`acquire()`**：获取一个令牌，挂起直到可用。
-- **`acquire_on_behalf_of(borrower)`**：代另一个任务/对象获取令牌。
-- **`release()`** / **`release_on_behalf_of(borrower)`**：归还一个令牌。
+- **`release()`**：归还一个令牌。
 
 ### `Event`
 
@@ -898,7 +811,6 @@ Barrier(parties: int)
 
 `Barrier.wait()` 返回的结果对象。
 
-- **`fulfilled`** -> `bool`：正常返回恒为 `True`。
 - **`parties`** -> `int`：本回合屏障的 party 总数。
 
 ### `AsyncContext`
@@ -913,6 +825,7 @@ ctx = AsyncContext(parent: AsyncContext | None = None)
   与已提交的 future。
 - **`ctx.submit(pool, target, *args, **kwargs)`**：向池提交绑定到本上下文
   的任务。
+- **`ctx.parent`**：父上下文，根上下文为 `None`（只读，构造时固定）。
 - **`ctx.is_cancelled`**：已取消则返回 `True`。
 
 ---
@@ -927,6 +840,8 @@ wg.add(2)
 # In worker tasks: wg.done()
 await wg.wait()
 ```
+
+所有正数 `add()` 调用必须先于同一计数器的第一次 `wait()`（与 Go `sync.WaitGroup` 一致）：并发的 `add()` 与 `wait()` 竞争会丢失唤醒并永久挂起。允许负数增量（Go 语义），但不得把计数器减到 0 以下——否则抛出 `RuntimeError`。
 
 ---
 

@@ -262,8 +262,6 @@ uv run pytest --lf
   跑纯 Python 部分）。
 - `yielder` fixture → `wait_all_tasks_blocked()`：等所有任务阻塞后再断言，
   消除"还没开始就断言"的时序假阳性。
-- `checkpoints` fixture → `assert_checkpoints(...)`：记录事件顺序的上下文
-  管理器，验证交错顺序符合预期。
 
 ### 5.4 本地资源约束（M1 8GB 实测）
 

@@ -129,7 +129,7 @@ async def main():
         fut1 = pool.submit(heavy_task, 21)
 
         # 显式指定目标 Worker Loop (有状态连接亲和性)
-        fut2 = pool.submit(heavy_task, 21, loop=0)  # Output: 42
+        fut2 = pool.submit(heavy_task, 21, pin_to=0)  # Output: 42
 
         # 查阅池健康指标
         print("Metrics:", pool.get_metrics())

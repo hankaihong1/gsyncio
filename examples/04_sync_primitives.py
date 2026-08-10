@@ -73,7 +73,7 @@ async def main() -> None:
 
     async def party(name: str) -> None:
         result = await barrier.wait()
-        print(f"  {name} 过关 (fulfilled={result.fulfilled})")
+        print(f"  {name} 过关 (parties={result.parties})")
 
     await asyncio.gather(*(party(f"p{i}") for i in range(3)))
 

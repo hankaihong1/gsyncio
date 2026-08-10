@@ -51,7 +51,8 @@ class Lock:
         the queue and a :class:`asyncio.CancelledError` is propagated.
         """
         task = asyncio.current_task()
-        assert task is not None, "acquire() must be called from an asyncio task"
+        if task is None:
+            raise RuntimeError("acquire() must be called from an asyncio task")
 
         with self._lock:
             # WHY: The owner task can die without releasing (CancelledError racing
@@ -73,6 +74,14 @@ class Lock:
         except asyncio.CancelledError:
             with self._lock:
                 self._discard_waiter(task)
+                # WHY: release() may already have popped this waiter and handed
+                # it ownership (BUG-8).  The lock would then belong to a dead
+                # task and every later FIFO waiter starves.  Forward it to the
+                # next live waiter — the same token-forwarding pattern as
+                # Semaphore._cancel_waiter; a cancelled successor forwards
+                # again via its own cancel handler (chain forwarding).
+                if self._owner is task:
+                    self._release_locked()
             raise
 
     def release(self) -> None:
@@ -81,22 +90,29 @@ class Lock:
         :raises RuntimeError: if called by a task that does not own the lock.
         """
         task = asyncio.current_task()
-        assert task is not None, "release() must be called from an asyncio task"
+        if task is None:
+            raise RuntimeError("release() must be called from an asyncio task")
 
         with self._lock:
             if self._owner is not task:
                 raise RuntimeError("Lock.release() called by a task that does not own the lock")
+            self._release_locked()
 
-            while self._waiters:
-                waiter_task, event = self._waiters.popleft()
-                if waiter_task.done():
-                    continue
-                self._owner = waiter_task
-                waiter_loop = waiter_task.get_loop()
-                waiter_loop.call_soon_threadsafe(event.set)
-                return
+    def _release_locked(self) -> None:
+        """Hand ownership to the next live waiter, or free the lock.
 
-            self._owner = None
+        Caller must hold ``_lock``.
+        """
+        while self._waiters:
+            waiter_task, event = self._waiters.popleft()
+            if waiter_task.done():
+                continue
+            self._owner = waiter_task
+            waiter_loop = waiter_task.get_loop()
+            waiter_loop.call_soon_threadsafe(event.set)
+            return
+
+        self._owner = None
 
     async def __aenter__(self) -> Self:
         await self.acquire()
@@ -247,10 +263,6 @@ class CapacityLimiter:
     be dynamically resized.  Available and borrowed tokens are computed from
     the underlying semaphore value.  ``total_tokens`` may be a fractional
     float; the underlying semaphore capacity is ``int(total_tokens)``.
-
-    ``acquire_on_behalf_of`` and ``release_on_behalf_of`` accept a
-    *borrower* object for future ownership tracking (currently a no-op
-    slot).
     """
 
     def __init__(self, total_tokens: float) -> None:
@@ -331,18 +343,8 @@ class CapacityLimiter:
         """Acquire one token, blocking if none are available."""
         await self._semaphore.acquire()
 
-    async def acquire_on_behalf_of(self, borrower: object) -> None:
-        """Acquire one token on behalf of *borrower*."""
-        _ = borrower
-        await self._semaphore.acquire()
-
     def release(self) -> None:
         """Release one token."""
-        self._semaphore.release()
-
-    def release_on_behalf_of(self, borrower: object) -> None:
-        """Release one token on behalf of *borrower*."""
-        _ = borrower
         self._semaphore.release()
 
     async def __aenter__(self) -> Self:
@@ -492,7 +494,13 @@ class Condition:
         try:
             await event.wait()
         except BaseException:
-            self._discard_waiter(event)
+            # WHY: notify() may already have popped and woken this waiter —
+            # the notification is then lost (W11).  Forward it to the next
+            # FIFO waiter so notify(n) semantics are preserved; a cancelled
+            # successor forwards again via its own cancel handler.
+            was_present = self._discard_waiter(event)
+            if not was_present:
+                self._forward_notify()
             from gsyncio._cancel import CancelScope
 
             async with CancelScope(shield=True):
@@ -541,11 +549,25 @@ class Condition:
                 popped.append(self._waiters.popleft())
             return popped
 
-    def _discard_waiter(self, event: asyncio.Event) -> None:
-        """Remove *event* from the waiter deque if still present."""
+    def _discard_waiter(self, event: asyncio.Event) -> bool:
+        """Remove *event* from the waiter deque if still present.
+
+        Returns ``True`` if the entry was still queued (i.e. this waiter was
+        cancelled while waiting), ``False`` if notify() had already popped it
+        — in which case the notification must be forwarded.
+        """
         with self._waiters_lock:
             remaining = collections.deque(entry for entry in self._waiters if entry[1] is not event)
+            was_present = len(remaining) != len(self._waiters)
             self._waiters = remaining
+            return was_present
+
+    def _forward_notify(self) -> None:
+        """Pass a lost notification to the next FIFO waiter (caller holds nothing)."""
+        with self._waiters_lock:
+            if self._waiters:
+                next_loop, next_event = self._waiters.popleft()
+                next_loop.call_soon_threadsafe(next_event.set)
 
 
 # ============================================================================
@@ -557,18 +579,16 @@ class BarrierWaitResult:
     """Simple result object returned by :meth:`Barrier.wait`.
 
     Attributes:
-        fulfilled: Always ``True`` for a normal return.
         parties: Total number of parties in this barrier round.
     """
 
-    __slots__ = ("fulfilled", "parties")
+    __slots__ = ("parties",)
 
-    def __init__(self, fulfilled: bool, parties: int) -> None:
-        self.fulfilled = fulfilled
+    def __init__(self, parties: int) -> None:
         self.parties = parties
 
     def __repr__(self) -> str:
-        return f"<BarrierWaitResult fulfilled={self.fulfilled}, parties={self.parties}>"
+        return f"<BarrierWaitResult parties={self.parties}>"
 
 
 class Barrier:
@@ -606,8 +626,9 @@ class Barrier:
     async def wait(self) -> BarrierWaitResult:
         """Wait at the barrier until *parties* tasks have arrived.
 
-        Returns a :class:`BarrierWaitResult` with ``fulfilled=True``
-        and ``parties`` set to the barrier's party count.
+        Returns a :class:`BarrierWaitResult` with ``parties`` set to the
+        barrier's party count.  A normal return always means the round was
+        completed; :meth:`abort` raises instead.
 
         :raises RuntimeError: if :meth:`abort` is called.
         """
@@ -623,7 +644,7 @@ class Barrier:
                     l.call_soon_threadsafe(e.set)
                 self._waiters.clear()
                 self._generation += 1
-                return BarrierWaitResult(fulfilled=True, parties=self._parties)
+                return BarrierWaitResult(parties=self._parties)
             self._waiters.append((loop, event))
             generation = self._generation
 
@@ -645,7 +666,7 @@ class Barrier:
         with self._mutex:
             if self._aborted:
                 raise RuntimeError("barrier has been aborted")
-            return BarrierWaitResult(fulfilled=True, parties=self._parties)
+            return BarrierWaitResult(parties=self._parties)
 
     def abort(self) -> None:
         """Abort the barrier, raising :exc:`RuntimeError` in all waiting tasks.

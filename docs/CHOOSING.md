@@ -16,13 +16,12 @@
 | Run async tasks in parallel across a multi-thread pool | `EventLoopThreadPool.submit()` / `run_in_pool()` | The only entry point that executes coroutines cross-thread; manage the pool with `async with` |
 | Explicitly create a pool object (deferred start / custom options) | `create_pool(num_threads=..., **PoolOptions)` | More controllable than `run_in_pool`; returns a reusable pool |
 | Submit a batch of tasks and collect results together | `pool.submit_group()` (with `group.start_soon()`) | Batch dispatch + batch wait; children auto-cancelled on pool close |
-| Submit a long-running background task (semantic marker) | `pool.submit_daemon(target, ...)` | Alias of `submit` that expresses "daemon" intent |
-| Pin a task to a fixed worker (stateful connection affinity) | `pool.submit(..., loop=N)` | Dedicated local queue, deterministic routing |
+| Pin a task to a fixed worker (stateful connection affinity) | `pool.submit(..., pin_to=N)` | Dedicated local queue, deterministic routing |
 | Communicate between tasks (Go channel style) | `FastChannel` | Rust flume lock-free channel, fastest cross-thread |
 | Race multiple channels and take the first ready one (Go select) | `select_channel(*channels)` | First ready channel wins |
 | Expose only send / only receive halves | `SendChannel` / `ReceiveChannel` (`ch.split()`) | Interface-level misuse prevention |
 | Iterate a data stream elegantly (until close) | `AsyncChannel` or `FastChannel` (`async for item in ch:`) | Iteration protocol + auto termination on close |
-| Just want a ready-made channel (asyncssh zero-config) | `open_channel()` | Top-level facade, no pool needed |
+| Just want a ready-made channel (asyncssh zero-config) | `FastChannel()` | Direct construction, no pool needed |
 | Mutually exclusive access to a shared resource | `Lock` | Fair FIFO, safe across loops/threads |
 | Limit concurrency (N permits) | `Semaphore` | Fixed permit pool, FIFO waiting |
 | Dynamically resize the concurrency cap | `CapacityLimiter` | `total_tokens` resizable at runtime |
@@ -48,7 +47,7 @@
 ## Primitive Quick Reference (one line each)
 
 - **`EventLoopThreadPool`** — a pool = N isolated asyncio loops; `submit` goes
-  through a global lock-free queue with work stealing; the `loop=` argument
+  through a global lock-free queue with work stealing; the `pin_to=` argument
   uses a dedicated local queue. The pool is an **async context manager**:
   `async with EventLoopThreadPool(num_threads=4) as pool:`.
 - **`FastChannel`** — data plane in Rust (flume), wait plane in Python
@@ -89,6 +88,7 @@
 import asyncio
 import gsyncio
 
+
 async def main():
     # Pool: submit + await result
     async with gsyncio.EventLoopThreadPool(num_threads=4) as pool:
@@ -105,6 +105,7 @@ async def main():
     wg.add(1)
     wg.done()
     await wg.wait()
+
 
 asyncio.run(main())
 ```

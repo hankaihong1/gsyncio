@@ -130,7 +130,7 @@ async def main():
         fut1 = pool.submit(heavy_task, 21)
 
         # Explicitly target a worker loop (stateful connection affinity)
-        fut2 = pool.submit(heavy_task, 21, loop=0)  # Output: 42
+        fut2 = pool.submit(heavy_task, 21, pin_to=0)  # Output: 42
 
         # Inspect pool health metrics
         print("Metrics:", pool.get_metrics())

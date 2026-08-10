@@ -108,9 +108,7 @@ def test_api_mirror_symbols_match() -> None:
     """API.md 与 API_ZH.md 的 ### `X` 符号集合必须一致（符号不翻译）。"""
     en = _extract_api_symbols(ROOT / "docs" / "API.md")
     zh = _extract_api_symbols(ROOT / "docs" / "API_ZH.md")
-    assert en == zh, (
-        f"API 镜像符号集不一致: 仅英文={sorted(en - zh)}, 仅中文={sorted(zh - en)}"
-    )
+    assert en == zh, f"API 镜像符号集不一致: 仅英文={sorted(en - zh)}, 仅中文={sorted(zh - en)}"
 
 
 def test_doc_mirror_headings_count_match() -> None:
@@ -121,6 +119,5 @@ def test_doc_mirror_headings_count_match() -> None:
             en_n = len(_count_headings(en_path, level))
             zh_n = len(_count_headings(zh_path, level))
             assert en_n == zh_n, (
-                f"{en_name} 与 {zh_name} 的 {'#' * level} 标题数不一致: "
-                f"英文={en_n}, 中文={zh_n}"
+                f"{en_name} 与 {zh_name} 的 {'#' * level} 标题数不一致: 英文={en_n}, 中文={zh_n}"
             )

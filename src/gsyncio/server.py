@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import socket
 import sys
+import threading
 from typing import TYPE_CHECKING, Any, Self
 
 if TYPE_CHECKING:
@@ -56,7 +58,12 @@ class ConnectionPinningServer:
         # live on the worker loops and are awaited nowhere, so close() must
         # cancel them explicitly or the pool shutdown orphans them
         # ("Task was destroyed but it is pending!").
+        # WHY: the set is mutated on worker loops (add/discard callbacks) and
+        # iterated from close() on another thread — a bare set races on
+        # free-threaded builds (W20), so every access goes through the lock.
         self._conn_tasks: set[asyncio.Task[Any]] = set()
+        self._conn_tasks_lock = threading.Lock()
+        self._running_lock = threading.Lock()
         self._running = False
 
     @property
@@ -67,7 +74,8 @@ class ConnectionPinningServer:
         :rtype: :class:`bool`
 
         """
-        return self._running
+        with self._running_lock:
+            return self._running
 
     def __repr__(self) -> str:
         return (
@@ -103,7 +111,8 @@ class ConnectionPinningServer:
 
         self.port = sock.getsockname()[1]
         self._server_socket = sock
-        self._running = True
+        with self._running_lock:
+            self._running = True
         self._accept_tasks = []
 
         # 多 acceptor 共享同一 listener socket（Thundering Herd）：
@@ -128,31 +137,44 @@ class ConnectionPinningServer:
     ) -> None:
         """Dedicated acceptor running on a worker thread sharing the main socket."""
         loop = asyncio.get_running_loop()
-        while self._running:
+        backoff = 0.001
+        while self.is_running:
             try:
-                client_sock, _addr = await loop.sock_accept(shared_sock)
+                client_sock, addr = await loop.sock_accept(shared_sock)
                 client_sock.setblocking(False)
                 # Pure local execution on the worker's loop! Zero IPC!
                 conn_task = loop.create_task(
-                    self._run_pinned_connection(client_sock, loop, handler)
+                    self._run_pinned_connection(client_sock, loop, handler, addr)
                 )
                 # Track so close() can cancel in-flight handlers; discard is
                 # invoked on the worker loop thread, and set ops are
                 # thread-safe under both GIL and free-threaded builds.
-                self._conn_tasks.add(conn_task)
-                conn_task.add_done_callback(self._conn_tasks.discard)
+                with self._conn_tasks_lock:
+                    self._conn_tasks.add(conn_task)
+                conn_task.add_done_callback(self._discard_conn_task)
+                backoff = 0.001  # success resets the error backoff
             except asyncio.CancelledError:
                 break
             except (OSError, RuntimeError):
                 # EWOULDBLOCK / EAGAIN are handled internally by asyncio,
-                # so if we hit OSError here it's likely a real error or thundering herd race condition
-                await asyncio.sleep(0.001)
+                # so if we hit OSError here it's likely a real error or
+                # thundering herd race condition.  Exponential backoff
+                # (1ms → … → 100ms cap) keeps a persistently failing accept
+                # from spinning the worker loop (C3).
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 0.1)
+
+    def _discard_conn_task(self, task: asyncio.Task[Any]) -> None:
+        """Done-callback: remove *task* from the tracked connection set."""
+        with self._conn_tasks_lock:
+            self._conn_tasks.discard(task)
 
     async def _run_pinned_connection(
         self,
         client_sock: socket.socket,
         target_loop: asyncio.AbstractEventLoop,
-        handler: Callable[[asyncio.StreamReader, asyncio.StreamWriter], Any],
+        handler: Callable[..., Any],
+        addr: tuple[str, int] | None = None,
     ) -> None:
         """Run connection handler pinned on target_loop with silent disconnect handling."""
         reader = asyncio.StreamReader(loop=target_loop)
@@ -163,6 +185,18 @@ class ConnectionPinningServer:
             transport, _ = await target_loop.connect_accepted_socket(lambda: protocol, client_sock)
             writer = asyncio.StreamWriter(transport, protocol, reader, target_loop)
 
+            # WHY: handlers may opt into the client address via a third
+            # parameter (e.g. the ASGI worker for scope["client"]); legacy
+            # two-parameter handlers keep working unchanged (S-2).
+            if addr is not None:
+                try:
+                    sig = inspect.signature(handler)
+                    handler_arity = len(sig.parameters)
+                except (TypeError, ValueError):
+                    handler_arity = 2
+                if handler_arity >= 3:
+                    await handler(reader, writer, addr)
+                    return
             await handler(reader, writer)
         except (
             ConnectionResetError,
@@ -180,7 +214,8 @@ class ConnectionPinningServer:
 
     async def close(self) -> None:
         """Stop server listening, cancel in-flight connection handlers."""
-        self._running = False
+        with self._running_lock:
+            self._running = False
 
         if getattr(self, "_accept_tasks", None):
             for fut in self._accept_tasks:
@@ -193,7 +228,8 @@ class ConnectionPinningServer:
         # actually unwind each handler (its finally closes the transport),
         # pass 2 catches any task accepted in the shutdown window.
         for _ in range(2):
-            tasks = list(self._conn_tasks)
+            with self._conn_tasks_lock:
+                tasks = list(self._conn_tasks)
             if not tasks:
                 break
             for task in tasks:
@@ -209,7 +245,7 @@ class ConnectionPinningServer:
                         ),
                         timeout=2,
                     )
-                except (Exception, TimeoutError):
+                except Exception:
                     pass
 
         if getattr(self, "_server_socket", None) and self._server_socket:

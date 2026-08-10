@@ -173,18 +173,6 @@ async def test_capacity_limiter_dynamic_total():
 
 
 @pytest.mark.asyncio
-async def test_capacity_limiter_on_behalf_of():
-    """acquire_on_behalf_of / release_on_behalf_of delegate to semaphore."""
-    limiter = CapacityLimiter(2.0)
-    borrower = object()
-
-    await limiter.acquire_on_behalf_of(borrower)
-    assert limiter.available_tokens == 1.0
-    limiter.release_on_behalf_of(borrower)
-    assert limiter.available_tokens == 2.0
-
-
-@pytest.mark.asyncio
 async def test_capacity_limiter_context_manager():
     """async with limiter: works."""
     limiter = CapacityLimiter(1.0)

@@ -1,4 +1,4 @@
-"""Shared base class for AsyncChannel and FastChannel."""
+"""Shared base class for FastChannel (AsyncChannel removed in FIX-8a)."""
 
 import asyncio
 import collections
@@ -11,6 +11,33 @@ from gsyncio.exceptions import ChannelClosedError
 _Waiter = tuple[asyncio.AbstractEventLoop, asyncio.Future[Any]]
 
 _CHANNEL_CLOSED_MSG = "Channel is closed"
+
+
+def _set_soon(
+    loop: asyncio.AbstractEventLoop,
+    fut: asyncio.Future[Any],
+    exc: BaseException | None = None,
+) -> None:
+    """Complete *fut* on its owning loop, tolerating a raced cancellation.
+
+    WHY: the old guard wrapped call_soon_threadsafe itself, where an
+    InvalidStateError (waiter cancelled between pop and delivery) surfaced
+    asynchronously in the loop exception handler (W21).  Moving the guard
+    inside the scheduled callback contains it.
+    """
+
+    def _do() -> None:
+        try:
+            if exc is not None:
+                fut.set_exception(exc)
+            else:
+                fut.set_result(None)
+        except asyncio.InvalidStateError:
+            # The waiter was cancelled after the pop — its cancel handler
+            # already cleaned up; nothing to deliver.
+            pass
+
+    loop.call_soon_threadsafe(_do)
 
 
 def _wake_all(
@@ -36,30 +63,12 @@ def _wake_all(
             loop, fut = waiters.popleft()
             if fut.done():
                 continue
-            if exc is not None:
-                try:
-                    loop.call_soon_threadsafe(fut.set_exception, exc)
-                except asyncio.InvalidStateError:
-                    pass
-            else:
-                try:
-                    loop.call_soon_threadsafe(fut.set_result, None)
-                except asyncio.InvalidStateError:
-                    pass
+            _set_soon(loop, fut, exc)
             woken += 1
         return
     for loop, fut in waiters:
         if not fut.done():
-            if exc is not None:
-                try:
-                    loop.call_soon_threadsafe(fut.set_exception, exc)
-                except asyncio.InvalidStateError:
-                    pass
-            else:
-                try:
-                    loop.call_soon_threadsafe(fut.set_result, None)
-                except asyncio.InvalidStateError:
-                    pass
+            _set_soon(loop, fut, exc)
 
 
 def _discard_waiter(waiters: collections.deque[_Waiter], fut: asyncio.Future[Any]) -> None:
@@ -76,10 +85,47 @@ class _BaseChannel:  # pyright: ignore[reportUnusedClass]
         self._lock = threading.Lock()
         self._getters: collections.deque[_Waiter] = collections.deque()
         self._putters: collections.deque[_Waiter] = collections.deque()
+        # WHY: select_channel needs "channel became non-empty" signals that do
+        # NOT consume the item (only the select winner may consume).  Notifier
+        # events are one-shot: _wakeup_notifiers pops them, so a woken notifier
+        # must re-register (its caller holds the new event).
+        self._notifiers: collections.deque[tuple[asyncio.AbstractEventLoop, asyncio.Event]] = (
+            collections.deque()
+        )
 
     def _wakeup_next(self, waiters: collections.deque[_Waiter]) -> None:
         """Wake the first non-done future in the waiter deque."""
         _wake_all(waiters, count=1)
+
+    def _wakeup_notifiers(self) -> None:
+        """Wake every registered notifier event (caller must hold ``_lock``)."""
+        while self._notifiers:
+            loop, event = self._notifiers.popleft()
+            loop.call_soon_threadsafe(event.set)
+
+    def _register_notifier(self, loop: asyncio.AbstractEventLoop) -> asyncio.Event | None:
+        """Register a non-consuming readiness notifier.
+
+        Returns ``None`` when the channel already holds an item (the caller
+        should try_recv immediately) — checking under ``_lock`` closes the
+        lost-wakeup window: a send that lands between the qsize check and the
+        registration would otherwise wake nobody.
+        """
+        with self._lock:
+            if self.qsize() > 0:
+                return None
+            event = asyncio.Event()
+            self._notifiers.append((loop, event))
+            return event
+
+    def _discard_notifier(self, loop: asyncio.AbstractEventLoop, event: asyncio.Event) -> None:
+        """Remove a notifier registration (cancelled select reader)."""
+        with self._lock:
+            remaining = collections.deque(
+                entry for entry in self._notifiers if entry[1] is not event
+            )
+            self._notifiers.clear()
+            self._notifiers.extend(remaining)
 
     async def recv(self, timeout: float | None = None) -> Any:
         """Receive an item from the channel.
@@ -126,6 +172,9 @@ class _BaseChannel:  # pyright: ignore[reportUnusedClass]
         exc = ChannelClosedError(_CHANNEL_CLOSED_MSG)
         _wake_all(self._getters, exc=exc)
         _wake_all(self._putters, exc=exc)
+        # Notifiers wake too: a select reader then re-checks the channel and
+        # observes the closed state via try_recv.
+        self._wakeup_notifiers()
 
     def _discard_waiter(
         self, waiters: collections.deque[_Waiter], fut: asyncio.Future[Any]
@@ -152,6 +201,7 @@ class _BaseChannel:  # pyright: ignore[reportUnusedClass]
                 with self._lock:
                     if try_fn(item):
                         self._wakeup_next(self._getters)
+                        self._wakeup_notifiers()
                         return
             except RuntimeError as e:
                 raise ChannelClosedError(_CHANNEL_CLOSED_MSG) from e
@@ -162,6 +212,7 @@ class _BaseChannel:  # pyright: ignore[reportUnusedClass]
                 try:
                     if try_fn(item):
                         self._wakeup_next(self._getters)
+                        self._wakeup_notifiers()
                         return
                 except RuntimeError as e:
                     raise ChannelClosedError(_CHANNEL_CLOSED_MSG) from e
@@ -183,4 +234,4 @@ class _BaseChannel:  # pyright: ignore[reportUnusedClass]
         try:
             return await self.recv()
         except ChannelClosedError:
-            raise StopAsyncIteration
+            raise StopAsyncIteration from None
