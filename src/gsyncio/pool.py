@@ -6,8 +6,7 @@ import asyncio
 import os
 import threading
 import types
-from collections.abc import AsyncGenerator, Callable
-from contextlib import asynccontextmanager
+from collections.abc import Callable
 from typing import Any, Protocol, Self
 
 from gsyncio._cancel import CancelScope
@@ -39,66 +38,6 @@ class _WorkerPoolProtocol(Protocol):
 NativeWorkerPool: type[_WorkerPoolProtocol] | None = _try_import_rust_class(
     "gsyncio._gsyncio_core", "NativeWorkerPool"
 )
-
-
-class _PoolGroup:
-    """TaskGroup-like context manager that submits tasks to pool workers.
-
-    Routes through :meth:`EventLoopThreadPool.submit` instead of
-    :func:`asyncio.create_task` so child tasks execute on pool worker
-    event loops rather than the caller's event loop.
-    """
-
-    def __init__(self, pool: EventLoopThreadPool) -> None:
-        self._pool = pool
-        self._futures: list[asyncio.Future[Any]] = []
-        self._cancel_scope = CancelScope()
-
-    def start_soon(self, coro_fn: Callable[..., Any], *args: Any) -> asyncio.Future[Any]:
-        """Submit a task to the pool (like :meth:`TaskGroup.start_soon` but via pool.submit)."""
-        fut = self._pool.submit(coro_fn, *args)
-        self._futures.append(fut)
-        return fut
-
-    async def __aenter__(self) -> Self:
-        await self._cancel_scope.__aenter__()
-        return self
-
-    async def __aexit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc_val: BaseException | None,
-        exc_tb: object,
-    ) -> bool | None:
-        if not self._futures:
-            return await self._cancel_scope.__aexit__(exc_type, exc_val, exc_tb)
-
-        # Wait for all submitted futures.
-        # If the hosting task was cancelled (e.g. pool close), gather raises
-        # CancelledError — catch it so we can still run CancelScope.__aexit__.
-        try:
-            results = await asyncio.gather(*self._futures, return_exceptions=True)
-        except asyncio.CancelledError:
-            results = [asyncio.CancelledError() for _ in self._futures]
-
-        # Collect real exceptions (not CancelledError from sibling-cancel).
-        exceptions: list[BaseException] = [
-            r
-            for r in results
-            if isinstance(r, BaseException) and not isinstance(r, asyncio.CancelledError)
-        ]
-
-        if exceptions:
-            self._cancel_scope.cancel()
-
-        await self._cancel_scope.__aexit__(exc_type, exc_val, exc_tb)
-
-        if len(exceptions) == 1:
-            raise exceptions[0]
-        if len(exceptions) > 1:
-            raise BaseExceptionGroup("pool group crashed", exceptions)
-
-        return None
 
 
 class EventLoopThreadPool:
@@ -171,8 +110,6 @@ class EventLoopThreadPool:
         if self._native_pool is not None and self._metrics_collector._metrics is not None:
             self._native_pool.set_metrics(self._metrics_collector._metrics)
         self._closed_event = asyncio.Event()
-        self._active_groups: set[_PoolGroup] = set()
-        self._groups_lock = threading.Lock()
 
     def __repr__(self) -> str:
         return (
@@ -375,12 +312,6 @@ class EventLoopThreadPool:
             threads = list(self._threads)
             self._loops.clear()
             self._threads.clear()
-
-        # Cancel all active submit groups before closing the native pool.
-        with self._groups_lock:
-            groups = list(self._active_groups)
-        for g in groups:
-            g._cancel_scope.cancel()
 
         if self._native_pool:
             self._native_pool.close()
@@ -628,28 +559,6 @@ class EventLoopThreadPool:
 
         """
         return self.submit(target, *args, loop=loop, **kwargs)
-
-    @asynccontextmanager
-    async def submit_group(self) -> AsyncGenerator[_PoolGroup]:
-        """Create a :class:`_PoolGroup` context manager for batch task submission.
-
-        Child tasks registered via :meth:`_PoolGroup.start_soon` are routed
-        through :meth:`submit` so they execute on pool worker event loops.
-        All children are automatically cancelled when the pool is closed.
-
-        :returns: An async iterator yielding a :class:`_PoolGroup` instance.
-        :rtype: :class:`_PoolGroup`
-
-        """
-        group = _PoolGroup(self)
-        with self._groups_lock:
-            self._active_groups.add(group)
-        try:
-            async with group:
-                yield group
-        finally:
-            with self._groups_lock:
-                self._active_groups.discard(group)
 
 
 async def create_pool(

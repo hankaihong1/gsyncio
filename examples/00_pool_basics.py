@@ -25,12 +25,7 @@ async def main() -> None:
         fut2 = pool.submit(heavy_task, 21, loop=0)
         print("钉到 worker 0:", await fut2)  # 42
 
-        # 3. 批量提交：start_soon 注册，离开 with 块时全部完成
-        async with pool.submit_group() as group:
-            results = [group.start_soon(heavy_task, i) for i in range(4)]
-        print("批量结果:", [r.result() for r in results])  # [0, 2, 4, 6]
-
-        # 4. 池健康指标（每个 worker 的活跃/完成计数）
+        # 3. 池健康指标（每个 worker 的活跃/完成计数）
         metrics = pool.get_metrics()
         print("metrics 键:", sorted(metrics.keys()))
 

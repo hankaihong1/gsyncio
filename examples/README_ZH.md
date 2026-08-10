@@ -5,7 +5,7 @@
 克隆仓库后（需先 `make develop` 编译 Rust 核心），直接运行：
 
 ```bash
-uv run python examples/00_pool_basics.py      # 线程池：submit / loop 钉选 / submit_group / metrics
+uv run python examples/00_pool_basics.py      # 线程池：submit / loop 钉选 / metrics
 uv run python examples/01_channels_select.py  # 通道：send/recv / async for / select_channel / 非阻塞
 uv run python examples/02_waitgroup_once.py   # 组同步：AsyncWaitGroup / AsyncOnce（含异常缓存）
 uv run python examples/03_taskgroup_timeout.py# 结构化并发：TaskGroup / fail_after / move_on_after / CancelScope

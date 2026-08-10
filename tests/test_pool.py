@@ -4,7 +4,6 @@ import threading
 import pytest
 
 from gsyncio import (
-    AsyncChannel,
     AsyncContext,
     AsyncOnce,
     AsyncRWMutex,
@@ -273,31 +272,8 @@ async def test_work_stealing_and_loop_pinning():
 
 
 @pytest.mark.asyncio
-async def test_submit_group_all_succeed():
-    """Submit 3 tasks via pool.submit_group() — verify all complete with correct results."""
-
-    async def add(a: int, b: int) -> int:
-        return a + b
-
-    async def multiply(a: int, b: int) -> int:
-        return a * b
-
-    async def concat(a: str, b: str) -> str:
-        return a + b
-
-    async with EventLoopThreadPool(num_threads=2) as pool:
-        async with pool.submit_group() as group:
-            f1 = group.start_soon(add, 3, 5)
-            f2 = group.start_soon(multiply, 4, 7)
-            f3 = group.start_soon(concat, "hello", "world")
-
-        results = [await f1, await f2, await f3]
-        assert results == [8, 28, "helloworld"]
-
-
-@pytest.mark.asyncio
-async def test_submit_group_cancel_on_close():
-    """Close pool while a submit_group has slow tasks — verify futures are cancelled."""
+async def test_pool_close_cancels_submitted_slow_tasks():
+    """Close pool while slow tasks are running — verify futures are cancelled."""
 
     async def slow_task(delay: float) -> str:
         await asyncio.sleep(delay)
@@ -306,35 +282,21 @@ async def test_submit_group_cancel_on_close():
     pool = EventLoopThreadPool(num_threads=2)
     await pool.start()
 
-    f1: asyncio.Future[str] | None = None
-    f2: asyncio.Future[str] | None = None
+    f1 = pool.submit(slow_task, 10.0)
+    f2 = pool.submit(slow_task, 10.0)
 
-    async def run_group() -> None:
-        nonlocal f1, f2
-        try:
-            async with pool.submit_group() as group:
-                f1 = group.start_soon(slow_task, 10.0)
-                f2 = group.start_soon(slow_task, 10.0)
-                # Block forever — pool.close() from another task will cancel the group.
-                await asyncio.Event().wait()
-        except asyncio.CancelledError:
-            pass  # Expected: pool close cancels the hosting task.
-
-    group_task = asyncio.create_task(run_group())
-
-    # Give the group time to submit its tasks to workers.
+    # Give the tasks time to be pulled by the workers.
     await wait_all_tasks_blocked()
 
-    # Close the pool from outside the group — triggers cancel on all groups.
+    # Close drains for up to ~5s, then stops the worker loops — the still
+    # running 10s tasks are cancelled and their futures resolve.
     await pool.close()
 
-    await group_task
-
-    # Give call_soon_threadsafe callbacks time to settle on caller's loop.
+    # Let the call_soon_threadsafe result deliveries land on this loop.
     await wait_all_tasks_blocked()
 
-    assert f1 is not None and f1.done()
-    assert f2 is not None and f2.done()
+    assert f1.done() and isinstance(f1.exception(), asyncio.CancelledError)
+    assert f2.done() and isinstance(f2.exception(), asyncio.CancelledError)
 
 
 @pytest.mark.asyncio
@@ -500,9 +462,6 @@ async def test_repr_implementations():
 
     ch = FastChannel()
     assert "FastChannel" in repr(ch)
-
-    ach = AsyncChannel()
-    assert "AsyncChannel" in repr(ach)
 
     ctx = AsyncContext()
     assert "AsyncContext" in repr(ctx)

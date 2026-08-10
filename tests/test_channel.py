@@ -9,8 +9,7 @@ from gsyncio import (
     open_channel,
     select_channel,
 )
-from gsyncio.channel import AsyncChannel, ChannelClosedError
-from gsyncio.exceptions import GsyncioError, WouldBlock
+from gsyncio.exceptions import ChannelClosedError, GsyncioError, WouldBlock
 from gsyncio.primitives import FastChannel
 from gsyncio.testing import wait_all_tasks_blocked
 
@@ -18,7 +17,7 @@ from gsyncio.testing import wait_all_tasks_blocked
 @pytest.mark.asyncio
 async def test_channel_valid_basic_send_recv():
     """Valid 1: Basic send and receive"""
-    ch = AsyncChannel()
+    ch = FastChannel()
     await ch.send("hello")
     res = await ch.recv()
     assert res == "hello"
@@ -27,7 +26,7 @@ async def test_channel_valid_basic_send_recv():
 @pytest.mark.asyncio
 async def test_channel_valid_multiple_items():
     """Valid 2: Sequential send and receive of multiple items"""
-    ch = AsyncChannel()
+    ch = FastChannel()
     items = [1, 2, 3, "test", {"key": "val"}]
     for item in items:
         await ch.send(item)
@@ -41,7 +40,7 @@ async def test_channel_valid_multiple_items():
 @pytest.mark.asyncio
 async def test_channel_valid_concurrent_producers_consumers():
     """Valid 3: Multi-coroutine concurrent send/receive data integrity"""
-    ch = AsyncChannel()
+    ch = FastChannel()
     count = 50
 
     async def producer(n):
@@ -60,7 +59,7 @@ async def test_channel_valid_concurrent_producers_consumers():
 @pytest.mark.asyncio
 async def test_channel_boundary_none_and_empty_payloads():
     """Boundary 1: None / empty bytes / empty data structure passing"""
-    ch = AsyncChannel()
+    ch = FastChannel()
     payloads = [None, b"", {}, [], 0, False]
     for p in payloads:
         await ch.send(p)
@@ -71,7 +70,7 @@ async def test_channel_boundary_none_and_empty_payloads():
 @pytest.mark.asyncio
 async def test_channel_boundary_capacity_limit():
     """Boundary 2: Capacity-limited (capacity=1) send and blocking unlock"""
-    ch = AsyncChannel(maxsize=1)
+    ch = FastChannel(maxsize=1)
     await ch.send("first")
 
     # The second send should suspend, waiting for consumption
@@ -91,7 +90,7 @@ async def test_channel_boundary_capacity_limit():
 @pytest.mark.asyncio
 async def test_channel_boundary_recv_blocks_until_send():
     """Boundary 3: recv suspends on empty channel, unblocks after send"""
-    ch = AsyncChannel()
+    ch = FastChannel()
 
     recv_task = asyncio.create_task(ch.recv())
     await asyncio.sleep(0.01)
@@ -105,7 +104,7 @@ async def test_channel_boundary_recv_blocks_until_send():
 @pytest.mark.asyncio
 async def test_channel_error_send_to_closed_channel():
     """Error 1: Sending data to a closed channel raises ChannelClosedError"""
-    ch = AsyncChannel()
+    ch = FastChannel()
     ch.close()
     with pytest.raises(ChannelClosedError):
         await ch.send("fail")
@@ -114,7 +113,7 @@ async def test_channel_error_send_to_closed_channel():
 @pytest.mark.asyncio
 async def test_channel_error_recv_from_closed_empty_channel():
     """Error 2: Receiving from a closed and empty channel raises ChannelClosedError"""
-    ch = AsyncChannel()
+    ch = FastChannel()
     ch.close()
     with pytest.raises(ChannelClosedError):
         await ch.recv()
@@ -123,7 +122,7 @@ async def test_channel_error_recv_from_closed_empty_channel():
 @pytest.mark.asyncio
 async def test_channel_error_recv_timeout():
     """Error 3: Timed recv raises asyncio.TimeoutError"""
-    ch = AsyncChannel()
+    ch = FastChannel()
     with pytest.raises(asyncio.TimeoutError):
         await ch.recv(timeout=0.02)
 
@@ -185,22 +184,22 @@ def test_fast_channel_try_send_closed_raises():
 
 
 def test_async_channel_try_send_recv_roundtrip():
-    """try_send + try_recv on AsyncChannel should round-trip a value."""
-    ch = AsyncChannel()
+    """try_send + try_recv on FastChannel should round-trip a value."""
+    ch = FastChannel()
     assert ch.try_send("world")
     assert ch.try_recv() == "world"
 
 
 def test_async_channel_try_recv_empty_raises_wouldblock():
-    """try_recv on an empty AsyncChannel should raise WouldBlock."""
-    ch = AsyncChannel()
+    """try_recv on an empty FastChannel should raise WouldBlock."""
+    ch = FastChannel()
     with pytest.raises(WouldBlock):
         ch.try_recv()
 
 
 def test_async_channel_qsize():
     """qsize() should reflect the number of buffered items."""
-    ch = AsyncChannel()
+    ch = FastChannel()
     assert ch.qsize() == 0
     ch.try_send("a")
     assert ch.qsize() == 1
@@ -211,23 +210,23 @@ def test_async_channel_qsize():
 
 
 def test_async_channel_try_send_full_bounded():
-    """try_send on a full bounded AsyncChannel should return False."""
-    ch = AsyncChannel(maxsize=1)
+    """try_send on a full bounded FastChannel should return False."""
+    ch = FastChannel(maxsize=1)
     assert ch.try_send("first")
     assert not ch.try_send("second")
 
 
 def test_async_channel_try_recv_closed_raises():
-    """try_recv on a closed empty AsyncChannel should raise ChannelClosedError."""
-    ch = AsyncChannel()
+    """try_recv on a closed empty FastChannel should raise ChannelClosedError."""
+    ch = FastChannel()
     ch.close()
     with pytest.raises(ChannelClosedError):
         ch.try_recv()
 
 
 def test_async_channel_try_send_closed_raises():
-    """try_send on a closed AsyncChannel should raise ChannelClosedError."""
-    ch = AsyncChannel()
+    """try_send on a closed FastChannel should raise ChannelClosedError."""
+    ch = FastChannel()
     ch.close()
     with pytest.raises(ChannelClosedError):
         ch.try_send("nope")
@@ -328,8 +327,8 @@ async def test_open_channel_close_behavior():
 
 @pytest.mark.asyncio
 async def test_async_channel_timeout_and_errors():
-    """Test AsyncChannel timeout and close edge paths"""
-    ch = AsyncChannel(maxsize=1)
+    """Test FastChannel timeout and close edge paths"""
+    ch = FastChannel(maxsize=1)
     await ch.send("item1")
 
     with pytest.raises(asyncio.TimeoutError):
@@ -412,7 +411,7 @@ async def test_race_high_concurrency_channel_send_recv():
 @pytest.mark.asyncio
 async def test_channel_async_for_iteration():
     """1. Go parity range ch: Validate async for item in ch loop consumption and graceful exit on close"""
-    ch = AsyncChannel()
+    ch = FastChannel()
 
     async def producer():
         for i in range(3):
@@ -452,8 +451,8 @@ async def test_fast_channel_async_for_iteration():
 @pytest.mark.asyncio
 async def test_select_channel_multi_branch():
     """2. Go parity select: Validate select_channel listening on multiple channels simultaneously"""
-    ch1 = AsyncChannel()
-    ch2 = AsyncChannel()
+    ch1 = FastChannel()
+    ch2 = FastChannel()
 
     async def send_to_ch2():
         await asyncio.sleep(0.02)

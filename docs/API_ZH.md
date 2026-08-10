@@ -12,7 +12,6 @@
 - [快速示例](#快速示例-quick-examples)
 - [核心引擎](#核心引擎-core-engine)
   - [`EventLoopThreadPool`](#eventloopthreadpool)
-    - [`submit_group`](#submit_group)
   - [`PoolOptions`](#pooloptions)
 - [顶层函数](#顶层函数-top-level-functions)
   - [`create_pool`](#create_pool)
@@ -28,9 +27,6 @@
   - [`set_log_level`](#set_log_level)
 - [Golang 风格通道与多路复用](#golang-风格通道与多路复用-golang-style-channels--multiplexing)
   - [`FastChannel`](#fastchannel)
-  - [`SendChannel`](#sendchannel)
-  - [`ReceiveChannel`](#receivechannel)
-  - [`AsyncChannel`](#asynchchannel)
   - [`select_channel`](#select_channel)
 - [任务管理](#任务管理-task-management)
   - [`TaskGroup`](#taskgroup)
@@ -389,17 +385,7 @@ EventLoopThreadPool(
 }
 ```
 
-##### `async submit_group()` -> `AsyncIterator[_PoolGroup]`
-批量提交任务的异步上下文管理器。通过 `group.start_soon(coro_fn, *args)`
-注册的子任务经 `submit()` 路由，在池的 worker 事件循环上执行（而不是
-调用方的循环）。池关闭时，所有待处理子任务被自动取消。
 
-```python
-async with pool.submit_group() as group:
-    group.start_soon(worker, "a")
-    group.start_soon(worker, "b")
-# All submitted tasks are guaranteed finished here.
-```
 
 ##### 上下文管理器
 支持 `async with EventLoopThreadPool(...) as pool:` 自动启动
@@ -617,8 +603,7 @@ FastChannel(maxsize: int = 0)
 ##### `qsize()` -> `int`
 返回当前缓冲在通道中的元素数量。
 
-##### `split()` -> `tuple[SendChannel, ReceiveChannel]`
-把通道拆成只发/只收两半，共享同一底层通道。
+
 
 ##### `close()` -> `None`
 关闭通道。所有挂起的发送者/接收者以 `ChannelClosedError` 被唤醒。
@@ -628,67 +613,6 @@ FastChannel(maxsize: int = 0)
 
 ##### `__aiter__()` & `__anext__()`
 支持 `async for item in ch:` 迭代。通道关闭且为空时自动终止。
-
----
-
-### `SendChannel`
-
-拆分通道的只写半部，由 `channel.split()` 产生。只暴露发送操作；在发送侧
-调用 `close()` 会关闭底层通道。
-
-#### 方法
-
-##### `async send(item: Any)` -> `None`
-向通道发送元素。满时挂起。
-- **抛出**：通道已关闭时抛 `ChannelClosedError`。
-
-##### `try_send(item: Any)` -> `bool`
-非阻塞发送。成功返回 `True`，满返回 `False`。
-
-##### `close()` -> `None`
-关闭底层通道。所有挂起的发送者/接收者以 `ChannelClosedError` 被唤醒。
-
----
-
-### `ReceiveChannel`
-
-拆分通道的只读半部，由 `channel.split()` 产生。只暴露接收操作；
-`close()` 是 no-op——关闭底层通道由发送侧负责。
-
-#### 方法
-
-##### `async recv(timeout: float | None = None)` -> `Any`
-从通道接收元素。为空时挂起。
-- **`timeout`** (*float | None*)：超时秒数。
-- **抛出**：关闭且为空抛 `ChannelClosedError`，超时抛 `TimeoutError`。
-
-##### `try_recv()` -> `Any`
-非阻塞接收。
-- **抛出**：为空抛 `WouldBlock`，关闭且为空抛 `ChannelClosedError`。
-
-##### `qsize()` -> `int`
-当前缓冲的元素数量。
-
-##### `__aiter__()` & `__anext__()`
-支持 `async for item in recv_ch:` 迭代。关闭且为空时自动终止。
-
-##### `close()` -> `None`
-No-op——关闭底层通道由发送侧负责。
-
----
-
-### `AsyncChannel`
-
-纯 Python 跨线程通道。
-
-```python
-ch = AsyncChannel(maxsize=10)
-await ch.send("data")
-val = await ch.recv()
-```
-
-与 `FastChannel` 接口相同（含 `try_send`、`try_recv`、`qsize`、
-`split`）。支持 `async for item in ch:`。
 
 ---
 
@@ -702,7 +626,7 @@ async def select_channel(
 ) -> Any
 ```
 
-从多个 `FastChannel` 或 `AsyncChannel` 中选择第一个就绪的通道（Go
+从多个 `FastChannel` 中选择第一个就绪的通道（Go
 `select` 风格）。
 
 - **返回**：`(selected_channel, value)`。

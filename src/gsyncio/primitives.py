@@ -12,7 +12,6 @@ from gsyncio._channel_base import (
     _discard_waiter,
     _wake_all,
 )
-from gsyncio._channel_wrappers import ReceiveChannel, SendChannel
 from gsyncio._rust import _try_import_rust_class
 from gsyncio._taskgroup import TaskGroup
 from gsyncio.exceptions import ChannelClosedError, TimeoutError, WouldBlock
@@ -140,16 +139,6 @@ class FastChannel(_BaseChannel):
         """
         return int(self._inner.qsize())
 
-    def split(self) -> tuple[SendChannel, ReceiveChannel]:
-        """Split the channel into send-only and receive-only halves.
-
-        :returns: A tuple of ``(SendChannel, ReceiveChannel)`` that share the
-                  same underlying channel.
-        :rtype: :class:`tuple`
-
-        """
-        return SendChannel(self), ReceiveChannel(self)
-
     async def send(self, item: Any) -> None:
         """Send an item into the channel.
 
@@ -208,7 +197,7 @@ async def select_channel(
     """Select the first ready channel from multiple channel instances.
 
     :param channels:
-        One or more :class:`FastChannel` or :class:`AsyncChannel` instances to poll.
+        One or more :class:`FastChannel` instances to poll.
 
     :param timeout:
         Optional maximum time in seconds to wait for a channel to become ready.

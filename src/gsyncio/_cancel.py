@@ -206,10 +206,9 @@ class CancelScope:
                 self._deadline_handle = None
 
             # Restore saved cancel count for shielded scopes.
-            if self._shield and self._saved_cancel_count > 0:
-                if task is not None:
-                    for _ in range(self._saved_cancel_count):
-                        task.cancel()
+            if self._shield and self._saved_cancel_count > 0 and task is not None:
+                for _ in range(self._saved_cancel_count):
+                    task.cancel()
 
             # fail_after / fail_at: convert CancelledError → TimeoutError
             # (only when this scope's own deadline fired / cancel was called).

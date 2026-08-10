@@ -13,9 +13,8 @@ import pytest
 pytest.importorskip("gsyncio")
 
 import gsyncio
-from gsyncio.channel import AsyncChannel
 from gsyncio.pool import EventLoopThreadPool
-from gsyncio.primitives import AsyncWaitGroup
+from gsyncio.primitives import AsyncWaitGroup, FastChannel
 
 # ── Bug A: Hang when Rust extension is missing ───────────────────────────
 
@@ -60,19 +59,18 @@ async def test_regression_bug_a_fallback_error():
 
 @pytest.mark.asyncio
 async def test_regression_bug_b_channel_leak_send():
-    """Bug B (send): AsyncChannel leaks waiter futures in _putters.
+    """Bug B (send): FastChannel must not leak waiter futures in _putters.
 
-    In channel.py:107-114, send() cleanup uses ``except Exception`` which
-    does NOT catch ``asyncio.CancelledError`` (BaseException in Python 3.8+).
+    Historical root cause: channel send cleanup used ``except Exception``,
+    which does NOT catch ``asyncio.CancelledError`` (BaseException in 3.8+).
     When a blocked send is cancelled by asyncio.wait_for(timeout), the
-    CancelledError escapes past the cleanup and the waiter future is never
-    removed from _putters.
+    CancelledError escaped past the cleanup and the waiter future was never
+    removed from _putters.  The shared _BaseChannel._wait_and_send now uses
+    ``except BaseException`` — this test pins that behavior on FastChannel.
 
-    Expected (fixed): after timeout/cancellation, _putters should be empty
-    (waiter cleaned up).  This test FAILS against current code because the
-    leaked future remains in _putters.
+    Expected (fixed): after timeout/cancellation, _putters should be empty.
     """
-    ch = AsyncChannel(maxsize=1)
+    ch = FastChannel(maxsize=1)
     await ch.send("first")  # Fill the bounded channel
 
     # Block on a send that can never complete (channel full, no receiver).
@@ -87,15 +85,14 @@ async def test_regression_bug_b_channel_leak_send():
 
 @pytest.mark.asyncio
 async def test_regression_bug_b_channel_leak_recv():
-    """Bug B (recv): AsyncChannel leaks getter futures in _getters.
+    """Bug B (recv): FastChannel must not leak getter futures in _getters.
 
-    Same root cause as send leak (channel.py:151-157) — ``except Exception``
-    misses CancelledError when a blocked recv is cancelled by wait_for.
+    Same root cause as the send leak — ``except Exception`` missed
+    CancelledError when a blocked recv is cancelled by wait_for.
 
     Expected (fixed): after timeout/cancellation, _getters should be empty.
-    This test FAILS against current code because the leaked future remains.
     """
-    ch = AsyncChannel()  # Empty channel — recv() will block.
+    ch = FastChannel()  # Empty channel — recv() will block.
 
     with pytest.raises(asyncio.TimeoutError):
         await asyncio.wait_for(ch.recv(), timeout=0.01)
@@ -172,17 +169,16 @@ def test_regression_bug_e_waitgroup_underflow():
 async def test_regression_bug_d_select_channel_timeout_leak():
     """Bug D: select_channel leaks waiter futures in channel _getters after timeout.
 
-    In primitives.py:217-230, select_channel creates _read_one tasks that block
-    on ch.recv(). When the timeout expires, pending tasks are cancelled but
-    without the ``except BaseException`` fix in channel.py:124, the
-    CancelledError escapes cleanup and waiter futures remain in _getters.
+    Historical root cause: select_channel's _read_one tasks blocked on
+    ch.recv(); on timeout the pending tasks were cancelled but without an
+    ``except BaseException`` cleanup the CancelledError escaped and waiter
+    futures remained in _getters.  Pinned here on FastChannel.
 
     Expected (fixed): after select_channel timeout, all channels' _getters
     should be empty (cancelled waiters cleaned up by except BaseException).
-    This test FAILS against the old code that uses ``except Exception``.
     """
-    ch1 = AsyncChannel()
-    ch2 = AsyncChannel()
+    ch1 = FastChannel()
+    ch2 = FastChannel()
 
     with pytest.raises(gsyncio.TimeoutError):
         await gsyncio.select_channel(ch1, ch2, timeout=0.01)

@@ -11,7 +11,6 @@ Complete API documentation for `gsyncio`: a multi-event-loop engine and concurre
 - [Quick Examples](#quick-examples)
 - [Core Engine](#core-engine)
   - [`EventLoopThreadPool`](#eventloopthreadpool)
-    - [`submit_group`](#submit_group)
   - [`PoolOptions`](#pooloptions)
 - [Top-Level Functions](#top-level-functions)
   - [`create_pool`](#create_pool)
@@ -27,9 +26,6 @@ Complete API documentation for `gsyncio`: a multi-event-loop engine and concurre
   - [`set_log_level`](#set_log_level)
 - [Golang-Style Channels & Multiplexing](#golang-style-channels--multiplexing)
   - [`FastChannel`](#fastchannel)
-  - [`SendChannel`](#sendchannel)
-  - [`ReceiveChannel`](#receivechannel)
-  - [`AsyncChannel`](#asyncchannel)
   - [`select_channel`](#select_channel)
 - [Task Management](#task-management)
   - [`TaskGroup`](#taskgroup)
@@ -377,15 +373,7 @@ Returns a JSON-serializable dictionary containing health metrics:
 }
 ```
 
-##### `async submit_group()` -> `AsyncIterator[_PoolGroup]`
-Async context manager for batch task submission. Children registered via `group.start_soon(coro_fn, *args)` are routed through `submit()` so they execute on pool worker event loops instead of the caller's loop. All pending children are automatically cancelled when the pool is closed.
 
-```python
-async with pool.submit_group() as group:
-    group.start_soon(worker, "a")
-    group.start_soon(worker, "b")
-# All submitted tasks are guaranteed finished here.
-```
 
 ##### Context Manager
 Supports `async with EventLoopThreadPool(...) as pool:` for automatic startup (`start()`) and shutdown (`close()`).
@@ -585,8 +573,7 @@ Non-blocking receive.
 ##### `qsize()` -> `int`
 Returns the number of items currently buffered in the channel.
 
-##### `split()` -> `tuple[SendChannel, ReceiveChannel]`
-Splits the channel into send-only and receive-only halves sharing the same underlying channel.
+
 
 ##### `close()` -> `None`
 Closes the channel. All pending senders/receivers are woken up with `ChannelClosedError`.
@@ -596,64 +583,6 @@ Returns `True` if closed.
 
 ##### `__aiter__()` & `__anext__()`
 Supports `async for item in ch:` iteration. Automatically terminates when the channel is closed and empty.
-
----
-
-### `SendChannel`
-
-Write-only half of a split channel, produced by `channel.split()`. Exposes only send operations; calling `close()` on the send side closes the underlying channel.
-
-#### Methods
-
-##### `async send(item: Any)` -> `None`
-Sends an item into the channel. Suspends if the channel is full until space is available.
-- **Raises**: `ChannelClosedError` if the channel is closed.
-
-##### `try_send(item: Any)` -> `bool`
-Non-blocking send. Returns `True` if the item was enqueued, `False` if the channel is full.
-
-##### `close()` -> `None`
-Closes the underlying channel. All pending senders/receivers are woken up with `ChannelClosedError`.
-
----
-
-### `ReceiveChannel`
-
-Read-only half of a split channel, produced by `channel.split()`. Exposes only receive operations; `close()` is a no-op — the send side is responsible for closing the underlying channel.
-
-#### Methods
-
-##### `async recv(timeout: float | None = None)` -> `Any`
-Receives an item from the channel. Suspends if empty until an item is available.
-- **`timeout`** (*float | None*): Timeout in seconds.
-- **Raises**: `ChannelClosedError` if closed and empty, `TimeoutError` if timed out.
-
-##### `try_recv()` -> `Any`
-Non-blocking receive.
-- **Raises**: `WouldBlock` if the channel is empty, `ChannelClosedError` if closed and empty.
-
-##### `qsize()` -> `int`
-Returns the number of items currently buffered in the channel.
-
-##### `__aiter__()` & `__anext__()`
-Supports `async for item in recv_ch:` iteration. Automatically terminates when the channel is closed and empty.
-
-##### `close()` -> `None`
-No-op — the send side is responsible for closing the underlying channel.
-
----
-
-### `AsyncChannel`
-
-Pure Python cross-thread channel.
-
-```python
-ch = AsyncChannel(maxsize=10)
-await ch.send("data")
-val = await ch.recv()
-```
-
-Same interface as `FastChannel` (including `try_send`, `try_recv`, `qsize`, `split`). Supports `async for item in ch:`.
 
 ---
 
@@ -667,7 +596,7 @@ async def select_channel(
 ) -> Any
 ```
 
-Selects the first ready channel from multiple `FastChannel` or `AsyncChannel` instances (Go `select`-style).
+Selects the first ready channel from multiple `FastChannel` instances (Go `select`-style).
 
 - **Returns**: `(selected_channel, value)`.
 - **`default`**: When provided, `select_channel` is non-blocking: it tries each channel with `try_recv()` and returns `(channel, value)` for the first ready channel, or `default` if none is ready.
