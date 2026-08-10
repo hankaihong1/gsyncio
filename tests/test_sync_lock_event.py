@@ -2,10 +2,11 @@
 
 import asyncio
 import threading
+from typing import Any
 
 import pytest
 
-from gsyncio import Event, Lock
+from gsyncio import Condition, Event, Lock
 from gsyncio.testing import wait_all_tasks_blocked
 
 # ---------------------------------------------------------------------------
@@ -317,3 +318,164 @@ async def test_lock_event_combined():
 
     results = await asyncio.gather(prod, cons)
     assert results[-1] == 42
+
+
+# ---------------------------------------------------------------------------
+# FIX-5 regression tests (BUG-8/W11/W21: handoff-to-cancelled-waiter must
+# forward) — 2026-08-10 audit
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_lock_handoff_to_cancelled_waiter_forwards() -> None:
+    """BUG-8: releasing the lock onto a waiter that is then cancelled before
+    it wakes must forward the lock to the next FIFO waiter instead of
+    stranding ownership on a dead task."""
+    lock = Lock()
+    go = asyncio.Event()
+    w3_got = asyncio.Event()
+    results: list[str] = []
+
+    async def w1() -> None:
+        async with lock:
+            await go.wait()
+
+    async def w2() -> None:
+        try:
+            async with lock:
+                results.append("w2")
+        except asyncio.CancelledError:
+            pass
+
+    async def w3() -> None:
+        async with lock:
+            results.append("w3")
+            w3_got.set()
+
+    t1 = asyncio.create_task(w1())
+    await asyncio.sleep(0.05)  # W1 holds the lock
+    t2 = asyncio.create_task(w2())
+    await asyncio.sleep(0.05)  # W2 queued
+    t3 = asyncio.create_task(w3())
+    await asyncio.sleep(0.05)  # W3 queued behind W2
+
+    go.set()      # W1 releases: ownership handed to W2
+    t2.cancel()   # ...but W2 is cancelled before its wakeup runs
+
+    # Pre-fix this times out: W3 waits forever on a lock owned by a dead task.
+    await asyncio.wait_for(w3_got.wait(), timeout=1.0)
+    await asyncio.gather(t1, t2, t3, return_exceptions=True)
+    assert results == ["w3"]
+
+
+@pytest.mark.asyncio
+async def test_condition_notify_consumed_by_cancelled_waiter_forwards() -> None:
+    """W11: a notify consumed by a cancelled waiter must wake the next waiter."""
+    cond = Condition()
+    w3_got = asyncio.Event()
+    results: list[str] = []
+
+    async def waiter(name: str, got: asyncio.Event | None = None) -> None:
+        async with cond:
+            await cond.wait()
+            results.append(name)
+            if got is not None:
+                got.set()
+
+    t2 = asyncio.create_task(waiter("w2"))
+    await asyncio.sleep(0.05)
+    t3 = asyncio.create_task(waiter("w3", w3_got))
+    await asyncio.sleep(0.05)
+
+    cond.notify()   # pops W2's entry and wakes it
+    t2.cancel()     # ...but W2 is cancelled before it re-acquires the lock
+
+    # Pre-fix this times out: the notification is gone and W3 never wakes.
+    await asyncio.wait_for(w3_got.wait(), timeout=1.0)
+    await asyncio.gather(t2, t3, return_exceptions=True)
+    assert results == ["w3"]
+
+
+@pytest.mark.asyncio
+async def test_wake_race_no_callback_noise() -> None:
+    """W21: cancelling a waiter after it was popped must not spam the loop
+    exception handler with InvalidStateError."""
+    loop = asyncio.get_running_loop()
+    errors: list[BaseException | None] = []
+    old_handler = loop.get_exception_handler()
+
+    def handler(_loop: asyncio.AbstractEventLoop, context: dict[str, Any]) -> None:
+        errors.append(context.get("exception"))
+
+    loop.set_exception_handler(handler)
+    try:
+        async def grab(lock: Lock, ev: asyncio.Event) -> None:
+            try:
+                async with lock:
+                    ev.set()
+            except asyncio.CancelledError:
+                pass
+
+        for _ in range(200):
+            lock = Lock()
+            held = asyncio.Event()
+            t1 = asyncio.create_task(grab(lock, held))
+            await asyncio.wait_for(held.wait(), timeout=1.0)  # t1 holds
+            t2 = asyncio.create_task(grab(lock, asyncio.Event()))
+            await asyncio.sleep(0)  # t2 queued
+            rel = asyncio.create_task(_release_after(lock))
+            await asyncio.sleep(0)  # release pops t2 and wakes it
+            t2.cancel()             # race: woken entry cancelled mid-delivery
+            await asyncio.gather(t1, t2, rel, return_exceptions=True)
+    finally:
+        loop.set_exception_handler(old_handler)
+
+    assert not errors, f"wake race produced {len(errors)} callback error(s)"
+
+
+async def _release_after(lock: Lock) -> None:
+    await asyncio.sleep(0)
+    lock.release()
+
+
+# ---------------------------------------------------------------------------
+# FIX-6 regression test (BUG-10: RWMutex writer cancel must wake readers)
+# — 2026-08-10 audit
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_writer_cancel_wakes_blocked_readers() -> None:
+    """BUG-10: cancelling a pending writer must wake readers blocked on it.
+
+    A cancelled writer decrements pending_writers without notifying _read_ok —
+    blocked readers then wait forever on a condition that is already false.
+    """
+    from gsyncio import AsyncRWMutex
+
+    rw = AsyncRWMutex()
+    reader_done = asyncio.Event()
+
+    async def reader(done: asyncio.Event) -> None:
+        async with rw.reader():
+            done.set()
+
+    async def writer_stuck() -> None:
+        try:
+            async with rw.writer():
+                await asyncio.Event().wait()  # never exits on its own
+        except asyncio.CancelledError:
+            pass
+
+    t1 = asyncio.create_task(reader(asyncio.Event()))
+    await asyncio.sleep(0.05)  # R1 holds the read lock
+    t2 = asyncio.create_task(writer_stuck())
+    await asyncio.sleep(0.05)  # W1 pending (blocks new readers)
+    t3 = asyncio.create_task(reader(reader_done))
+    await asyncio.sleep(0.05)  # R2 blocked on _read_ok
+
+    t2.cancel()  # W1 cancelled: pending_writers -> 0
+
+    # Pre-fix this times out: R2 waits forever.
+    await asyncio.wait_for(reader_done.wait(), timeout=1.0)
+    await asyncio.gather(t1, t2, t3, return_exceptions=True)

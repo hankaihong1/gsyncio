@@ -58,6 +58,12 @@ class AsyncRWMutex:
                 self._writer = True
             finally:
                 self._pending_writers -= 1
+                # WHY: a cancelled writer just changed the readers' wait
+                # condition (pending_writers dropped) — wake them, otherwise
+                # blocked readers wait forever on a condition that is now
+                # false (BUG-10).
+                if self._pending_writers == 0 and not self._writer:
+                    self._read_ok.notify_all()
 
         try:
             yield

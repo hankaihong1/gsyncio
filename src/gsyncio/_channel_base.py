@@ -1,4 +1,4 @@
-"""Shared base class for AsyncChannel and FastChannel."""
+"""Shared base class for FastChannel (AsyncChannel removed in FIX-8a)."""
 
 import asyncio
 import collections
@@ -11,6 +11,33 @@ from gsyncio.exceptions import ChannelClosedError
 _Waiter = tuple[asyncio.AbstractEventLoop, asyncio.Future[Any]]
 
 _CHANNEL_CLOSED_MSG = "Channel is closed"
+
+
+def _set_soon(
+    loop: asyncio.AbstractEventLoop,
+    fut: asyncio.Future[Any],
+    exc: BaseException | None = None,
+) -> None:
+    """Complete *fut* on its owning loop, tolerating a raced cancellation.
+
+    WHY: the old guard wrapped call_soon_threadsafe itself, where an
+    InvalidStateError (waiter cancelled between pop and delivery) surfaced
+    asynchronously in the loop exception handler (W21).  Moving the guard
+    inside the scheduled callback contains it.
+    """
+
+    def _do() -> None:
+        try:
+            if exc is not None:
+                fut.set_exception(exc)
+            else:
+                fut.set_result(None)
+        except asyncio.InvalidStateError:
+            # The waiter was cancelled after the pop — its cancel handler
+            # already cleaned up; nothing to deliver.
+            pass
+
+    loop.call_soon_threadsafe(_do)
 
 
 def _wake_all(
@@ -36,30 +63,12 @@ def _wake_all(
             loop, fut = waiters.popleft()
             if fut.done():
                 continue
-            if exc is not None:
-                try:
-                    loop.call_soon_threadsafe(fut.set_exception, exc)
-                except asyncio.InvalidStateError:
-                    pass
-            else:
-                try:
-                    loop.call_soon_threadsafe(fut.set_result, None)
-                except asyncio.InvalidStateError:
-                    pass
+            _set_soon(loop, fut, exc)
             woken += 1
         return
     for loop, fut in waiters:
         if not fut.done():
-            if exc is not None:
-                try:
-                    loop.call_soon_threadsafe(fut.set_exception, exc)
-                except asyncio.InvalidStateError:
-                    pass
-            else:
-                try:
-                    loop.call_soon_threadsafe(fut.set_result, None)
-                except asyncio.InvalidStateError:
-                    pass
+            _set_soon(loop, fut, exc)
 
 
 def _discard_waiter(waiters: collections.deque[_Waiter], fut: asyncio.Future[Any]) -> None:
