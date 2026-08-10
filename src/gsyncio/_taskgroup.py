@@ -7,6 +7,7 @@ the block exits.
 
 import asyncio
 import enum
+import threading
 from typing import Any, Self
 
 from gsyncio._cancel import CancelScope
@@ -101,11 +102,24 @@ class TaskGroup:
     def __init__(self, name: str | None = None) -> None:
         self._name: str | None = name
         self._children: set[TaskHandle] = set()
+        # WHY: _children is mutated from the hosting task (start_soon/start/
+        # _wait_children) and read from any thread (cancel_all), so every
+        # access goes through this lock.  The critical sections never run
+        # user code and never await — the lock only guards set operations
+        # and quick snapshots.
+        self._children_lock = threading.Lock()
         self._cancel_scope: CancelScope = CancelScope()
 
     # -- context manager -------------------------------------------------------
 
     async def __aenter__(self) -> Self:
+        # WHY: after a child failure the group's cancel scope stays cancelled;
+        # re-entering such a group would raise a confusing CancelledError at
+        # the first await.  Reject the reuse explicitly — and BEFORE the
+        # scope is pushed onto the task-local stack, because __aexit__ is
+        # never called when __aenter__ raises (a pushed scope would leak).
+        if self._cancel_scope.cancel_called:
+            raise RuntimeError("TaskGroup is not reusable after failure")
         await self._cancel_scope.__aenter__()
         return self
 
@@ -115,17 +129,54 @@ class TaskGroup:
         exc_val: BaseException | None,
         exc_tb: object,
     ) -> bool | None:
-        # Collect exceptions from all child tasks.
-        child_exceptions = await self._wait_children()
+        # WHY: structured concurrency — when the body fails (exception or
+        # cancellation) every still-running child must be cancelled before we
+        # wait for them, otherwise a stuck child hangs the group forever
+        # (BUG-9).  Children cancelled here are recorded so their
+        # CancelledError is not reported as a group failure.
+        pre_cancelled: set[asyncio.Task[Any]] = set()
+        if exc_val is not None:
+            with self._children_lock:
+                remaining = [h._task for h in self._children if not h._task.done()]
+            for task in remaining:
+                task.cancel()
+                pre_cancelled.add(task)
+            # WHY: deliberately NOT calling self._cancel_scope.cancel() here —
+            # it would inject a cancellation into the hosting task that the
+            # shielded _wait_children would snapshot and later restore,
+            # leaking a cancel count.  Scope cancellation is handled inside
+            # _wait_children on the first real child failure; for a cancelled
+            # body the external cancel already marks the scope.
+
+        child_exceptions = await self._wait_children(pre_cancelled)
+
+        # Cancellation wins: never merge CancelledError into the group —
+        # merging would swallow the cancellation and hang outer timeouts.
+        if exc_val is not None and isinstance(exc_val, asyncio.CancelledError):
+            await self._cancel_scope.__aexit__(exc_type, exc_val, exc_tb)
+            return None  # let the body's CancelledError propagate
 
         if not child_exceptions:
             return await self._cancel_scope.__aexit__(exc_type, exc_val, exc_tb)
+
+        # All children failed with CancelledError while the body exited
+        # normally: this is a soft group-exit signal (e.g. select_channel's
+        # first-ready report), not a real failure.  Do NOT cancel the scope —
+        # that would inject a cancellation into the hosting task and make a
+        # well-behaved caller see its own signal as an external cancel.
+        if exc_val is None and all(
+            isinstance(e, asyncio.CancelledError) for e in child_exceptions
+        ):
+            await self._cancel_scope.__aexit__(None, None, exc_tb)
+            if len(child_exceptions) == 1:
+                raise child_exceptions[0]
+            raise BaseExceptionGroup("taskgroup soft exit", child_exceptions)
 
         # At least one child failed — cancel the scope so parent scopes
         # (and the hosting task) are aware of the failure.
         self._cancel_scope.cancel()
 
-        # Exit the scope, suppressing the incoming CancelledError (if any)
+        # Exit the scope, suppressing an incoming CancelledError (if any)
         # because we are going to raise the children's errors instead.
         scope_exc_type = exc_type
         scope_exc_val = exc_val
@@ -135,25 +186,34 @@ class TaskGroup:
 
         await self._cancel_scope.__aexit__(scope_exc_type, scope_exc_val, exc_tb)
 
-        # Raise collected child exceptions.
-        if len(child_exceptions) == 1:
-            raise child_exceptions[0]
-        raise BaseExceptionGroup("taskgroup crashed", child_exceptions)
+        # Collect body + child exceptions (BUG-3: the body's exception must
+        # not vanish when children also fail).
+        all_exceptions = list(child_exceptions)
+        if exc_val is not None:
+            all_exceptions.insert(0, exc_val)
 
-    async def _wait_children(self) -> list[BaseException]:
+        if len(all_exceptions) == 1:
+            raise all_exceptions[0]
+        raise BaseExceptionGroup("taskgroup crashed", all_exceptions)
+
+    async def _wait_children(
+        self, pre_cancelled: set[asyncio.Task[Any]] | None = None
+    ) -> list[BaseException]:
         """Wait for every child task to finish, collecting non-trivial exceptions.
 
         CancelledError raised as a direct result of our sibling-cancel call
         (i.e. after we cancel the scope and cancel remaining tasks) is
-        filtered out.
+        filtered out — including children cancelled by the caller before
+        this method runs (``pre_cancelled``).
         """
         exceptions: list[BaseException] = []
-        tasks = [h._task for h in self._children]
+        with self._children_lock:
+            tasks = [h._task for h in self._children]
         if not tasks:
             return exceptions
 
         pending: set[asyncio.Task[Any]] = set(tasks)
-        cancelled_by_scope: set[int] = set()
+        cancelled_by_scope: set[asyncio.Task[Any]] = set(pre_cancelled or ())
         scope_cancelled = False
 
         async with CancelScope(shield=True):
@@ -175,7 +235,7 @@ class TaskGroup:
                         exc = task_exc
 
                     # Was this CancelledError caused by *our* sibling-cancel?
-                    if isinstance(exc, asyncio.CancelledError) and id(task) in cancelled_by_scope:
+                    if isinstance(exc, asyncio.CancelledError) and task in cancelled_by_scope:
                         continue
 
                     exceptions.append(exc)
@@ -186,7 +246,7 @@ class TaskGroup:
                         # Cancel all remaining siblings directly.
                         for p in pending:
                             p.cancel()
-                            cancelled_by_scope.add(id(p))
+                            cancelled_by_scope.add(p)
 
                         # Mark the scope as cancelled so parent scopes see it.
                         # CancelScope.cancel() also cancels the hosting (nursery)
@@ -209,9 +269,13 @@ class TaskGroup:
         The coroutine is scheduled on the event loop; this method does not
         block.
         """
+        # WHY: coro_fn(*args) is user code — never run it under
+        # _children_lock (threading.Lock is not reentrant and user code may
+        # call back into the group).
         task = asyncio.create_task(coro_fn(*args))
         handle = TaskHandle(task)
-        self._children.add(handle)
+        with self._children_lock:
+            self._children.add(handle)
         return handle
 
     async def start(self, coro_fn: Any, *args: Any) -> TaskHandle:
@@ -224,15 +288,17 @@ class TaskGroup:
         task = asyncio.create_task(coro_fn(task_status, *args))
         handle = TaskHandle(task)
         handle._start_event = task_status._started
-        self._children.add(handle)
+        with self._children_lock:
+            self._children.add(handle)
         try:
             await task_status._started.wait()
         finally:
             if task.done() and task.exception() is not None:
                 exc = task.exception()
-                for h in self._children:
-                    if h._task is not task and not h._task.done():
-                        h._task.cancel()
+                with self._children_lock:
+                    siblings = [h._task for h in self._children if h._task is not task and not h._task.done()]
+                for sibling in siblings:
+                    sibling.cancel()
                 if exc is not None:
                     raise exc
         return handle
@@ -244,6 +310,11 @@ class TaskGroup:
         call from any thread, including time-out handlers running outside
         the nursery's own event loop.
         """
-        for h in self._children:
+        # WHY: snapshot under the lock — iterating the live set from another
+        # thread while the hosting task adds children is a data race on
+        # free-threaded builds.
+        with self._children_lock:
+            handles = list(self._children)
+        for h in handles:
             loop = h._task.get_loop()
             loop.call_soon_threadsafe(h._task.cancel)

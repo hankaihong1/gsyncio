@@ -1,6 +1,7 @@
 """Tests for gsyncio TaskGroup (structured concurrency)."""
 
 import asyncio
+import threading
 from typing import Any
 
 import pytest
@@ -213,3 +214,119 @@ async def test_taskgroup_start_child_crash_cleans_up():
             await tg.start(child_crashes_after_init)
 
     assert cleanup_called, "sibling child was not cancelled after start child crash"
+
+
+# ---------------------------------------------------------------------------
+# FIX-3 regression tests (BUG-3/9: structured-concurrency contract) — 2026-08-10
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_body_and_child_exceptions_both_visible() -> None:
+    """BUG-3: a body exception must not be silently dropped when children fail."""
+    async def child_fail() -> None:
+        raise ValueError("child")
+
+    with pytest.raises(BaseExceptionGroup) as ei:
+        async with TaskGroup() as tg:
+            tg.start_soon(child_fail)
+            # Yield once so the child actually runs and fails before the
+            # body raises — both exceptions must surface (BUG-3).
+            await asyncio.sleep(0)
+            raise KeyError("body")
+
+    names = {type(e).__name__ for e in ei.value.exceptions}
+    assert "KeyError" in names, f"body exception lost: {names}"
+    assert "ValueError" in names, f"child exception lost: {names}"
+
+
+@pytest.mark.asyncio
+async def test_body_cancel_propagates_without_merge() -> None:
+    """Cancellation wins: a cancelled body must propagate CancelledError, not a group."""
+    async def stuck() -> None:
+        await asyncio.Event().wait()
+
+    async def run() -> None:
+        async with TaskGroup() as tg:
+            tg.start_soon(stuck)
+            await asyncio.Event().wait()
+
+    task = asyncio.create_task(run())
+    await asyncio.sleep(0.05)  # let the group body park
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_cancel_cancels_stuck_child() -> None:
+    """BUG-9: cancelling a TaskGroup body must cancel stuck children so the
+    group exits promptly instead of hanging forever."""
+    async def stuck() -> None:
+        await asyncio.Event().wait()
+
+    async def run() -> None:
+        async with TaskGroup() as tg:
+            tg.start_soon(stuck)
+            await asyncio.Event().wait()
+
+    task = asyncio.create_task(run())
+    await asyncio.sleep(0.05)  # let the group body park
+    task.cancel()
+    # The external cancel must pass through (group exits promptly instead of
+    # hanging). Pre-fix this times out: the group never exits.
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_taskgroup_not_reusable() -> None:
+    """TS-3: a crashed TaskGroup must raise RuntimeError on re-entry, not a
+    confusing CancelledError."""
+    async def boom() -> None:
+        raise ValueError("child")
+
+    with pytest.raises(ValueError):
+        async with TaskGroup() as tg:
+            tg.start_soon(boom)
+
+    with pytest.raises(RuntimeError, match="reus"):
+        async with tg:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_cancel_all_concurrent_start_soon() -> None:
+    """B2: cancel_all from another thread must not race with start_soon
+    (free-threaded: an unlocked iteration raises mid-loop)."""
+    async def noop() -> None:
+        await asyncio.sleep(0)
+
+    tg = TaskGroup()
+    stop = threading.Event()
+    errors: list[BaseException] = []
+
+    def hammer() -> None:
+        try:
+            for _ in range(500):
+                tg.cancel_all()
+        except BaseException as e:  # noqa: BLE001
+            errors.append(e)
+        finally:
+            stop.set()
+
+    t = threading.Thread(target=hammer)
+    t.start()
+    try:
+        for _ in range(500):
+            tg.start_soon(noop)
+            await asyncio.sleep(0)
+    finally:
+        t.join(timeout=10)
+
+    assert not errors, f"cancel_all raced with start_soon: {errors}"
+
+    # Cleanup: cancel everything and let the children finish.
+    tg.cancel_all()
+    handles = list(tg._children)
+    await asyncio.gather(*(h._task for h in handles), return_exceptions=True)

@@ -103,6 +103,7 @@ class FastChannel(_BaseChannel):
             if result:
                 with self._lock:
                     self._wakeup_next(self._getters)
+                    self._wakeup_notifiers()
                 return True
             return False
         except RuntimeError:
@@ -236,30 +237,67 @@ async def select_channel(
     result: list[tuple[Any, Any]] = []
     _tg: TaskGroup | None = None
 
-    async def _read_one(ch: Any) -> None:
-        val = await ch.recv()
-        result.append((ch, val))
+    async def _notify_one(ch: Any, ready: list[Any]) -> None:
+        """Report channel readiness WITHOUT consuming — only the winner consumes.
+
+        Loops on spurious/raced wakeups (a concurrent consumer may steal the
+        item between the send and this task running).
+        """
+        while True:
+            loop = asyncio.get_running_loop()
+            event = ch._register_notifier(loop)
+            if event is None:
+                break  # already non-empty — report ready
+            try:
+                await event.wait()
+            except asyncio.CancelledError:
+                ch._discard_notifier(loop, event)
+                raise
+            break
+        ready.append(ch)
         # WHY: TaskGroup only exits early when a child fails. Raising CancelledError
-        # is the soft failure that cancels the sibling readers and unwinds the group
-        # the moment the first channel delivers; a normal return would make the
-        # group wait for every channel to produce data.
+        # is the soft failure that cancels the sibling notifiers and unwinds the
+        # group the moment the first channel reports; a normal return would make
+        # the group wait for every channel to produce data.
         raise asyncio.CancelledError()
 
     async def _select() -> None:
         nonlocal _tg
-        try:
-            async with TaskGroup() as tg:
-                _tg = tg
-                for ch in channels:
-                    tg.start_soon(_read_one, ch)
-        except BaseExceptionGroup as eg:
-            for exc in eg.exceptions:
-                if not isinstance(exc, asyncio.CancelledError):
-                    raise
-        except asyncio.CancelledError:
-            pass
-        finally:
-            _tg = None
+        while not result:
+            ready: list[Any] = []
+            try:
+                async with TaskGroup() as tg:
+                    _tg = tg
+                    for ch in channels:
+                        tg.start_soon(_notify_one, ch, ready)
+            except BaseExceptionGroup as eg:
+                for exc in eg.exceptions:
+                    if not isinstance(exc, asyncio.CancelledError):
+                        raise
+            except asyncio.CancelledError:
+                cur = asyncio.current_task()
+                if cur is not None and cur.cancelling() > 0:
+                    raise  # the select task itself was cancelled — exit
+                # Soft-failure signal from the first reporting notifier —
+                # unwind and re-arbitrate.
+                pass
+            finally:
+                _tg = None
+
+            # Arbitration: only the winner consumes.  The notifiers never
+            # consumed, so items on non-winner channels stay buffered and can
+            # be received later (BUG-4).
+            for ch in ready:
+                try:
+                    val = ch.try_recv()
+                    result.append((ch, val))
+                    return
+                except (ChannelClosedError, WouldBlock):
+                    # A concurrent consumer stole the item after readiness was
+                    # reported — try the next ready channel.
+                    continue
+            # Every reported channel was stolen — re-register and wait again.
+            await asyncio.sleep(0)
 
     select_task = asyncio.create_task(_select())
 
@@ -284,6 +322,12 @@ async def select_channel(
         await select_task
     except (BaseExceptionGroup, asyncio.CancelledError):
         pass
+
+    if result:
+        # WHY: the winner was decided in the same instant the timeout fired —
+        # the item was already consumed by the arbitration, so surface it
+        # instead of losing it (W4).
+        return result[0]
 
     raise TimeoutError("select_channel timed out")
 

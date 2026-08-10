@@ -517,3 +517,52 @@ def test_pop_work_rejects_none() -> None:
             pool.push_local(0, None)
     finally:
         pool.close()
+
+
+# ---------------------------------------------------------------------------
+# FIX-4 regression tests (BUG-4: select_channel must only consume the winner)
+# — 2026-08-10 audit
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_select_no_item_loss_simultaneous() -> None:
+    """BUG-4: both channels ready at once — the unselected item stays buffered."""
+    ch1 = FastChannel()
+    ch2 = FastChannel()
+    await ch1.send("a")
+    await ch2.send("b")
+
+    selected_ch, val = await select_channel(ch1, ch2, timeout=1.0)
+
+    # The loser's item must still be receivable; the winner's was consumed.
+    if selected_ch is ch1:
+        assert val == "a"
+        assert await asyncio.wait_for(ch2.recv(), timeout=1.0) == "b"
+    else:
+        assert val == "b"
+        assert await asyncio.wait_for(ch1.recv(), timeout=1.0) == "a"
+
+
+@pytest.mark.asyncio
+async def test_select_timeout_no_loss() -> None:
+    """W4: an item sent at the timeout boundary must never vanish."""
+    async def delayed_send(ch: FastChannel, delay: float, value: str) -> None:
+        await asyncio.sleep(delay)
+        await ch.send(value)
+
+    for i in range(100):
+        ch = FastChannel()
+        sender = asyncio.create_task(delayed_send(ch, 0.005, f"v{i}"))
+        consumed = 0
+        try:
+            await select_channel(ch, timeout=0.01)
+            consumed = 1
+        except TimeoutError:
+            pass
+        await sender
+        # Accounting: exactly one item was sent — it was either consumed by
+        # the select winner or is still buffered.  Zero means it was dropped.
+        assert ch.qsize() + consumed == 1, (
+            f"round {i}: item lost (qsize={ch.qsize()}, consumed={consumed})"
+        )
