@@ -83,16 +83,22 @@ class CancelScope:
             if self._cancel_called:
                 return
             self._cancel_called = True
+            # WHY: _task/_loop are written under the same lock in __aenter__ /
+            # __aexit__, so they must be read here under the lock too — on
+            # free-threaded builds a bare read would race with __aexit__
+            # clearing the binding.
+            task = self._task
+            loop = self._loop
 
-        if self._task is not None and not self._task.done():
+        if task is not None and not task.done():
             try:
                 current_loop = asyncio.get_running_loop()
             except RuntimeError:
                 current_loop = None
-            if self._loop is not None and current_loop is not self._loop:
-                self._loop.call_soon_threadsafe(self._task.cancel)
+            if loop is not None and current_loop is not loop:
+                loop.call_soon_threadsafe(task.cancel)
             else:
-                self._task.cancel()
+                task.cancel()
 
     def _effectively_cancelled(self) -> bool:
         """Whether *this* scope (or an unshielded ancestor) is cancelled.
@@ -127,11 +133,24 @@ class CancelScope:
     # -- context manager protocol ---------------------------------------------
 
     async def __aenter__(self) -> Self:
+        # WHY: A scope belongs to exactly one hosting task.  Entering it from a
+        # second task silently overwrites _task, after which cancel() targets
+        # the wrong task.  The check-and-set must be atomic under
+        # _cancel_lock: on free-threaded builds a bare check-then-act is a
+        # data race.
+        with self._cancel_lock:
+            host = asyncio.current_task()
+            if self._task is not None and self._task is not host:
+                raise RuntimeError(
+                    "CancelScope cannot be shared across tasks: "
+                    "already entered by another task"
+                )
+            self._task = host
+            self._loop = asyncio.get_running_loop()
+
         stack = _get_scope_stack()
         stack.append(self)
         self._reset_token = _scope_stack_var.set(stack)
-        self._task = asyncio.current_task()
-        self._loop = asyncio.get_running_loop()
 
         # Shield: clear any pending cancellation injected by parent scopes.
         # WHY: If a parent scope was cancelled before we entered, its injection is
@@ -167,46 +186,72 @@ class CancelScope:
         exc_val: BaseException | None,
         exc_tb: object,
     ) -> bool | None:
-        # Pop self from the task-local stack.
-        stack = _get_scope_stack()
-        if stack and stack[-1] is self:
-            stack.pop()
-        else:
-            # Belt-and-suspenders: remove from anywhere in the stack.
-            stack = [s for s in stack if s is not self]
-        _scope_stack_var.set(stack)
-
-        # Clean up the deadline timer.
-        if self._deadline_handle is not None:
-            self._deadline_handle.cancel()
-            self._deadline_handle = None
-
-        # Restore saved cancel count for shielded scopes.
-        if self._shield and self._saved_cancel_count > 0:
+        # Snapshot the host binding once; all exit paths use it and the
+        # binding is cleared in the finally block below.
+        with self._cancel_lock:
             task = self._task
-            if task is not None:
-                for _ in range(self._saved_cancel_count):
-                    task.cancel()
+        try:
+            # Pop self from the task-local stack.
+            stack = _get_scope_stack()
+            if stack and stack[-1] is self:
+                stack.pop()
+            else:
+                # Belt-and-suspenders: remove from anywhere in the stack.
+                stack = [s for s in stack if s is not self]
+            _scope_stack_var.set(stack)
 
-        # fail_after / fail_at: convert CancelledError → TimeoutError
-        # (only when this scope's own deadline fired / cancel was called).
-        if (
-            exc_type is not None
-            and issubclass(exc_type, asyncio.CancelledError)
-            and self._convert_to_timeout
-            and self._cancel_called
-        ):
-            raise TimeoutError() from exc_val
+            # Clean up the deadline timer.
+            if self._deadline_handle is not None:
+                self._deadline_handle.cancel()
+                self._deadline_handle = None
 
-        # move_on_* variants silently swallow CancelledError.
-        if (
-            exc_type is not None
-            and issubclass(exc_type, asyncio.CancelledError)
-            and self._cancelled_caught
-        ):
-            return True
+            # Restore saved cancel count for shielded scopes.
+            if self._shield and self._saved_cancel_count > 0:
+                if task is not None:
+                    for _ in range(self._saved_cancel_count):
+                        task.cancel()
 
-        return None
+            # fail_after / fail_at: convert CancelledError → TimeoutError
+            # (only when this scope's own deadline fired / cancel was called).
+            if (
+                exc_type is not None
+                and issubclass(exc_type, asyncio.CancelledError)
+                and self._convert_to_timeout
+                and self._cancel_called
+            ):
+                # WHY: The deadline cancel was counted on this task.  asyncio
+                # only decrements the count when CancelledError propagates out
+                # of the task top-level; converting it to TimeoutError here
+                # would leak the count and fire a spurious CancelledError on a
+                # later await.  Undo the count before raising — same order as
+                # asyncio.timeout (uncancel first, then raise), so an external
+                # cancel racing in after the uncancel still lands correctly.
+                if task is not None:
+                    task.uncancel()
+                raise TimeoutError() from exc_val
+
+            # move_on_* variants silently swallow CancelledError — but only the
+            # one we injected ourselves.  An external task.cancel() must pass
+            # through: swallowing it would silently break the caller's control
+            # flow (the task would "succeed" even though it was cancelled).
+            if (
+                exc_type is not None
+                and issubclass(exc_type, asyncio.CancelledError)
+                and self._cancelled_caught
+                and self._cancel_called
+            ):
+                if task is not None:
+                    task.uncancel()
+                return True
+
+            return None
+        finally:
+            # Release the host binding so the scope can be re-entered later.
+            # WHY: kept under _cancel_lock — cancel() reads _task/_loop from
+            # any thread and must never see a torn binding.
+            with self._cancel_lock:
+                self._task = None
+                self._loop = None
 
 
 # ---------------------------------------------------------------------------
@@ -269,7 +314,7 @@ async def checkpoint() -> None:
     Raises :exc:`asyncio.CancelledError` when the current scope — or any
     unshielded ancestor — has been cancelled.
 
-    Call this periodically inside long-running synchronous code that cannot
+    Call this periodically inside long-running coroutines that cannot
     ``await`` frequently.
     """
     stack = _get_scope_stack()

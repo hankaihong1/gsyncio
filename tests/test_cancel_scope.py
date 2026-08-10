@@ -321,3 +321,111 @@ async def test_async_context_cross_thread_cancellation():
 
         with pytest.raises(asyncio.CancelledError):
             await fut
+
+
+# ---------------------------------------------------------------------------
+# FIX-1 regression tests (BUG-1/5: cancellation-count leaks & swallowed
+# external cancels) — 2026-08-10 audit
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_timeout_leaves_cancelling_zero() -> None:
+    """BUG-1: fail_after/move_on_after timeouts must not leak cancelling() counts.
+
+    A leaked count surfaces as a spurious CancelledError on the next await
+    (or worse, gets consumed by TaskGroup._wait_children's uncancel()).
+    """
+    task = asyncio.current_task()
+    assert task is not None
+
+    try:
+        async with fail_after(0.01):
+            await asyncio.sleep(0.1)
+    except TimeoutError:
+        pass
+    assert task.cancelling() == 0
+
+    async with move_on_after(0.01):
+        await asyncio.sleep(0.1)
+    assert task.cancelling() == 0
+
+    # The await after the scope must not raise a spurious CancelledError.
+    await asyncio.sleep(0.01)
+    assert task.cancelling() == 0
+
+
+@pytest.mark.asyncio
+async def test_timeout_then_taskgroup_no_spurious_cancel() -> None:
+    """BUG-1: timeout leak consumed by TaskGroup must not cancel the next await."""
+    from gsyncio import TaskGroup
+
+    task = asyncio.current_task()
+    assert task is not None
+
+    try:
+        async with fail_after(0.01):
+            await asyncio.sleep(0.1)
+    except TimeoutError:
+        pass
+    assert task.cancelling() == 0
+
+    async def boom() -> None:
+        raise ValueError("child")
+
+    with pytest.raises(ValueError):
+        async with TaskGroup() as tg:
+            tg.start_soon(boom)
+
+    # Group exit consumed the leaked count — the next await must survive.
+    await asyncio.sleep(0.01)
+    assert task.cancelling() == 0
+
+
+@pytest.mark.asyncio
+async def test_move_on_after_does_not_swallow_external_cancel() -> None:
+    """BUG-5: move_on_after must absorb only its own deadline cancel."""
+
+    async def worker() -> None:
+        async with move_on_after(5.0):
+            await asyncio.sleep(1.0)
+
+    task = asyncio.create_task(worker())
+    await asyncio.sleep(0.05)  # let the worker enter the scope
+    task.cancel()
+    try:
+        await asyncio.wait_for(task, timeout=2.0)
+        pytest.fail("external task.cancel() was swallowed by move_on_after")
+    except asyncio.CancelledError:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_cancel_scope_cannot_share_across_tasks() -> None:
+    """TS-2: a CancelScope entered from a second task must raise RuntimeError.
+
+    Without the host-task check the scope's ``_task`` pointer is silently
+    overwritten and cancel() targets the wrong task.
+    """
+    scope = CancelScope()
+    results: dict[str, str] = {}
+
+    async def enter_a() -> None:
+        try:
+            async with scope:
+                await asyncio.sleep(0.3)
+        except BaseException as e:  # noqa: BLE001
+            results["a"] = type(e).__name__
+
+    async def enter_b() -> None:
+        await asyncio.sleep(0.05)  # let A enter first
+        try:
+            async with scope:
+                await asyncio.sleep(0.3)
+        except BaseException as e:  # noqa: BLE001
+            results["b"] = type(e).__name__
+
+    ta = asyncio.create_task(enter_a())
+    tb = asyncio.create_task(enter_b())
+    await asyncio.wait_for(asyncio.gather(ta, tb, return_exceptions=True), timeout=3.0)
+    assert results.get("b") == "RuntimeError"

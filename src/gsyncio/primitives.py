@@ -118,15 +118,17 @@ class FastChannel(_BaseChannel):
         :raises ChannelClosedError: If the channel is closed and empty.
 
         """
-        result: Any
         try:
-            result = self._inner.try_recv()
+            # WHY: the native boundary returns (has_item, item) — a bare
+            # Option<Py<PyAny>> cannot distinguish a None payload from an
+            # empty channel (BUG-2).
+            has_item, item = self._inner.try_recv()
         except RuntimeError:
             raise ChannelClosedError(_CHANNEL_CLOSED_MSG)
-        if result is not None:
+        if has_item:
             with self._lock:
                 self._wakeup_next(self._putters)
-            return result
+            return item
         raise WouldBlock("Channel is empty")
 
     def qsize(self) -> int:
@@ -166,8 +168,8 @@ class FastChannel(_BaseChannel):
         loop = asyncio.get_running_loop()
         while True:
             try:
-                item = self._inner.try_recv()
-                if item is not None:
+                has_item, item = self._inner.try_recv()
+                if has_item:
                     with self._lock:
                         self._wakeup_next(self._putters)
                     return item
@@ -177,8 +179,8 @@ class FastChannel(_BaseChannel):
             # Double-check inside lock before queueing future to prevent Lost-Wakeup race
             with self._lock:
                 try:
-                    item = self._inner.try_recv()
-                    if item is not None:
+                    has_item, item = self._inner.try_recv()
+                    if has_item:
                         self._wakeup_next(self._putters)
                         return item
                 except RuntimeError as e:

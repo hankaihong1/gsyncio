@@ -464,3 +464,57 @@ async def test_select_channel_multi_branch():
     selected_ch, val = await select_channel(ch1, ch2, timeout=1.0)
     assert selected_ch is ch2
     assert val == "from_ch2"
+
+
+# ---------------------------------------------------------------------------
+# FIX-2 regression tests (BUG-2: PyO3 Option<Py<PyAny>> boundary loses None
+# payloads) — 2026-08-10 audit
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_fastchannel_none_payload() -> None:
+    """BUG-2: FastChannel must transport None payloads end to end.
+
+    Before the fix `send(None)` consumed the item but `recv()` saw the
+    channel as empty and registered a waiter that nobody would wake —
+    a permanent hang.
+    """
+    ch = FastChannel()
+    await ch.send(None)
+    # wait_for guards against the historical permanent hang.
+    assert await asyncio.wait_for(ch.recv(), timeout=1.0) is None
+
+    # try_send/try_recv must distinguish "None payload" from "empty".
+    assert ch.try_send(None) is True
+    assert ch.try_recv() is None  # None payload, NOT WouldBlock
+
+    # The channel is now truly empty: WouldBlock must be raised.
+    with pytest.raises(WouldBlock):
+        ch.try_recv()
+
+
+@pytest.mark.asyncio
+async def test_fastchannel_none_after_regular_items() -> None:
+    """None must not disturb the FIFO order of surrounding items."""
+    ch = FastChannel()
+    await ch.send(1)
+    await ch.send(None)
+    await ch.send(2)
+    assert await ch.recv() == 1
+    assert await ch.recv() is None
+    assert await ch.recv() == 2
+
+
+def test_pop_work_rejects_none() -> None:
+    """FIX-2 hardening: pushing a None task into the native pool is a type error."""
+    import gsyncio._gsyncio_core as core
+
+    pool = core.NativeWorkerPool(2)
+    try:
+        with pytest.raises(TypeError):
+            pool.push_global(None)
+        with pytest.raises(TypeError):
+            pool.push_local(0, None)
+    finally:
+        pool.close()

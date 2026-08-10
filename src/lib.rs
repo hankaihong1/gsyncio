@@ -1,5 +1,5 @@
 use parking_lot::Mutex;
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyRuntimeError, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use std::collections::VecDeque;
@@ -239,7 +239,13 @@ impl NativeWorkerPool {
             .is_none_or(|s| s.is_disconnected())
     }
 
-    fn push_global(&self, task: Py<PyAny>) -> PyResult<()> {
+    fn push_global(&self, py: Python<'_>, task: Py<PyAny>) -> PyResult<()> {
+        // WHY: pop_work() signals "no work" with Ok(None).  A None task pushed
+        // here would therefore be silently swallowed by every worker — reject
+        // it at the boundary instead of losing work.
+        if task.is_none(py) {
+            return Err(PyTypeError::new_err("pool task cannot be None"));
+        }
         // Fast path: check advisory flag before acquiring lock — Acquire observes close store
         if self.is_closed.load(Ordering::Acquire) {
             return Err(PyRuntimeError::new_err("Pool is closed"));
@@ -257,6 +263,11 @@ impl NativeWorkerPool {
     }
 
     fn push_local(&self, index: usize, task: Py<PyAny>, py: Python<'_>) -> PyResult<()> {
+        // Same None rejection as push_global: a None "task" would be read by
+        // pop_work() as "no work" and dropped.
+        if task.is_none(py) {
+            return Err(PyTypeError::new_err("pool task cannot be None"));
+        }
         // Fast path: check advisory flag before acquiring lock — Acquire observes close store
         if self.is_closed.load(Ordering::Acquire) {
             return Err(PyRuntimeError::new_err("Pool is closed"));
@@ -276,7 +287,7 @@ impl NativeWorkerPool {
             Err(flume::TrySendError::Full(task)) => {
                 // Local queue full — fall back to global (drop lock first)
                 drop(guard);
-                self.push_global(task)
+                self.push_global(py, task)
             }
             Err(flume::TrySendError::Disconnected(_)) => {
                 Err(PyRuntimeError::new_err("Pool is closed"))
@@ -397,14 +408,19 @@ impl FastChannel {
         }
     }
 
-    fn try_recv(&self, _py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+    /// Non-blocking receive.
+    ///
+    /// Returns `(has_item, item)`: `has_item` distinguishes "channel empty"
+    /// from "item is None" — PyO3 maps both `Ok(None)` and `Ok(Some(None))`
+    /// to Python `None`, so a bare `Option` return would lose None payloads.
+    fn try_recv(&self, _py: Python<'_>) -> PyResult<(bool, Option<Py<PyAny>>)> {
         match self.receiver.try_recv() {
-            Ok(item) => Ok(Some(item)),
+            Ok(item) => Ok((true, Some(item))),
             Err(flume::TryRecvError::Empty) => {
                 if self.is_closed() {
                     Err(PyRuntimeError::new_err("Channel is closed"))
                 } else {
-                    Ok(None)
+                    Ok((false, None))
                 }
             }
             Err(flume::TryRecvError::Disconnected) => {
