@@ -359,8 +359,8 @@ async def test_lock_handoff_to_cancelled_waiter_forwards() -> None:
     t3 = asyncio.create_task(w3())
     await asyncio.sleep(0.05)  # W3 queued behind W2
 
-    go.set()      # W1 releases: ownership handed to W2
-    t2.cancel()   # ...but W2 is cancelled before its wakeup runs
+    go.set()  # W1 releases: ownership handed to W2
+    t2.cancel()  # ...but W2 is cancelled before its wakeup runs
 
     # Pre-fix this times out: W3 waits forever on a lock owned by a dead task.
     await asyncio.wait_for(w3_got.wait(), timeout=1.0)
@@ -387,8 +387,8 @@ async def test_condition_notify_consumed_by_cancelled_waiter_forwards() -> None:
     t3 = asyncio.create_task(waiter("w3", w3_got))
     await asyncio.sleep(0.05)
 
-    cond.notify()   # pops W2's entry and wakes it
-    t2.cancel()     # ...but W2 is cancelled before it re-acquires the lock
+    cond.notify()  # pops W2's entry and wakes it
+    t2.cancel()  # ...but W2 is cancelled before it re-acquires the lock
 
     # Pre-fix this times out: the notification is gone and W3 never wakes.
     await asyncio.wait_for(w3_got.wait(), timeout=1.0)
@@ -409,6 +409,7 @@ async def test_wake_race_no_callback_noise() -> None:
 
     loop.set_exception_handler(handler)
     try:
+
         async def grab(lock: Lock, ev: asyncio.Event) -> None:
             try:
                 async with lock:
@@ -425,7 +426,7 @@ async def test_wake_race_no_callback_noise() -> None:
             await asyncio.sleep(0)  # t2 queued
             rel = asyncio.create_task(_release_after(lock))
             await asyncio.sleep(0)  # release pops t2 and wakes it
-            t2.cancel()             # race: woken entry cancelled mid-delivery
+            t2.cancel()  # race: woken entry cancelled mid-delivery
             await asyncio.gather(t1, t2, rel, return_exceptions=True)
     finally:
         loop.set_exception_handler(old_handler)

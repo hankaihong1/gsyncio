@@ -245,7 +245,7 @@ class ConnectionPinningServer:
                         ),
                         timeout=2,
                     )
-                except (Exception, TimeoutError):
+                except Exception:
                     pass
 
         if getattr(self, "_server_socket", None) and self._server_socket:

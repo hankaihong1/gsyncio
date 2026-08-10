@@ -424,34 +424,34 @@ class EventLoopThreadPool:
         await self.close()
 
     def _resolve_target_worker(
-        self, loop_target: asyncio.AbstractEventLoop | int | None
+        self, pin_target: asyncio.AbstractEventLoop | int | None
     ) -> tuple[int, asyncio.AbstractEventLoop] | None:
         with self._lock:
             loops = self._loops
             if not self._running or not loops:
                 raise ThreadPoolClosedError("ThreadPool is not running")
 
-            if loop_target is None:
+            if pin_target is None:
                 return None
 
-            if isinstance(loop_target, int):
-                if 0 <= loop_target < len(loops):
-                    return loop_target, loops[loop_target]
-                raise ValueError(f"Worker index {loop_target} out of range (0-{len(loops) - 1})")
+            if isinstance(pin_target, int):
+                if 0 <= pin_target < len(loops):
+                    return pin_target, loops[pin_target]
+                raise ValueError(f"Worker index {pin_target} out of range (0-{len(loops) - 1})")
 
-            if isinstance(loop_target, asyncio.AbstractEventLoop):  # pyright: ignore[reportUnnecessaryIsInstance]
+            if isinstance(pin_target, asyncio.AbstractEventLoop):  # pyright: ignore[reportUnnecessaryIsInstance]
                 for idx, l in enumerate(loops):
-                    if l is loop_target:
+                    if l is pin_target:
                         return idx, l
                 raise ValueError("Target AbstractEventLoop is not managed by this thread pool")
 
-            raise TypeError("loop argument must be an AbstractEventLoop, int index, or None")
+            raise TypeError("pin_to argument must be an AbstractEventLoop, int index, or None")
 
     def submit(
         self,
         target: Callable[..., Any],
         *args: Any,
-        loop: asyncio.AbstractEventLoop | int | None = None,
+        pin_to: asyncio.AbstractEventLoop | int | None = None,
         cancel_scope: CancelScope | None = None,
         **kwargs: Any,
     ) -> asyncio.Future[Any]:
@@ -464,11 +464,11 @@ class EventLoopThreadPool:
         :param args:
             Positional arguments to pass to `target`.
 
-        :param loop:
+        :param pin_to:
             Optional target event loop instance or worker index `int` for explicit pinning
             (e.g. for `asyncssh` connection affinity). If ``None``, pushed to the global
             shared queue for idle workers to pull instantly.
-        :type loop: asyncio.AbstractEventLoop or int or None
+        :type pin_to: asyncio.AbstractEventLoop or int or None
 
         :param kwargs:
             Keyword arguments to pass to `target`.
@@ -479,10 +479,10 @@ class EventLoopThreadPool:
         :raises ThreadPoolClosedError:
             If task submission is attempted on a closed or unstarted pool.
         :raises ValueError:
-            If `loop` is an invalid worker index or unmanaged event loop.
+            If `pin_to` is an invalid worker index or unmanaged event loop.
 
         """
-        pinned_info = self._resolve_target_worker(loop)
+        pinned_info = self._resolve_target_worker(pin_to)
 
         try:
             caller_loop: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
@@ -572,29 +572,6 @@ class EventLoopThreadPool:
                 loop.call_soon_threadsafe(event.set)
 
         return fut
-
-    def submit_daemon(
-        self,
-        target: Callable[..., Any],
-        *args: Any,
-        loop: asyncio.AbstractEventLoop | int | None = None,
-        **kwargs: Any,
-    ) -> asyncio.Future[Any]:
-        """Submit a long-running daemon task to a worker event loop.
-
-        :param target:
-            A coroutine function or callable daemon task.
-        :type target: callable or coroutine
-
-        :param loop:
-            Optional target event loop instance or worker index `int` for explicit pinning.
-        :type loop: asyncio.AbstractEventLoop or int or None
-
-        :returns: An :class:`asyncio.Future` representing the pending daemon task.
-        :rtype: :class:`asyncio.Future`
-
-        """
-        return self.submit(target, *args, loop=loop, **kwargs)
 
 
 async def create_pool(

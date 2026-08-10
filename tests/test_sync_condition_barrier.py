@@ -160,14 +160,14 @@ async def test_barrier_cross_loop_wake():
     event loop than the waiting parties.
     """
     barrier = Barrier(parties=2)
-    results: list[bool] = []
+    results: list[int] = []
 
     def waiter_in_thread():
         loop = asyncio.new_event_loop()
 
         async def _wait():
             r = await barrier.wait()
-            results.append(r.fulfilled)
+            results.append(r.parties)
 
         loop.run_until_complete(_wait())
         loop.close()
@@ -183,7 +183,7 @@ async def test_barrier_cross_loop_wake():
     await barrier.wait()
     thread.join(timeout=5)
     assert not thread.is_alive()
-    assert results == [True]
+    assert results == [2]
     assert barrier.n_waiting == 0
 
 
@@ -200,7 +200,6 @@ async def test_barrier_wait_two_parties():
 
     async def party(i: int) -> None:
         r = await barrier.wait()
-        assert r.fulfilled
         assert r.parties == 2
         results.append(i)
 
@@ -217,7 +216,6 @@ async def test_barrier_multiple_rounds():
     async def party(i: int) -> None:
         for round_num in range(3):
             r = await barrier.wait()
-            assert r.fulfilled
             assert r.parties == 2
             round_results.append(round_num)
 

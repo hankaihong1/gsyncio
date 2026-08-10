@@ -106,8 +106,8 @@ class FastChannel(_BaseChannel):
                     self._wakeup_notifiers()
                 return True
             return False
-        except RuntimeError:
-            raise ChannelClosedError(_CHANNEL_CLOSED_MSG)
+        except RuntimeError as e:
+            raise ChannelClosedError(_CHANNEL_CLOSED_MSG) from e
 
     def try_recv(self) -> Any:
         """Non-blocking recv. Returns an item or raises :class:`WouldBlock`.
@@ -123,8 +123,8 @@ class FastChannel(_BaseChannel):
             # Option<Py<PyAny>> cannot distinguish a None payload from an
             # empty channel (BUG-2).
             has_item, item = self._inner.try_recv()
-        except RuntimeError:
-            raise ChannelClosedError(_CHANNEL_CLOSED_MSG)
+        except RuntimeError as e:
+            raise ChannelClosedError(_CHANNEL_CLOSED_MSG) from e
         if has_item:
             with self._lock:
                 self._wakeup_next(self._putters)
@@ -349,11 +349,16 @@ class AsyncWaitGroup:
         return "<AsyncWaitGroup>"
 
     def add(self, delta: int = 1) -> None:
-        """Increment the internal counter.
+        """Adjust the internal counter by ``delta`` (Go ``sync.WaitGroup`` semantics).
+
+        Negative deltas are allowed but must not drive the counter below zero.
 
         :param delta:
             Amount to add to the counter. Defaults to 1.
         :type delta: int
+
+        :raises RuntimeError:
+            If the counter would go negative.
 
         """
         self._inner.add(delta)

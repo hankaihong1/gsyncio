@@ -60,11 +60,6 @@ from gsyncio.server import ConnectionPinningServer
 __version__ = "0.1.0"
 
 
-async def open_channel() -> FastChannel:
-    """Create and return a new FastChannel (asyncssh-style facade)."""
-    return FastChannel()
-
-
 async def run_in_pool(coro: Any, *args: Any, num_threads: int = 0, **kwargs: Any) -> Any:
     """Run a coroutine in a freshly-created pool (one-shot convenience)."""
     pool = EventLoopThreadPool(num_threads=num_threads)
@@ -111,7 +106,6 @@ __all__ = [
     "get_logger",
     "move_on_after",
     "move_on_at",
-    "open_channel",
     "run_in_pool",
     "select_channel",
     "set_log_level",

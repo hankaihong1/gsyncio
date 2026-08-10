@@ -21,8 +21,8 @@ async def main() -> None:
         fut1 = pool.submit(heavy_task, 21)
         print("单个任务:", await fut1)  # 42
 
-        # 2. 钉到指定 worker（loop=0），确定性路由
-        fut2 = pool.submit(heavy_task, 21, loop=0)
+        # 2. 钉到指定 worker（pin_to=0），确定性路由
+        fut2 = pool.submit(heavy_task, 21, pin_to=0)
         print("钉到 worker 0:", await fut2)  # 42
 
         # 3. 池健康指标（每个 worker 的活跃/完成计数）

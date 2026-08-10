@@ -1,4 +1,4 @@
-.PHONY: develop build test bench lint format docs clean all
+.PHONY: develop build test test-slow bench lint format docs clean all
 
 develop:
 	uv run maturin develop --release
@@ -9,6 +9,9 @@ build:
 test:
 	uv run pytest
 
+test-slow:
+	uv run pytest -m slow -o addopts=""
+
 bench:
 	for f in benchmarks/benchmark_pull_model.py benchmarks/bench_asgi_throughput.py benchmarks/bench_multithread_loops.py; do \
 		uv run python "$$f"; \
@@ -16,6 +19,7 @@ bench:
 
 lint:
 	uv run ruff check .
+	uv run ruff format --check .
 	uv run mypy --strict src/gsyncio
 	uv run pyright src/gsyncio
 	cargo clippy -- -D warnings

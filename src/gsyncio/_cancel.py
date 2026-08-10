@@ -142,8 +142,7 @@ class CancelScope:
             host = asyncio.current_task()
             if self._task is not None and self._task is not host:
                 raise RuntimeError(
-                    "CancelScope cannot be shared across tasks: "
-                    "already entered by another task"
+                    "CancelScope cannot be shared across tasks: already entered by another task"
                 )
             self._task = host
             self._loop = asyncio.get_running_loop()

@@ -224,6 +224,7 @@ async def test_taskgroup_start_child_crash_cleans_up():
 @pytest.mark.asyncio
 async def test_body_and_child_exceptions_both_visible() -> None:
     """BUG-3: a body exception must not be silently dropped when children fail."""
+
     async def child_fail() -> None:
         raise ValueError("child")
 
@@ -243,6 +244,7 @@ async def test_body_and_child_exceptions_both_visible() -> None:
 @pytest.mark.asyncio
 async def test_body_cancel_propagates_without_merge() -> None:
     """Cancellation wins: a cancelled body must propagate CancelledError, not a group."""
+
     async def stuck() -> None:
         await asyncio.Event().wait()
 
@@ -262,6 +264,7 @@ async def test_body_cancel_propagates_without_merge() -> None:
 async def test_cancel_cancels_stuck_child() -> None:
     """BUG-9: cancelling a TaskGroup body must cancel stuck children so the
     group exits promptly instead of hanging forever."""
+
     async def stuck() -> None:
         await asyncio.Event().wait()
 
@@ -283,6 +286,7 @@ async def test_cancel_cancels_stuck_child() -> None:
 async def test_taskgroup_not_reusable() -> None:
     """TS-3: a crashed TaskGroup must raise RuntimeError on re-entry, not a
     confusing CancelledError."""
+
     async def boom() -> None:
         raise ValueError("child")
 
@@ -299,6 +303,7 @@ async def test_taskgroup_not_reusable() -> None:
 async def test_cancel_all_concurrent_start_soon() -> None:
     """B2: cancel_all from another thread must not race with start_soon
     (free-threaded: an unlocked iteration raises mid-loop)."""
+
     async def noop() -> None:
         await asyncio.sleep(0)
 

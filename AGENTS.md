@@ -45,7 +45,7 @@ gsyncio/
 │   └── lib.rs                # Rust core: NativeWorkerPool, FastChannel,
 │                              #   AtomicMetrics, RawAsyncWaitGroup
 ├── tests/                    # 27 test files (pytest + pytest-asyncio)
-├── benchmarks/               # 4 benchmark scripts
+├── benchmarks/               # 3 benchmark scripts
 ├── examples/                 # Runnable examples (python examples/00_*.py)
 ├── docs/
 │   ├── API.md                # Complete API reference

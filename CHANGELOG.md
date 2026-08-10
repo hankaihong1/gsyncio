@@ -43,6 +43,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `GsyncioASGIWorker.stop()` (both were `DeprecationWarning`-emitting aliases
   of `close()`); also dropped the stale `shutdown()` API doc entry that the
   code had already lost.
+- **API slim-down (audit FIX-8)**:
+  - `open_channel()` — top-level facade removed; construct `FastChannel()`
+    directly (it was a trivial async wrapper).
+  - `EventLoopThreadPool.submit_daemon()` — pure alias of `submit()` removed.
+  - `CapacityLimiter.acquire_on_behalf_of()` / `release_on_behalf_of()` —
+    no-op borrower slots removed; `acquire()` / `release()` are the API.
+  - `testing.assert_checkpoints()` and its `checkpoints` fixture — never
+    used by the test suite, removed.
+  - `BarrierWaitResult.fulfilled` — removed; a normal `Barrier.wait()`
+    return always means the round completed (aborts raise `RuntimeError`
+    instead), so the flag carried no information.
+  - `AtomicMetrics.get_metrics()` — dead Rust method removed; pool health
+    metrics come exclusively from the Python `MetricsCollector`.
 
 ### Fixed
 - **free-threading stress tests**: `test_cancel_scope_cross_thread_stress` no
@@ -89,6 +102,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tasks, round-tripping each worker loop so the cancellations land before
   the pool stops — the `"Task was destroyed but it is pending!"` warnings
   at shutdown are gone.
+- **Concurrency audit fixes (BUG-1..BUG-10)**: fixed cancel-count leaks and
+  swallowed external cancels in `CancelScope` (BUG-1/2), `None` payloads on
+  `FastChannel` (send(None) then recv — BUG-5), structured-concurrency
+  contract violations in `TaskGroup` and `select_channel` (child futures
+  always settled before scope exit), handoff tokens now forwarded to live
+  waiters, readers woken when a writer cancels, and pool lifecycle contract
+  violations (submit/close races). Submission to a closed pool reliably
+  raises `ThreadPoolClosedError` — native `Disconnected` errors are
+  translated to the public exception type instead of leaking.
 
 ### Changed
 - **CI: docs-only changes skip the heavy matrix**: a `changes` job
@@ -127,6 +149,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **CI hang protection**: added `pytest-timeout` (180s, thread method) so a
   deadlocked test fails with a thread-stack dump instead of spinning a CI job
   until the runner timeout.
+- **Breaking: `submit(loop=...)` renamed to `submit(pin_to=...)`**
+  (`EventLoopThreadPool`) — the parameter name now states what it does (pin
+  the task to a worker event loop or index). All call sites, tests,
+  examples, and docs updated.
+- **`AsyncContext.parent` is now read-only** — fixed at construction;
+  previously a publicly writable attribute.
 
 ## [0.1.0] - 2026-08-03
 

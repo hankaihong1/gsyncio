@@ -2,7 +2,6 @@ use parking_lot::Mutex;
 use pyo3::create_exception;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -21,7 +20,7 @@ const _LOCAL_QUEUE_CAPACITY: usize = 256;
 #[repr(align(64))]
 struct PaddedAtomic(AtomicUsize);
 
-#[pyclass]
+#[pyclass(module = "gsyncio._gsyncio_core")]
 pub struct AtomicMetrics {
     active: Vec<PaddedAtomic>,
     completed: Vec<PaddedAtomic>,
@@ -149,26 +148,6 @@ impl AtomicMetrics {
             0
         }
     }
-
-    fn get_metrics(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let n = self.active.len();
-        let active: Vec<usize> = (0..n).map(|i| self.get_active(i)).collect();
-        let completed: Vec<usize> = (0..n).map(|i| self.get_completed(i)).collect();
-        let global_pull: Vec<usize> = (0..n).map(|i| self.get_global_pull(i)).collect();
-        let park: Vec<usize> = (0..n).map(|i| self.get_park(i)).collect();
-        let injection_depth: Vec<usize> =
-            (0..n).map(|i| self.get_injection_queue_depth(i)).collect();
-        let remote_schedule: Vec<usize> = (0..n).map(|i| self.get_remote_schedule(i)).collect();
-
-        let dict = PyDict::new(py);
-        dict.set_item("active_tasks", PyList::new(py, active)?)?;
-        dict.set_item("completed_tasks", PyList::new(py, completed)?)?;
-        dict.set_item("global_pull_count", PyList::new(py, global_pull)?)?;
-        dict.set_item("park_count", PyList::new(py, park)?)?;
-        dict.set_item("injection_queue_depth", PyList::new(py, injection_depth)?)?;
-        dict.set_item("remote_schedule_count", PyList::new(py, remote_schedule)?)?;
-        Ok(dict.unbind().into())
-    }
 }
 
 /// RAII guard that decrements an `AtomicUsize` counter on drop.
@@ -183,7 +162,7 @@ impl Drop for PollerGuard<'_> {
 }
 
 /// Native Rust Worker Pool Core for zero-overhead task queueing and work stealing.
-#[pyclass]
+#[pyclass(module = "gsyncio._gsyncio_core")]
 pub struct NativeWorkerPool {
     global_sender: Mutex<Option<flume::Sender<Py<PyAny>>>>,
     global_receiver: flume::Receiver<Py<PyAny>>,
@@ -371,7 +350,7 @@ impl NativeWorkerPool {
     }
 }
 
-#[pyclass]
+#[pyclass(module = "gsyncio._gsyncio_core")]
 pub struct FastChannel {
     sender: flume::Sender<Py<PyAny>>,
     receiver: flume::Receiver<Py<PyAny>>,
@@ -441,11 +420,14 @@ impl FastChannel {
     }
 }
 
-#[pyclass]
-#[allow(clippy::type_complexity)]
+/// A registered waiter: (event loop, future) pair used to wake a suspended
+/// `wait()` coroutine from whichever thread calls `done()`.
+type Waiter = (Py<PyAny>, Py<PyAny>);
+
+#[pyclass(module = "gsyncio._gsyncio_core")]
 pub struct RawAsyncWaitGroup {
     counter: Arc<AtomicUsize>,
-    waiters: Arc<Mutex<Vec<(Py<PyAny>, Py<PyAny>)>>>,
+    waiters: Arc<Mutex<Vec<Waiter>>>,
 }
 
 #[pymethods]
@@ -458,12 +440,49 @@ impl RawAsyncWaitGroup {
         }
     }
 
-    fn add(&self, delta: usize) {
-        self.counter.fetch_add(delta, Ordering::Release); // add(): Release makes increment visible to done's AcqRel
+    /// Add `delta` to the counter (Go `sync.WaitGroup.Add` semantics).
+    ///
+    /// Negative deltas are legal, but the counter must never go below zero:
+    /// an `add()` that would underflow raises `RuntimeError` (mirroring Go's
+    /// panic on a negative counter). The update is a CAS loop so concurrent
+    /// `add()`/`done()` calls are never lost and the underflow check is
+    /// race-free.
+    fn add(&self, delta: isize) -> PyResult<()> {
+        let mut prev = self.counter.load(Ordering::Acquire); // add(): Acquire pairs with done()'s AcqRel
+        loop {
+            let new_val = if delta < 0 {
+                let magnitude = delta.unsigned_abs();
+                if prev < magnitude {
+                    return Err(PyRuntimeError::new_err(
+                        "WaitGroup counter went negative: add() with negative delta",
+                    ));
+                }
+                prev - magnitude
+            } else {
+                match prev.checked_add(delta as usize) {
+                    Some(v) => v,
+                    None => {
+                        return Err(PyRuntimeError::new_err(
+                            "WaitGroup counter overflowed: add() with positive delta",
+                        ));
+                    }
+                }
+            };
+            match self.counter.compare_exchange_weak(
+                prev,
+                new_val,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                // AcqRel: Release makes the increment visible to done()/register_waiter,
+                // Acquire observes done()'s decrements racing with this add().
+                Ok(_) => return Ok(()),
+                Err(actual) => prev = actual,
+            }
+        }
     }
 
-    #[allow(clippy::type_complexity)]
-    fn done(&self) -> PyResult<Option<Vec<(Py<PyAny>, Py<PyAny>)>>> {
+    fn done(&self) -> PyResult<Option<Vec<Waiter>>> {
         let prev = self.counter.fetch_sub(1, Ordering::AcqRel); // done(): AcqRel — Acquire observes add()s, Release so register_waiter sees decrement
         if prev == 0 {
             return Err(PyRuntimeError::new_err(
@@ -493,7 +512,7 @@ impl RawAsyncWaitGroup {
     /// the waiter is pushed, the waiter will never be woken. Callers must
     /// ensure all `add()` calls with a positive delta happen-before
     /// `register_waiter()`.
-    fn register_waiter(&self, waiter: (Py<PyAny>, Py<PyAny>)) -> bool {
+    fn register_waiter(&self, waiter: Waiter) -> bool {
         if self.counter.load(Ordering::Acquire) == 0 {
             // register_waiter: Acquire sees done()'s decrement
             true
@@ -512,7 +531,10 @@ impl RawAsyncWaitGroup {
 
 #[pymodule]
 fn _gsyncio_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add("ThreadPoolClosedError", m.py().get_type::<ThreadPoolClosedError>())?;
+    m.add(
+        "ThreadPoolClosedError",
+        m.py().get_type::<ThreadPoolClosedError>(),
+    )?;
     m.add_class::<AtomicMetrics>()?;
     m.add_class::<NativeWorkerPool>()?;
     m.add_class::<FastChannel>()?;
@@ -539,7 +561,7 @@ mod tests {
     fn test_waitgroup_double_check() {
         Python::attach(|py| {
             let wg = RawAsyncWaitGroup::new();
-            wg.add(1);
+            wg.add(1).unwrap();
             // done() decrements from 1 → 0, returns the waiters list.
             let result = wg.done();
             assert!(result.is_ok(), "done() on counter=1 should succeed");
@@ -552,11 +574,34 @@ mod tests {
             assert!(waiters.is_empty(), "waiters list should be empty");
             // After done(), counter is 0, so register_waiter should return true
             // (meaning "already done, wake immediately").
-            let waiter: (Py<PyAny>, Py<PyAny>) = (Py::from(py.None()), Py::from(py.None()));
+            let waiter: Waiter = (Py::from(py.None()), Py::from(py.None()));
             assert!(
                 wg.register_waiter(waiter),
                 "register_waiter after done should return true"
             );
+        });
+    }
+
+    #[test]
+    fn test_waitgroup_add_negative() {
+        Python::attach(|_py| {
+            let wg = RawAsyncWaitGroup::new();
+            // add(-1) on a zero counter must error (Go panics on a negative
+            // counter; we mirror that with RuntimeError).
+            assert!(
+                wg.add(-1).is_err(),
+                "add(-1) on counter=0 should return Err"
+            );
+            wg.add(2).unwrap();
+            // add(-3) would drive 2 → -1: must error.
+            assert!(
+                wg.add(-3).is_err(),
+                "add(-3) on counter=2 should return Err"
+            );
+            // add(-2) brings 2 → 0: legal, mirrors done().
+            wg.add(-2).unwrap();
+            // Counter is 0 again: a positive add is legal.
+            wg.add(1).unwrap();
         });
     }
 

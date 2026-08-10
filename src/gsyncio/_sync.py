@@ -263,10 +263,6 @@ class CapacityLimiter:
     be dynamically resized.  Available and borrowed tokens are computed from
     the underlying semaphore value.  ``total_tokens`` may be a fractional
     float; the underlying semaphore capacity is ``int(total_tokens)``.
-
-    ``acquire_on_behalf_of`` and ``release_on_behalf_of`` accept a
-    *borrower* object for future ownership tracking (currently a no-op
-    slot).
     """
 
     def __init__(self, total_tokens: float) -> None:
@@ -347,18 +343,8 @@ class CapacityLimiter:
         """Acquire one token, blocking if none are available."""
         await self._semaphore.acquire()
 
-    async def acquire_on_behalf_of(self, borrower: object) -> None:
-        """Acquire one token on behalf of *borrower*."""
-        _ = borrower
-        await self._semaphore.acquire()
-
     def release(self) -> None:
         """Release one token."""
-        self._semaphore.release()
-
-    def release_on_behalf_of(self, borrower: object) -> None:
-        """Release one token on behalf of *borrower*."""
-        _ = borrower
         self._semaphore.release()
 
     async def __aenter__(self) -> Self:
@@ -593,18 +579,16 @@ class BarrierWaitResult:
     """Simple result object returned by :meth:`Barrier.wait`.
 
     Attributes:
-        fulfilled: Always ``True`` for a normal return.
         parties: Total number of parties in this barrier round.
     """
 
-    __slots__ = ("fulfilled", "parties")
+    __slots__ = ("parties",)
 
-    def __init__(self, fulfilled: bool, parties: int) -> None:
-        self.fulfilled = fulfilled
+    def __init__(self, parties: int) -> None:
         self.parties = parties
 
     def __repr__(self) -> str:
-        return f"<BarrierWaitResult fulfilled={self.fulfilled}, parties={self.parties}>"
+        return f"<BarrierWaitResult parties={self.parties}>"
 
 
 class Barrier:
@@ -642,8 +626,9 @@ class Barrier:
     async def wait(self) -> BarrierWaitResult:
         """Wait at the barrier until *parties* tasks have arrived.
 
-        Returns a :class:`BarrierWaitResult` with ``fulfilled=True``
-        and ``parties`` set to the barrier's party count.
+        Returns a :class:`BarrierWaitResult` with ``parties`` set to the
+        barrier's party count.  A normal return always means the round was
+        completed; :meth:`abort` raises instead.
 
         :raises RuntimeError: if :meth:`abort` is called.
         """
@@ -659,7 +644,7 @@ class Barrier:
                     l.call_soon_threadsafe(e.set)
                 self._waiters.clear()
                 self._generation += 1
-                return BarrierWaitResult(fulfilled=True, parties=self._parties)
+                return BarrierWaitResult(parties=self._parties)
             self._waiters.append((loop, event))
             generation = self._generation
 
@@ -681,7 +666,7 @@ class Barrier:
         with self._mutex:
             if self._aborted:
                 raise RuntimeError("barrier has been aborted")
-            return BarrierWaitResult(fulfilled=True, parties=self._parties)
+            return BarrierWaitResult(parties=self._parties)
 
     def abort(self) -> None:
         """Abort the barrier, raising :exc:`RuntimeError` in all waiting tasks.

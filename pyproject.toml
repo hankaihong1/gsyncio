@@ -65,7 +65,6 @@ warn_unused_configs = true
 [tool.pytest.ini_options]
 asyncio_mode = "strict"
 addopts = "-m \"not slow\""
-filterwarnings = ["ignore::DeprecationWarning"]
 # WHY: 死锁/挂死必须以失败+线程栈 dump 结束，而不是让 CI job 空转数小时。
 # thread 方法超时时会打印所有线程的 traceback，精确定位卡住的 await 点。
 timeout = 180
@@ -85,7 +84,6 @@ lint.ignore = [
     "E501",    # line-too-long
     "E741",    # ambiguous-variable-name
     "F821",    # undefined-name (self-referencing forward-ref types)
-    "B904",    # raise-from-err
     "RUF002",  # ambiguous-unicode-character-docstring (Chinese punctuation)
     "RUF003",  # ambiguous-unicode-character-comment (Chinese punctuation)
     "RUF006",  # store-task-reference

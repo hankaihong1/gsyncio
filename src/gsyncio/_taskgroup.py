@@ -164,9 +164,7 @@ class TaskGroup:
         # first-ready report), not a real failure.  Do NOT cancel the scope —
         # that would inject a cancellation into the hosting task and make a
         # well-behaved caller see its own signal as an external cancel.
-        if exc_val is None and all(
-            isinstance(e, asyncio.CancelledError) for e in child_exceptions
-        ):
+        if exc_val is None and all(isinstance(e, asyncio.CancelledError) for e in child_exceptions):
             await self._cancel_scope.__aexit__(None, None, exc_tb)
             if len(child_exceptions) == 1:
                 raise child_exceptions[0]
@@ -296,7 +294,11 @@ class TaskGroup:
             if task.done() and task.exception() is not None:
                 exc = task.exception()
                 with self._children_lock:
-                    siblings = [h._task for h in self._children if h._task is not task and not h._task.done()]
+                    siblings = [
+                        h._task
+                        for h in self._children
+                        if h._task is not task and not h._task.done()
+                    ]
                 for sibling in siblings:
                     sibling.cancel()
                 if exc is not None:

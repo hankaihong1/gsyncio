@@ -14,7 +14,6 @@ Complete API documentation for `gsyncio`: a multi-event-loop engine and concurre
   - [`PoolOptions`](#pooloptions)
 - [Top-Level Functions](#top-level-functions)
   - [`create_pool`](#create_pool)
-  - [`open_channel`](#open_channel)
   - [`run_in_pool`](#run_in_pool)
   - [`checkpoint`](#checkpoint)
   - [`fail_after`](#fail_after)
@@ -74,7 +73,7 @@ async def heavy_task(x: int) -> int:
 async def main():
     async with gsyncio.EventLoopThreadPool(num_threads=2) as pool:
         fut1 = pool.submit(heavy_task, 21)
-        fut2 = pool.submit(heavy_task, 21, loop=0)  # pinned to worker 0
+        fut2 = pool.submit(heavy_task, 21, pin_to=0)  # pinned to worker 0
         results = await asyncio.gather(fut1, fut2)
         print(results)  # [42, 42]
 
@@ -346,21 +345,20 @@ Starts all worker threads and their work-stealing queue dispatchers.
 ##### `async close()` -> `None`
 Gracefully stops all worker loops, drains pending tasks, and joins worker threads.
 
+Drain is bounded: `close()` waits up to ~5 seconds for in-flight tasks to finish, then force-stops every worker loop — tasks still running at that point are cancelled and are not guaranteed to complete.
+
 ##### `async abort()` -> `None`
 Forcefully stops all worker loops without draining pending tasks. Queued but unexecuted work is discarded.
 
 ##### `async wait_closed()` -> `None`
 Waits until the pool has been fully stopped. Returns immediately if the pool is not running.
 
-##### `submit(target: Callable[..., Any], *args: Any, loop: asyncio.AbstractEventLoop | int | None = None, cancel_scope: CancelScope | None = None, **kwargs: Any)` -> `asyncio.Future`
+##### `submit(target: Callable[..., Any], *args: Any, pin_to: asyncio.AbstractEventLoop | int | None = None, cancel_scope: CancelScope | None = None, **kwargs: Any)` -> `asyncio.Future`
 Submits a coroutine function, coroutine object, or callable to the shared work queue. Workers pull tasks as they become idle. Returns an `asyncio.Future` that resolves with the task's result.
 
-- **`loop`**: Optionally pins the task to a specific worker loop (an `int` worker index or an `AbstractEventLoop` managed by the pool). When `None`, the task goes to the global shared queue.
+- **`pin_to`**: Optionally pins the task to a specific worker loop (an `int` worker index or an `AbstractEventLoop` managed by the pool). When `None`, the task goes to the global shared queue.
 - **`cancel_scope`**: Optionally binds the task to a `CancelScope`; cancelled scopes suppress the task result.
-- **Raises**: `ThreadPoolClosedError` if the pool is closed, `ValueError` for an invalid `loop` index.
-
-##### `submit_daemon(target: Callable[..., Any], *args: Any, **kwargs: Any)` -> `asyncio.Future`
-Submits a long-running daemon coroutine task to the pool.
+- **Raises**: `ThreadPoolClosedError` if the pool is closed, `ValueError` for an invalid `pin_to` index.
 
 ##### `get_metrics()` -> `dict[str, Any]`
 Returns a JSON-serializable dictionary containing health metrics:
@@ -409,14 +407,6 @@ async def create_pool(
 ```
 
 Creates and **starts** a pool, returning it ready for use (`asyncssh`-style facade). `num_threads=0` auto-detects via `os.cpu_count()`. Use it as an async context manager, or call `close()` manually when finished.
-
-### `open_channel`
-
-```text
-async def open_channel() -> FastChannel
-```
-
-Creates and returns a new unbounded `FastChannel` (`asyncssh`-style facade).
 
 ### `run_in_pool`
 
@@ -735,8 +725,7 @@ CapacityLimiter(total_tokens: float)
   `total_tokens` concurrently — separate reads can mix values computed
   against different totals.
 - **`acquire()`**: Acquires one token, suspending until available.
-- **`acquire_on_behalf_of(borrower)`**: Acquires a token on behalf of another task/object.
-- **`release()`** / **`release_on_behalf_of(borrower)`**: Return one token.
+- **`release()`**: Returns one token.
 
 ### `Event`
 
@@ -780,7 +769,6 @@ Barrier(parties: int)
 
 Result object returned by `Barrier.wait()`.
 
-- **`fulfilled`** -> `bool`: Always `True` for a normal return.
 - **`parties`** -> `int`: Total number of parties in this barrier round.
 
 ### `AsyncContext`
@@ -793,6 +781,7 @@ ctx = AsyncContext(parent: AsyncContext | None = None)
 
 - **`ctx.cancel()`**: Cancels this context and cascades cancellation thread-safely to all child contexts and submitted futures.
 - **`ctx.submit(pool, target, *args, **kwargs)`**: Submits a task to the pool bound to this context.
+- **`ctx.parent`**: The parent context, or `None` for a root context (read-only, fixed at construction).
 - **`ctx.is_cancelled`**: Returns `True` if cancelled.
 
 ---
@@ -807,6 +796,8 @@ wg.add(2)
 # In worker tasks: wg.done()
 await wg.wait()
 ```
+
+All `add()` calls with a positive delta must happen-before the first `wait()` on the counter (matches Go `sync.WaitGroup`): a concurrent `add()` racing with `wait()` can lose its wakeup and hang forever. Negative deltas are allowed (Go semantics) but must never drive the counter below zero — doing so raises `RuntimeError`.
 
 ---
 

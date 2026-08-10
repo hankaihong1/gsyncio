@@ -6,7 +6,6 @@ import pytest
 from gsyncio import (
     EventLoopThreadPool,
     TimeoutError,
-    open_channel,
     select_channel,
 )
 from gsyncio.exceptions import ChannelClosedError, GsyncioError, WouldBlock
@@ -308,24 +307,6 @@ async def test_channel_close_with_blocked_waiters():
 
 
 @pytest.mark.asyncio
-async def test_open_channel_basic():
-    """open_channel returns a FastChannel instance."""
-    ch = await open_channel()
-    assert isinstance(ch, FastChannel)
-
-
-@pytest.mark.asyncio
-async def test_open_channel_close_behavior():
-    """Closing an open_channel raises ChannelClosedError on send/recv."""
-    ch = await open_channel()
-    ch.close()
-    with pytest.raises(ChannelClosedError):
-        await ch.send("x")
-    with pytest.raises(ChannelClosedError):
-        await ch.recv()
-
-
-@pytest.mark.asyncio
 async def test_async_channel_timeout_and_errors():
     """Test FastChannel timeout and close edge paths"""
     ch = FastChannel(maxsize=1)
@@ -547,6 +528,7 @@ async def test_select_no_item_loss_simultaneous() -> None:
 @pytest.mark.asyncio
 async def test_select_timeout_no_loss() -> None:
     """W4: an item sent at the timeout boundary must never vanish."""
+
     async def delayed_send(ch: FastChannel, delay: float, value: str) -> None:
         await asyncio.sleep(delay)
         await ch.send(value)

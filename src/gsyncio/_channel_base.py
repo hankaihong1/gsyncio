@@ -103,9 +103,7 @@ class _BaseChannel:  # pyright: ignore[reportUnusedClass]
             loop, event = self._notifiers.popleft()
             loop.call_soon_threadsafe(event.set)
 
-    def _register_notifier(
-        self, loop: asyncio.AbstractEventLoop
-    ) -> asyncio.Event | None:
+    def _register_notifier(self, loop: asyncio.AbstractEventLoop) -> asyncio.Event | None:
         """Register a non-consuming readiness notifier.
 
         Returns ``None`` when the channel already holds an item (the caller
@@ -120,9 +118,7 @@ class _BaseChannel:  # pyright: ignore[reportUnusedClass]
             self._notifiers.append((loop, event))
             return event
 
-    def _discard_notifier(
-        self, loop: asyncio.AbstractEventLoop, event: asyncio.Event
-    ) -> None:
+    def _discard_notifier(self, loop: asyncio.AbstractEventLoop, event: asyncio.Event) -> None:
         """Remove a notifier registration (cancelled select reader)."""
         with self._lock:
             remaining = collections.deque(
@@ -238,4 +234,4 @@ class _BaseChannel:  # pyright: ignore[reportUnusedClass]
         try:
             return await self.recv()
         except ChannelClosedError:
-            raise StopAsyncIteration
+            raise StopAsyncIteration from None
