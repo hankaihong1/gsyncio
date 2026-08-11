@@ -54,8 +54,15 @@ class Lock:
         is cancelled while waiting, its waiter entry is removed from
         the queue and a :class:`asyncio.CancelledError` is propagated.
         """
-        task = asyncio.current_task()
-        if task is None:
+        # WHY: on 3.14 current_task() RAISES RuntimeError when no loop is
+        # running instead of returning None — the try/except converts the
+        # bare "no running event loop" into the documented message (R5
+        # FIX-J).
+        try:
+            task = asyncio.current_task()
+        except RuntimeError:
+            raise RuntimeError("acquire() must be called from an asyncio task") from None
+        if task is None:  # defensive narrowing for older interpreters
             raise RuntimeError("acquire() must be called from an asyncio task")
 
         with self._lock:
@@ -104,8 +111,12 @@ class Lock:
 
         :raises RuntimeError: if called by a task that does not own the lock.
         """
-        task = asyncio.current_task()
-        if task is None:
+        # WHY: same 3.14 current_task() semantics as acquire() (R5 FIX-J).
+        try:
+            task = asyncio.current_task()
+        except RuntimeError:
+            raise RuntimeError("release() must be called from an asyncio task") from None
+        if task is None:  # defensive narrowing for older interpreters
             raise RuntimeError("release() must be called from an asyncio task")
 
         with self._lock:
@@ -124,7 +135,14 @@ class Lock:
                 continue
             self._owner = waiter_task
             waiter_loop = waiter_task.get_loop()
-            waiter_loop.call_soon_threadsafe(event.set)
+            try:
+                waiter_loop.call_soon_threadsafe(event.set)
+            except RuntimeError:
+                # WHY: the waiter's loop was closed (abandoned loop) — it can
+                # never take ownership.  Keep scanning for a live waiter
+                # instead of leaving the lock owned by a dead task, which
+                # would break every later acquire (R5 FIX-E).
+                continue
             return
 
         self._owner = None
@@ -251,11 +269,18 @@ class Semaphore:
                 # a permit. Dropping the entry would silently destroy that permit
                 # and shrink the pool forever. Forwarding it to the next FIFO
                 # waiter, or returning it to the value pool, keeps the count exact.
-                if self._waiters:
+                while self._waiters:
                     next_loop, next_event = self._waiters.popleft()
-                    next_loop.call_soon_threadsafe(next_event.set)
-                else:
-                    self._value += 1
+                    try:
+                        next_loop.call_soon_threadsafe(next_event.set)
+                        return
+                    except RuntimeError:
+                        # WHY: dead loop — this waiter can never take the
+                        # token; keep forwarding to the next live one, and if
+                        # none remain the token returns to the pool below
+                        # (R5 FIX-E).
+                        continue
+                self._value += 1
 
     def release(self) -> None:
         """Release a permit, waking the first FIFO waiter if any.
@@ -266,12 +291,21 @@ class Semaphore:
         """
         with self._lock:
             if self._waiters:
-                loop, event = self._waiters.popleft()
-                loop.call_soon_threadsafe(event.set)
-            else:
-                if self._value >= self._max_value:
-                    raise ValueError("Semaphore released too many times")
+                while self._waiters:
+                    loop, event = self._waiters.popleft()
+                    try:
+                        loop.call_soon_threadsafe(event.set)
+                        return
+                    except RuntimeError:
+                        # WHY: dead loop — drop this waiter and keep looking;
+                        # if none remain, the token returns to the pool (R5
+                        # FIX-E).
+                        continue
                 self._value += 1
+                return
+            if self._value >= self._max_value:
+                raise ValueError("Semaphore released too many times")
+            self._value += 1
 
     async def __aenter__(self) -> Self:
         await self.acquire()
@@ -336,32 +370,37 @@ class CapacityLimiter:
             self._total_tokens = value
             new_int = int(value)
             old_int = int(old)
-            # WHY: the semaphore max must be updated BEFORE releasing tokens —
-            # release() is now bounded (R1 FIX-3), so regrowing against a stale
-            # max would raise ValueError (R5 修订 D).
-            self._semaphore._max_value = new_int
-            diff = new_int - old_int
-            if diff > 0:
-                # WHY: only tokens NOT currently borrowed may become
-                # available — with 3 borrowed, growing 1 → 5 must yield
-                # exactly 2 available tokens, not diff=4 (R5 修订 D).
-                target_value = max(0, new_int - self._borrowed)
-                while True:
-                    with self._semaphore._lock:
-                        if self._semaphore._value >= target_value:
-                            break
+            # WHY: max write + token reclaim/grow are ONE atomic region
+            # under the semaphore lock — release() checks value against max
+            # under that same lock, so it can never observe an intermediate
+            # resize state (max lowered, tokens not yet reclaimed) and raise
+            # a false over-release ValueError (R5 FIX-I / 修订 D).
+            with self._semaphore._lock:
+                self._semaphore._max_value = new_int
+                diff = new_int - old_int
+                if diff > 0:
+                    # WHY: only tokens NOT currently borrowed may become
+                    # available — with 3 borrowed, growing 1 → 5 must yield
+                    # exactly 2 available tokens, not diff=4 (R5 修订 D).
+                    target_value = max(0, new_int - self._borrowed)
+                    while self._semaphore._value < target_value:
                         if self._semaphore._waiters:
                             loop, event = self._semaphore._waiters.popleft()
-                            loop.call_soon_threadsafe(event.set)
+                            try:
+                                loop.call_soon_threadsafe(event.set)
+                            except RuntimeError:
+                                # WHY: dead loop — the waiter can never take
+                                # the token; the loop retries with the next
+                                # one (R5 FIX-E).
+                                continue
                         else:
                             self._semaphore._value += 1
-            elif diff < 0:
-                # Shrink only reclaims AVAILABLE tokens (value); borrowed ones
-                # are untouched — the cap below is inherent (value cannot go
-                # negative), so shrinking below the borrowed count is safe.
-                to_reduce = -diff
-                for _ in range(to_reduce):
-                    with self._semaphore._lock:
+                elif diff < 0:
+                    # Shrink only reclaims AVAILABLE tokens (value); borrowed ones
+                    # are untouched — the cap below is inherent (value cannot go
+                    # negative), so shrinking below the borrowed count is safe.
+                    to_reduce = -diff
+                    for _ in range(to_reduce):
                         if self._semaphore._value > 0:
                             self._semaphore._value -= 1
 
@@ -424,10 +463,19 @@ class CapacityLimiter:
             if self._borrowed <= 0:
                 raise ValueError("CapacityLimiter released too many times")
             with self._semaphore._lock:
-                if self._semaphore._waiters:
+                token_delivered = False
+                while self._semaphore._waiters:
                     loop, event = self._semaphore._waiters.popleft()
-                    loop.call_soon_threadsafe(event.set)
-                elif self._semaphore._value < self._semaphore._max_value:
+                    try:
+                        loop.call_soon_threadsafe(event.set)
+                        token_delivered = True
+                        break
+                    except RuntimeError:
+                        # WHY: dead loop — keep looking for a live waiter;
+                        # if none remain the token is absorbed below (R5
+                        # FIX-E).
+                        continue
+                if not token_delivered and self._semaphore._value < self._semaphore._max_value:
                     self._semaphore._value += 1
                 # else: over-budget return — absorbed; value stays at max
             self._borrowed -= 1
@@ -482,7 +530,13 @@ class Event:
             self._waiters = []
 
         for loop, event in waiters:
-            loop.call_soon_threadsafe(event.set)
+            try:
+                loop.call_soon_threadsafe(event.set)
+            except RuntimeError:
+                # WHY: a waiter whose loop was closed can never wake — skip
+                # it instead of aborting the whole wakeup loop, which would
+                # leave every live-loop waiter sleeping forever (R5 FIX-E).
+                pass
 
     async def wait(self) -> None:
         """Wait until the event has been set.
@@ -612,7 +666,13 @@ class Condition:
         if n <= 0:
             return
         for waiter_loop, event in self._pop_waiters(n):
-            waiter_loop.call_soon_threadsafe(event.set)
+            try:
+                waiter_loop.call_soon_threadsafe(event.set)
+            except RuntimeError:
+                # WHY: dead loop — this notification would be lost anyway;
+                # skip rather than abort notifying the remaining waiters
+                # (R5 FIX-E).
+                pass
 
     def notify_all(self) -> None:
         """Wake up **all** current waiters.
@@ -650,9 +710,16 @@ class Condition:
     def _forward_notify(self) -> None:
         """Pass a lost notification to the next FIFO waiter (caller holds nothing)."""
         with self._waiters_lock:
-            if self._waiters:
+            while self._waiters:
                 next_loop, next_event = self._waiters.popleft()
-                next_loop.call_soon_threadsafe(next_event.set)
+                try:
+                    next_loop.call_soon_threadsafe(next_event.set)
+                    return
+                except RuntimeError:
+                    # WHY: dead loop — keep forwarding to the next live
+                    # waiter; the notification dies only when no live waiter
+                    # remains (R5 FIX-E).
+                    continue
 
 
 # ============================================================================
@@ -726,7 +793,12 @@ class Barrier:
             n = len(self._waiters) + 1
             if n == self._parties:
                 for l, e in self._waiters:
-                    l.call_soon_threadsafe(e.set)
+                    try:
+                        l.call_soon_threadsafe(e.set)
+                    except RuntimeError:
+                        # WHY: dead loop — the party is gone; waking the
+                        # remaining live parties must not abort (R5 FIX-E).
+                        pass
                 self._waiters.clear()
                 self._generation += 1
                 return BarrierWaitResult(parties=self._parties)
@@ -765,4 +837,8 @@ class Barrier:
             self._waiters = []
 
         for loop, event in waiters:
-            loop.call_soon_threadsafe(event.set)
+            try:
+                loop.call_soon_threadsafe(event.set)
+            except RuntimeError:
+                # WHY: dead loop — skip rather than abort the abort (R5 FIX-E).
+                pass

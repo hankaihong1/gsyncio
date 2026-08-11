@@ -287,21 +287,16 @@ async def test_server_handler_exception_no_noise(capsys):
     intentional and consumed by the done-callback."""
     async with EventLoopThreadPool(num_threads=1) as pool:
 
-        async def bad_handler(
-            reader: asyncio.StreamReader, writer: asyncio.StreamWriter
-        ) -> None:
+        async def bad_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
             raise ValueError("boom")
 
         server = ConnectionPinningServer(pool, handler=bad_handler)
         await server.start()
         try:
-            _reader, writer = await asyncio.open_connection(
-                "127.0.0.1", server.port
-            )
+            _reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
             writer.close()
             await asyncio.sleep(0.1)  # let the handler run and fail
         finally:
             await server.close()
     err = capsys.readouterr().err
     assert "never retrieved" not in err
-

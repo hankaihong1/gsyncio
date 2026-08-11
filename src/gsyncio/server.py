@@ -111,15 +111,21 @@ class ConnectionPinningServer:
         # Using Shared Acceptor (Thundering Herd) architecture
         # Bind one socket, and pass it to all worker loops to accept concurrently.
         # This provides perfect cross-platform load balancing (unlike macOS SO_REUSEPORT bias).
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind((self.host, self.port))
-        sock.listen(128)
-        sock.setblocking(False)
-
-        self.port = sock.getsockname()[1]
-        self._server_socket = sock
+        # WHY: the idempotency check and the bind happen under the SAME lock —
+        # a check-then-act across the lock boundary would let two concurrent
+        # start() calls both bind (EADDRINUSE) and double-spawn acceptors
+        # (R5 FIX-G).
         with self._running_lock:
+            if self._running:
+                return
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((self.host, self.port))
+            sock.listen(128)
+            sock.setblocking(False)
+
+            self.port = sock.getsockname()[1]
+            self._server_socket = sock
             self._running = True
         self._accept_tasks = []
 
@@ -255,9 +261,20 @@ class ConnectionPinningServer:
             if not tasks:
                 break
             for task in tasks:
-                task.get_loop().call_soon_threadsafe(task.cancel)
+                try:
+                    task.get_loop().call_soon_threadsafe(task.cancel)
+                except RuntimeError:
+                    # WHY: the task's loop was already closed (pool shut down
+                    # first) — the task is gone with it (R5 FIX-E/G).
+                    pass
             for i in range(self.pool.num_threads):
-                loop = self.pool._get_loop(i)
+                try:
+                    loop = self.pool._get_loop(i)
+                except RuntimeError:
+                    # WHY: the pool was closed before the server — nothing
+                    # left to round-trip; keep going so the socket still
+                    # gets closed (R5 FIX-G).
+                    continue
                 if not loop.is_running():
                     continue
                 try:

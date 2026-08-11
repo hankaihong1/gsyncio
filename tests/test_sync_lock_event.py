@@ -480,3 +480,61 @@ async def test_writer_cancel_wakes_blocked_readers() -> None:
     # Pre-fix this times out: R2 waits forever.
     await asyncio.wait_for(reader_done.wait(), timeout=1.0)
     await asyncio.gather(t1, t2, t3, return_exceptions=True)
+
+
+# ---------------------------------------------------------------------------
+# FIX-E (R5 audit): wakeup loops must tolerate waiters whose loop was closed
+# ---------------------------------------------------------------------------
+
+
+def _register_on_abandoned_loop(coro_factory: Any) -> None:
+    """Register a waiter on a fresh loop, then stop and close that loop
+    WITHOUT cancelling the waiter — simulating an abandoned loop whose
+    waiter entry is still registered."""
+    loop = asyncio.new_event_loop()
+
+    def _run() -> None:
+        asyncio.set_event_loop(loop)
+        loop.run_forever()
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    asyncio.run_coroutine_threadsafe(coro_factory(), loop)
+    # WHY: block until the coroutine's first step ran on loop_a (waiter
+    # registered) — a bare call_soon sync point can race the loop's
+    # iteration boundary and close the loop before the waiter registers,
+    # silently turning the test into a no-op.
+    asyncio.run_coroutine_threadsafe(asyncio.sleep(0.1), loop).result()
+    loop.call_soon_threadsafe(loop.stop)
+    t.join(2.0)
+    loop.close()
+
+
+@pytest.mark.asyncio
+async def test_event_set_tolerates_closed_loop_waiter() -> None:
+    """FIX-E: ``Event.set()`` must wake live-loop waiters even when a stale
+    waiter's loop was closed — pre-fix the first ``call_soon_threadsafe``
+    raised RuntimeError and aborted the wakeup loop."""
+    ev = Event()
+    _register_on_abandoned_loop(lambda: ev.wait())
+
+    t2 = asyncio.create_task(ev.wait())
+    await asyncio.sleep(0)
+    ev.set()  # must not raise
+    await asyncio.wait_for(t2, timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_lock_release_tolerates_closed_loop_waiter() -> None:
+    """FIX-E: releasing a lock whose FIFO head lives on a closed loop must
+    hand ownership to the next live waiter — pre-fix ``release()`` raised
+    RuntimeError after transferring ownership to the dead task and the lock
+    was permanently broken (every later acquire hung)."""
+    lock = Lock()
+    await lock.acquire()
+    _register_on_abandoned_loop(lock.acquire)
+
+    t2 = asyncio.create_task(lock.acquire())
+    await asyncio.sleep(0)
+    lock.release()  # must not raise; ownership must reach t2
+    await asyncio.wait_for(t2, timeout=1.0)

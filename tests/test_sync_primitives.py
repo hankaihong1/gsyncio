@@ -229,9 +229,9 @@ async def test_semaphore_release_beyond_max_raises():
     with pytest.raises(ValueError):
         sem.release()
     await sem.acquire()  # value 1
-    sem.release()        # back to max — legal
+    sem.release()  # back to max — legal
     with pytest.raises(ValueError):
-        sem.release()    # over-release
+        sem.release()  # over-release
 
 
 def test_semaphore_zero_ok():
@@ -320,4 +320,3 @@ def test_semaphore_max_value_consistent_after_resize():
     assert limiter._semaphore.max_value == 5  # type: ignore[attr-defined]
     limiter.total_tokens = 2.5
     assert limiter._semaphore.max_value == 2  # type: ignore[attr-defined]
-

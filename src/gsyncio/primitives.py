@@ -35,6 +35,7 @@ class _WaitGroupProtocol(Protocol):
     def add(self, delta: int) -> None: ...
     def done(self) -> Any: ...
     def register_waiter(self, waiter: Any) -> bool: ...
+    def unregister_waiter(self, fut: Any) -> bool: ...
 
 
 _RustFastChannel: type[_FastChannelProtocol] | None = _try_import_rust_class(
@@ -318,35 +319,50 @@ async def select_channel(
 
     select_task = asyncio.create_task(_select())
 
-    if timeout is None:
-        await select_task
-        return result[0]
-
-    done, _pending = await asyncio.wait(
-        [select_task],
-        timeout=timeout,
-    )
-
-    if done:
-        await select_task
-        return result[0]
-
-    if _tg is not None:
-        _tg.cancel_all()
-
-    select_task.cancel()
     try:
-        await select_task
-    except (BaseExceptionGroup, asyncio.CancelledError):
-        pass
+        if timeout is None:
+            await select_task
+            return result[0]
 
-    if result:
-        # WHY: the winner was decided in the same instant the timeout fired —
-        # the item was already consumed by the arbitration, so surface it
-        # instead of losing it (W4).
-        return result[0]
+        done, _pending = await asyncio.wait(
+            [select_task],
+            timeout=timeout,
+        )
 
-    raise TimeoutError("select_channel timed out")
+        if done:
+            await select_task
+            return result[0]
+
+        if _tg is not None:
+            _tg.cancel_all()
+
+        select_task.cancel()
+        try:
+            await select_task
+        except (BaseExceptionGroup, asyncio.CancelledError):
+            pass
+
+        if result:
+            # WHY: the winner was decided in the same instant the timeout fired —
+            # the item was already consumed by the arbitration, so surface it
+            # instead of losing it (W4).
+            return result[0]
+
+        raise TimeoutError("select_channel timed out")
+    finally:
+        # WHY: EVERY exit path (normal, timeout, caller cancellation) must
+        # tear the select machinery down — a caller cancelled while awaiting
+        # would otherwise leave the notifier tasks parked on the channels
+        # and their registrations in place until the next send (R5 FIX-F).
+        # The notifiers' cancellation handlers discard their registrations.
+        if _tg is not None:
+            _tg.cancel_all()
+        if not select_task.done():
+            select_task.cancel()
+            try:
+                await select_task
+            except (BaseExceptionGroup, asyncio.CancelledError):
+                pass
 
 
 class AsyncWaitGroup:
@@ -390,19 +406,25 @@ class AsyncWaitGroup:
         """Suspend execution until the WaitGroup counter becomes 0.
 
         .. note::
-            If the waiting task is cancelled, its entry stays in the Rust
-            waiter list until the counter next reaches 0 (FIX-7): the entry
-            holds a cancelled future and is simply skipped at wakeup, so
-            cancellation is safe — but a group that never reaches 0 keeps
-            the (inert) entry, and a repeated cancelled wait accumulates
-            entries until the next ``done()`` to zero drains them.
+            If the waiting task is cancelled, its entry is removed from the
+            Rust waiter list immediately (R5 FIX-D) — a cancelled wait never
+            accumulates stale entries.
         """
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[Any] = loop.create_future()
         already_done = self._inner.register_waiter((loop, fut))
         if already_done:
             return
-        await fut
+        try:
+            await fut
+        except BaseException:
+            # WHY: an entry left behind by a cancelled wait would sit in the
+            # Rust waiter list until the counter next reaches zero —
+            # unbounded growth on long-lived groups.  The unregister is a
+            # no-op when done() already handed the entry over (its waker
+            # skips done futures), so there is no lost-wakeup (R5 FIX-D).
+            self._inner.unregister_waiter(fut)
+            raise
 
 
 class AsyncOnce:

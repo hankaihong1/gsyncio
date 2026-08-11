@@ -389,3 +389,32 @@ async def test_reenter_after_normal_exit_ok() -> None:
     async with tg:
         h = tg.start_soon(_worker, "b")
         assert await h == "b"
+
+
+# ---------------------------------------------------------------------------
+# FIX-C (R5 audit): start() must not hang when the child fails before started()
+# ---------------------------------------------------------------------------
+
+
+async def _child_fails_before_started(_ts: TaskStatus) -> None:
+    raise ValueError("boom before started")
+
+
+@pytest.mark.asyncio
+async def test_start_child_failure_raises_not_hangs() -> None:
+    """FIX-C: a child that raises before calling ``started()`` must surface
+    its exception from ``start()`` — pre-fix ``start()`` blocked forever
+    (the started-event is never set)."""
+    with pytest.raises(ValueError, match="boom before started"):
+        async with TaskGroup() as tg:
+            await asyncio.wait_for(tg.start(_child_fails_before_started), timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_start_child_failure_reported_once() -> None:
+    """FIX-C: the same child exception must not be reported twice (start()
+    raises it AND the group re-collects it into an ExceptionGroup)."""
+    with pytest.raises(ValueError, match="boom before started") as excinfo:
+        async with TaskGroup() as tg:
+            await asyncio.wait_for(tg.start(_child_fails_before_started), timeout=2.0)
+    assert not isinstance(excinfo.value, BaseExceptionGroup)

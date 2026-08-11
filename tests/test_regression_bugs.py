@@ -15,6 +15,7 @@ pytest.importorskip("gsyncio")
 import gsyncio
 from gsyncio.pool import EventLoopThreadPool
 from gsyncio.primitives import AsyncWaitGroup, FastChannel
+from gsyncio.testing import wait_all_tasks_blocked
 
 # ── Bug A: Hang when Rust extension is missing ───────────────────────────
 
@@ -375,3 +376,29 @@ async def test_rwmutex_cancelled_writer_preserves_holder_state():
         async with rw.reader():
             pass
 
+
+# ---------------------------------------------------------------------------
+# FIX-F (R5 audit): select_channel caller cancellation must clean up
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_select_channel_caller_cancel_cleans_up() -> None:
+    """FIX-F: cancelling the select_channel caller must unregister the
+    channel notifiers and stop the select machinery — pre-fix the notifier
+    stayed registered (and the select task alive) until the channel's next
+    send."""
+    from gsyncio.primitives import FastChannel, select_channel
+
+    ch = FastChannel()
+    sel = asyncio.create_task(select_channel(ch))
+    await wait_all_tasks_blocked()
+    await asyncio.sleep(0)
+    assert len(ch._notifiers) == 1  # notifier registered
+
+    sel.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await sel
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert len(ch._notifiers) == 0, "notifier leaked after caller cancellation"

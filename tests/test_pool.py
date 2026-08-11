@@ -615,9 +615,7 @@ async def test_abort_completes_all_futures():
         await asyncio.sleep(0.05)  # let some tasks start executing
         await pool.abort()
         done, pending = await asyncio.wait(futs, timeout=5.0)
-        assert len(pending) == 0, (
-            f"{len(pending)} futures still pending after abort"
-        )
+        assert len(pending) == 0, f"{len(pending)} futures still pending after abort"
         for fut in done:
             try:
                 exc = fut.exception()
@@ -688,3 +686,95 @@ async def test_submit_no_ctx_backward_compat():
     async with EventLoopThreadPool(num_threads=1) as pool:
         res = await asyncio.wait_for(pool.submit(read_var), timeout=5.0)
     assert res == "missing"
+
+
+# ---------------------------------------------------------------------------
+# FIX-A / FIX-B / FIX-H (R5 audit): future-completion contracts
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_pool_cancel_scope_completes_future():
+    """FIX-A: ``pool.submit(coro, cancel_scope=s)`` + ``s.cancel()`` must
+    complete the caller's future with CancelledError — pre-fix the future
+    stayed pending forever (worker returned silently on the scope-cancel
+    branch)."""
+    from gsyncio._cancel import CancelScope
+
+    async with EventLoopThreadPool(num_threads=2) as pool:
+        scope = CancelScope()
+
+        async def work() -> int:
+            return 42
+
+        fut = pool.submit(work, cancel_scope=scope)
+        scope.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(fut, timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_pool_close_completes_all_burst_futures():
+    """FIX-B contract lock: burst submit + immediate ``close()`` must
+    complete every future.  Pre-fix a task popped by the drain but never
+    stepped (loop.stop raced create_task) was cancelled at its outermost
+    await and its future stayed pending forever; close() now also completes
+    any leftover ``_outstanding`` futures as a safety net."""
+    pool = EventLoopThreadPool(num_threads=2)
+    await pool.start()
+
+    async def work(i: int) -> int:
+        await asyncio.sleep(0)
+        return i
+
+    futs = [pool.submit(work, i) for i in range(40)]
+    await asyncio.wait_for(pool.close(), timeout=5.0)
+    pending = [f for f in futs if not f.done()]
+    for f in pending:
+        f.cancel()
+    assert not pending, f"{len(pending)} futures left pending after close()"
+    with pool._lock:
+        assert not pool._outstanding, "close() left futures in _outstanding"
+
+
+@pytest.mark.asyncio
+async def test_pool_submit_push_failure_discards_future():
+    """FIX-H: a failed native push must not leave the future registered in
+    ``_outstanding`` (repeated failures would grow the set forever)."""
+    pool = EventLoopThreadPool(num_threads=1)
+    await pool.start()
+
+    class _FailingPool:
+        """Duck-typed native pool whose push always fails; the idle paths
+        (pop_work / is_closed) stay benign so live workers keep running."""
+
+        def push_global(self, task: object) -> None:  # noqa: ARG002
+            raise RuntimeError("boom")
+
+        def push_local(self, index: int, task: object) -> None:  # noqa: ARG002
+            raise RuntimeError("boom")
+
+        def pop_work(self, index: int) -> None:  # noqa: ARG002
+            return None
+
+        def is_closed(self) -> bool:
+            return False
+
+        def close(self) -> None:
+            pass
+
+        def set_metrics(self, metrics: object) -> None:  # noqa: ARG002
+            pass
+
+    try:
+        pool._native_pool = _FailingPool()  # type: ignore[assignment]
+        with pytest.raises(RuntimeError, match="boom"):
+            pool.submit(lambda: 1)
+        # WHY: snapshot under the lock, assert OUTSIDE it — pytest's
+        # assertion rewriting reprs the failed expression, and repr(pool)
+        # takes the same non-reentrant lock (self-deadlock on failure).
+        with pool._lock:
+            outstanding = bool(pool._outstanding)
+        assert not outstanding
+    finally:
+        await pool.close()

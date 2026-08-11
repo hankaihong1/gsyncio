@@ -125,6 +125,12 @@ class TaskGroup:
         # waits for (R3 FIX-20).  Written in __aexit__'s finally, reset in
         # __aenter__, checked under _children_lock.
         self._exited = False
+        # WHY: a start() child whose failure was already raised to the
+        # caller (before started()) must not be re-collected by
+        # _wait_children — the same exception would surface twice (R5
+        # FIX-C).  Populated under _children_lock in start(), consulted by
+        # _wait_children.
+        self._consumed: set[asyncio.Task[Any]] = set()
 
     # -- context manager -------------------------------------------------------
 
@@ -145,6 +151,7 @@ class TaskGroup:
             # admitted and the old cancelled children would be re-collected,
             # resurfacing their CancelledError as a stale failure (R5 修订 C).
             self._children.clear()
+            self._consumed.clear()
         await self._cancel_scope.__aenter__()
         return self
 
@@ -189,7 +196,21 @@ class TaskGroup:
             # _wait_children on the first real child failure; for a cancelled
             # body the external cancel already marks the scope.
 
-        child_exceptions = await self._wait_children(pre_cancelled)
+        try:
+            child_exceptions = await self._wait_children(pre_cancelled)
+        except BaseException:
+            # WHY: the group's host was cancelled WHILE waiting for the
+            # children (e.g. Task.cancel() cascades into this group's host
+            # through the awaited task's _fut_waiter, as in select_channel's
+            # caller-cancel).  The pre-cancel branch above never ran, so the
+            # children would be orphaned with their registrations still in
+            # place — cancel every remaining child before propagating (R5
+            # FIX-F).
+            with self._children_lock:
+                remaining = [h._task for h in self._children if not h._task.done()]
+            for task in remaining:
+                task.cancel()
+            raise
 
         # Cancellation wins: never merge CancelledError into the group —
         # merging would swallow the cancellation and hang outer timeouts.
@@ -262,6 +283,12 @@ class TaskGroup:
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 for task in done:
+                    # WHY: a start() child whose exception was already
+                    # raised to the caller must not be collected again —
+                    # it would surface twice (R5 FIX-C).
+                    with self._children_lock:
+                        if task in self._consumed:
+                            continue
                     if task.cancelled():
                         # task.exception() raises CancelledError on cancelled
                         # tasks in Python 3.14. Synthesise it ourselves so we
@@ -337,14 +364,17 @@ class TaskGroup:
         task = asyncio.create_task(coro_fn(task_status, *args))
         handle = TaskHandle(task)
         handle._start_event = task_status._started
+        # WHY: a child that finishes WITHOUT calling started() (failure or
+        # early return) would otherwise leave the started-event unset and
+        # start() blocked forever (R5 FIX-C).  The callback resolves the
+        # event so the wait below returns and the failure path can raise.
+        task.add_done_callback(lambda _t: task_status._started.set())
         with self._children_lock:
             if self._exited:
                 # WHY: same orphan guard as start_soon (R3 FIX-20).
                 task.cancel()
                 task.add_done_callback(_retrieve_task_exception)
-                raise RuntimeError(
-                    "TaskGroup is not active: cannot start() after the group exited"
-                )
+                raise RuntimeError("TaskGroup is not active: cannot start() after the group exited")
             self._children.add(handle)
         try:
             await task_status._started.wait()
@@ -352,6 +382,10 @@ class TaskGroup:
             if task.done() and task.exception() is not None:
                 exc = task.exception()
                 with self._children_lock:
+                    # WHY: the exception is raised here, to the caller —
+                    # _wait_children must not collect it a second time and
+                    # re-raise it as a group failure (R5 FIX-C).
+                    self._consumed.add(task)
                     siblings = [
                         h._task
                         for h in self._children
@@ -377,4 +411,9 @@ class TaskGroup:
             handles = list(self._children)
         for h in handles:
             loop = h._task.get_loop()
-            loop.call_soon_threadsafe(h._task.cancel)
+            try:
+                loop.call_soon_threadsafe(h._task.cancel)
+            except RuntimeError:
+                # WHY: the child's loop was closed — it is already gone
+                # (R5 FIX-E).
+                pass

@@ -103,7 +103,12 @@ class CancelScope:
             except RuntimeError:
                 current_loop = None
             if loop is not None and current_loop is not loop:
-                loop.call_soon_threadsafe(task.cancel)
+                try:
+                    loop.call_soon_threadsafe(task.cancel)
+                except RuntimeError:
+                    # WHY: the host loop was closed — the task is gone with
+                    # it; nothing to cancel (R5 FIX-E).
+                    pass
             else:
                 task.cancel()
 
