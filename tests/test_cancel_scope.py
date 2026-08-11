@@ -454,7 +454,7 @@ async def test_aenter_raise_does_not_leak_stack() -> None:
     inner = CancelScope(deadline=asyncio.get_running_loop().time() + 60)
     with pytest.raises(asyncio.CancelledError):
         await inner.__aenter__()
-    assert _get_scope_stack() == [outer]            # stale entry popped
+    assert _get_scope_stack() == [outer]  # stale entry popped
     assert inner._task is None  # type: ignore[reportAttributeAccessIssue]
     assert inner._deadline_handle is None  # type: ignore[reportAttributeAccessIssue]
     assert inner._reset_token is None  # type: ignore[reportAttributeAccessIssue]
@@ -563,13 +563,10 @@ async def test_shield_expired_deadline_restores_cancel_count() -> None:
     task.cancel()
     assert task.cancelling() == 2
     with pytest.raises(asyncio.CancelledError):
-        async with CancelScope(
-            deadline=asyncio.get_running_loop().time() - 1, shield=True
-        ):
+        async with CancelScope(deadline=asyncio.get_running_loop().time() - 1, shield=True):
             pass  # pragma: no cover — __aenter__ raises before the body
     # Pre-fix: 0 (count lost); fixed: 2 (restored, parent cancel preserved).
     assert task.cancelling() == 2
     task.uncancel()
     task.uncancel()
     assert task.cancelling() == 0
-

@@ -40,6 +40,10 @@ class AsyncRWMutex:
         self._write_ok = Condition(self._lock)
 
     def __repr__(self) -> str:
+        # WHY: diagnostic only — the counters are read WITHOUT the state
+        # lock (it is an async Lock that cannot be taken in repr), so the
+        # snapshot may be stale under concurrency on free-threaded builds.
+        # Never use these values for check-then-act decisions (R5 FIX-J).
         return (
             f"<AsyncRWMutex readers={self._readers} writer={self._writer}"
             f" pending_writers={self._pending_writers}>"

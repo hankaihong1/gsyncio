@@ -172,3 +172,26 @@ async def test_race_wait_group_high_concurrency():
 
         await wg.wait()
         assert completed == total_tasks
+
+
+# ---------------------------------------------------------------------------
+# FIX-D (R5 audit): cancelled AsyncWaitGroup.wait() must unregister
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_waitgroup_cancelled_wait_unregisters() -> None:
+    """FIX-D: a cancelled ``wait()`` must remove its entry from the Rust
+    waiter list — pre-fix every cancelled wait left a stale entry that only
+    a later done()-to-zero drained (unbounded growth on long-lived groups)."""
+    wg = AsyncWaitGroup()
+    wg.add(1)
+    tasks = [asyncio.create_task(wg.wait()) for _ in range(5)]
+    await asyncio.sleep(0)
+    for t in tasks:
+        t.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+    waiters = wg._inner.done()  # returns the handed-over waiter list
+    n = len(waiters) if waiters else 0
+    assert n == 0, f"{n} stale waiter entries left after cancellation"

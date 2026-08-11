@@ -527,6 +527,24 @@ impl RawAsyncWaitGroup {
             }
         }
     }
+
+    /// Removes a previously registered waiter by future identity.
+    ///
+    /// Returns `true` if the waiter was still queued and is now removed,
+    /// `false` if it had already been handed over by a `done()`-to-zero
+    /// (in which case the waker's done-check simply skips it).
+    ///
+    /// WHY: a cancelled `wait()` that never unregisters would leave its
+    /// entry in the list until the counter next reaches zero — repeated
+    /// cancelled waits grow the list without bound on long-lived groups
+    /// (R5 FIX-D).  The identity check is a plain pointer comparison, so
+    /// no Python code runs under the mutex.
+    fn unregister_waiter(&self, fut: Py<PyAny>) -> bool {
+        let mut guard = self.waiters.lock();
+        let before = guard.len();
+        guard.retain(|(_, f)| !f.is(&fut));
+        guard.len() != before
+    }
 }
 
 #[pymodule]
@@ -574,7 +592,7 @@ mod tests {
             assert!(waiters.is_empty(), "waiters list should be empty");
             // After done(), counter is 0, so register_waiter should return true
             // (meaning "already done, wake immediately").
-            let waiter: Waiter = (Py::from(py.None()), Py::from(py.None()));
+            let waiter: Waiter = (py.None(), py.None());
             assert!(
                 wg.register_waiter(waiter),
                 "register_waiter after done should return true"
@@ -606,10 +624,40 @@ mod tests {
     }
 
     #[test]
+    fn test_waitgroup_unregister_waiter() {
+        Python::attach(|py| {
+            let wg = RawAsyncWaitGroup::new();
+            wg.add(1).unwrap();
+            let fut = py.None();
+            let waiter: Waiter = (py.None(), fut.clone_ref(py));
+            assert!(
+                !wg.register_waiter(waiter),
+                "register on counter=1 should queue"
+            );
+            assert!(
+                wg.unregister_waiter(fut.clone_ref(py)),
+                "first unregister should remove the entry"
+            );
+            assert!(
+                !wg.unregister_waiter(fut.clone_ref(py)),
+                "second unregister is a no-op"
+            );
+            // done() to zero hands over an EMPTY list — the cancelled
+            // waiter's entry is gone.
+            let waiters = wg.done().unwrap();
+            assert!(waiters.is_some());
+            assert!(
+                waiters.unwrap().is_empty(),
+                "no stale entries after unregister"
+            );
+        });
+    }
+
+    #[test]
     fn test_fastchannel_try_send_recv() {
         Python::attach(|py| {
             let ch = FastChannel::new(0); // unbounded channel
-            let item: Py<PyAny> = Py::from(py.None());
+            let item: Py<PyAny> = py.None();
             let send_result = ch.try_send(item);
             assert!(send_result.is_ok(), "try_send should succeed");
             assert!(send_result.unwrap(), "try_send should return Ok(true)");

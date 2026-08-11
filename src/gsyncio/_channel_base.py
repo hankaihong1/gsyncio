@@ -37,7 +37,12 @@ def _set_soon(
             # already cleaned up; nothing to deliver.
             pass
 
-    loop.call_soon_threadsafe(_do)
+    try:
+        loop.call_soon_threadsafe(_do)
+    except RuntimeError:
+        # WHY: the waiter's loop was closed — it can never be woken.  Skip
+        # it instead of aborting the caller's wakeup loop (R5 FIX-E).
+        pass
 
 
 def _wake_all(
@@ -101,7 +106,12 @@ class _BaseChannel:  # pyright: ignore[reportUnusedClass]
         """Wake every registered notifier event (caller must hold ``_lock``)."""
         while self._notifiers:
             loop, event = self._notifiers.popleft()
-            loop.call_soon_threadsafe(event.set)
+            try:
+                loop.call_soon_threadsafe(event.set)
+            except RuntimeError:
+                # WHY: dead loop — the notifier can never wake; drop it and
+                # keep waking the rest (R5 FIX-E).
+                pass
 
     def _register_notifier(self, loop: asyncio.AbstractEventLoop) -> asyncio.Event | None:
         """Register a non-consuming readiness notifier.

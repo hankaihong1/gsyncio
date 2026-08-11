@@ -304,6 +304,15 @@ class EventLoopThreadPool:
             if not dispatcher_task.done():
                 dispatcher_task.cancel()
             pending = asyncio.all_tasks(loop)
+            # WHY: a task created by the drain but never stepped (loop.stop
+            # raced create_task) would be cancelled at its OUTERMOST await —
+            # the inner _execute_task except never runs and the caller's
+            # future stays pending forever (U9).  Run every task to its
+            # first suspension point first, so the cancel lands inside the
+            # coroutine's try block where its except completes the future.
+            if pending:
+                loop.run_until_complete(asyncio.sleep(0))
+                pending = asyncio.all_tasks(loop)  # some finished in that tick
             for task in pending:
                 task.cancel()
             if pending:
@@ -362,7 +371,12 @@ class EventLoopThreadPool:
             loop = self._loops[worker_idx]
             event = self._notify_events[worker_idx]
 
-        loop.call_soon_threadsafe(event.set)
+        try:
+            loop.call_soon_threadsafe(event.set)
+        except RuntimeError:
+            # The worker's loop was closed between the snapshot and the
+            # wakeup (shutdown race) — nothing to wake (FIX-E).
+            pass
 
     def _notify_all_workers(self) -> None:
         """Trigger instant Pipe/EventFD wakeup across all worker event loops."""
@@ -377,7 +391,10 @@ class EventLoopThreadPool:
             def _wake(evt: asyncio.Event = event) -> None:
                 evt.set()
 
-            loop.call_soon_threadsafe(_wake)
+            try:
+                loop.call_soon_threadsafe(_wake)
+            except RuntimeError:
+                pass
 
     async def close(self) -> None:
         """Gracefully stop all event loop threads and join worker threads."""
@@ -411,10 +428,26 @@ class EventLoopThreadPool:
                 await asyncio.sleep(0.1)
 
         for loop in loops:
-            loop.call_soon_threadsafe(loop.stop)
+            try:
+                loop.call_soon_threadsafe(loop.stop)
+            except RuntimeError:
+                pass  # worker loop already closed (shutdown race)
 
         for t in threads:
             t.join(timeout=2.0)
+
+        # WHY: a task popped by the drain but never stepped is cancelled in
+        # the worker's finally at its outermost await — its future would
+        # stay pending forever.  Complete everything that never ran, the
+        # same safety net abort() has (U9 / R5 FIX-B).  The done() guard
+        # makes a raced worker delivery win cleanly.
+        with self._lock:
+            leftover = list(self._outstanding)
+            self._outstanding.clear()
+        close_exc = ThreadPoolClosedError("Pool closed before task ran")
+        for fut in leftover:
+            if not fut.done():
+                _safe_complete(fut.get_loop(), fut, exc=close_exc)
 
         self._closed_event.set()
         _logger.info(
@@ -453,7 +486,10 @@ class EventLoopThreadPool:
         self._notify_all_workers()
 
         for loop in loops:
-            loop.call_soon_threadsafe(loop.stop)
+            try:
+                loop.call_soon_threadsafe(loop.stop)
+            except RuntimeError:
+                pass  # worker loop already closed (shutdown race)
 
         for t in threads:
             t.join(timeout=2.0)
@@ -583,11 +619,19 @@ class EventLoopThreadPool:
                     res = target
 
                 if cancel_scope is not None and cancel_scope.cancel_called:
+                    # WHY: the scope was cancelled — the caller must not be
+                    # left awaiting a future that will never be completed.
+                    # Deliver CancelledError exactly like a cancel would
+                    # (R5 FIX-A).
+                    if not fut.done():
+                        _safe_complete(caller_loop, fut, exc=asyncio.CancelledError())
                     return
                 if not fut.done():
                     _safe_complete(caller_loop, fut, result=res)
             except BaseException as exc:  # noqa: BLE001
                 if cancel_scope is not None and cancel_scope.cancel_called:
+                    if not fut.done():
+                        _safe_complete(caller_loop, fut, exc=asyncio.CancelledError())
                     return
                 if not fut.done():
                     _safe_complete(caller_loop, fut, exc=exc)
@@ -614,22 +658,26 @@ class EventLoopThreadPool:
             if self._native_pool:
                 try:
                     self._native_pool.push_local(target_idx, _execute_task)
-                    self._notify_worker(target_idx)
                 except Exception as exc:  # noqa: BLE001
+                    # WHY: a failed push means the task never entered a queue
+                    # and the future can never complete — release its
+                    # outstanding slot on EVERY failure, not just the Rust
+                    # closed error (R5 FIX-H).
+                    with self._lock:
+                        self._outstanding.discard(fut)
                     if _RustPoolClosedError is not None and isinstance(exc, _RustPoolClosedError):
-                        with self._lock:
-                            self._outstanding.discard(fut)
                         raise ThreadPoolClosedError("ThreadPool is closed") from exc
                     raise
+                self._notify_worker(target_idx)
         else:
             # Pushed to global shared queue in Rust Native Pool
             if self._native_pool:
                 try:
                     self._native_pool.push_global(_execute_task)
                 except Exception as exc:  # noqa: BLE001
+                    with self._lock:
+                        self._outstanding.discard(fut)
                     if _RustPoolClosedError is not None and isinstance(exc, _RustPoolClosedError):
-                        with self._lock:
-                            self._outstanding.discard(fut)
                         raise ThreadPoolClosedError("ThreadPool is closed") from exc
                     raise
 
@@ -645,7 +693,10 @@ class EventLoopThreadPool:
                     loop = None
 
             if loop is not None and event is not None:
-                loop.call_soon_threadsafe(event.set)
+                try:
+                    loop.call_soon_threadsafe(event.set)
+                except RuntimeError:
+                    pass  # worker loop closed mid-submit (shutdown race)
 
         return fut
 
