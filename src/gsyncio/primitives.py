@@ -245,7 +245,16 @@ async def select_channel(
         """
         while True:
             loop = asyncio.get_running_loop()
-            event = ch._register_notifier(loop)
+            try:
+                event = ch._register_notifier(loop)
+            except ChannelClosedError:
+                # WHY: a closed-and-empty channel can never become ready.
+                # Retire this notifier silently — _select decides, once the
+                # group unwinds, whether an open channel remains to wait on
+                # or every channel is closed and select must raise (R3
+                # FIX-19).  Raising here would abort the whole select even
+                # when another channel is still usable.
+                return
             if event is None:
                 break  # already non-empty — report ready
             try:
@@ -297,6 +306,14 @@ async def select_channel(
                     # reported — try the next ready channel.
                     continue
             # Every reported channel was stolen — re-register and wait again.
+            # A *normal* group exit (no exception) means every notifier
+            # retired because its channel was closed-and-empty at
+            # registration time.  If ANY channel is still open, its notifier
+            # is still parked and the loop keeps waiting for it — so reaching
+            # this point with nothing ready and every channel closed means
+            # select would spin forever: surface it (R3 FIX-19).
+            if all(ch.is_closed and ch.qsize() == 0 for ch in channels):
+                raise ChannelClosedError(_CHANNEL_CLOSED_MSG)
             await asyncio.sleep(0)
 
     select_task = asyncio.create_task(_select())
@@ -370,7 +387,16 @@ class AsyncWaitGroup:
             _wake_all(waiters)
 
     async def wait(self) -> None:
-        """Suspend execution until the WaitGroup counter becomes 0."""
+        """Suspend execution until the WaitGroup counter becomes 0.
+
+        .. note::
+            If the waiting task is cancelled, its entry stays in the Rust
+            waiter list until the counter next reaches 0 (FIX-7): the entry
+            holds a cancelled future and is simply skipped at wakeup, so
+            cancellation is safe — but a group that never reaches 0 keeps
+            the (inert) entry, and a repeated cancelled wait accumulates
+            entries until the next ``done()`` to zero drains them.
+        """
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[Any] = loop.create_future()
         already_done = self._inner.register_waiter((loop, fut))
@@ -403,6 +429,12 @@ class AsyncOnce:
 
     async def do(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         """Execute `fn` if and only if it has never been executed before.
+
+        .. warning::
+            Do not call :meth:`do` (directly or indirectly) from inside
+            ``fn`` — the leader task waits for its own completion, which is
+            a deadlock (the same limitation as Go's ``sync.Once``; R3-FIX-22
+            probe).  Spawn a separate task if ``fn`` needs the once result.
 
         :param fn:
             The function or coroutine function to execute.

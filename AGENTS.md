@@ -22,11 +22,10 @@ minimal, modeled after `asyncssh`'s top-level-facade style.
 ```
 gsyncio/
 ├── src/
-│   ├── gsyncio/              # Python package (19 modules)
+│   ├── gsyncio/              # Python package (17 modules)
 │   │   ├── __init__.py       # Public API surface — start here
 │   │   ├── pool.py           # EventLoopThreadPool engine
 │   │   ├── primitives.py     # FastChannel, select_channel, AsyncWaitGroup, AsyncOnce
-│   │   ├── channel.py        # AsyncChannel
 │   │   ├── context.py        # AsyncContext
 │   │   ├── _cancel.py        # CancelScope, fail_after, move_on_after, shield
 │   │   ├── _sync.py          # Lock, Semaphore, Event, Condition, Barrier
@@ -35,7 +34,6 @@ gsyncio/
 │   │   ├── asgi.py           # GsyncioASGIWorker
 │   │   ├── server.py         # ConnectionPinningServer
 │   │   ├── _channel_base.py  # Shared waiter deques, _wake_all, _wakeup_next
-│   │   ├── _channel_wrappers.py  # ReceiveChannel, SendChannel
 │   │   ├── _rust.py          # _try_import_rust_class helper
 │   │   ├── _metrics.py       # MetricsCollector
 │   │   ├── _options.py       # PoolOptions dataclass

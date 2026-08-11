@@ -576,3 +576,115 @@ async def test_vulnerability_submit_coroutine_object():
         fut = pool.submit(coro_obj)
         res = await fut
         assert res == 50
+
+
+@pytest.mark.asyncio
+async def test_context_futures_cleaned():
+    """R3-FIX-21 (probe R3-D): completed AsyncContext submissions must be
+    dropped from _futures — pre-fix 500/500 stayed behind, so cancel() kept
+    walking stale futures forever."""
+    from gsyncio import AsyncContext
+
+    ctx = AsyncContext()
+    async with EventLoopThreadPool(num_threads=2) as pool:
+
+        async def quick() -> int:
+            return 7
+
+        for _ in range(200):
+            fut = ctx.submit(pool, quick)
+            await asyncio.wait_for(fut, timeout=5.0)
+    assert len(ctx._futures) == 0  # type: ignore[attr-defined]
+
+
+# ── U6 FIX-13 + FIX-24: abort completes futures + contextvars propagation ──
+
+
+@pytest.mark.asyncio
+async def test_abort_completes_all_futures():
+    """R2-FIX-13 (probe F13b): abort() must complete every outstanding
+    future — pre-fix 2911/5000 hung forever because queued-but-unexecuted
+    tasks were discarded with nobody completing their futures."""
+    async with EventLoopThreadPool(num_threads=2) as pool:
+
+        async def slow() -> int:
+            await asyncio.sleep(10)
+            return 1
+
+        futs = [pool.submit(slow) for _ in range(500)]
+        await asyncio.sleep(0.05)  # let some tasks start executing
+        await pool.abort()
+        done, pending = await asyncio.wait(futs, timeout=5.0)
+        assert len(pending) == 0, (
+            f"{len(pending)} futures still pending after abort"
+        )
+        for fut in done:
+            try:
+                exc = fut.exception()
+            except asyncio.CancelledError:
+                continue  # future was cancelled outright — legitimate
+            if exc is not None:
+                # Two legitimate abort outcomes: tasks that never ran get
+                # ThreadPoolClosedError from abort(); tasks that were being
+                # executed get CancelledError from the worker-thread
+                # shutdown cancel (_worker's finally) — both mean "aborted".
+                assert isinstance(exc, (ThreadPoolClosedError, asyncio.CancelledError)), exc
+
+
+@pytest.mark.asyncio
+async def test_abort_delivery_no_invalid_state(capsys):
+    """R2-FIX-13 修订 B: abort racing a worker's own delivery must not
+    surface InvalidStateError noise (the guard lives inside the scheduled
+    callback, like _channel_base._set_soon)."""
+    pool = EventLoopThreadPool(num_threads=1)
+    await pool.start()
+    try:
+
+        async def quick() -> int:
+            return 42
+
+        futs = [pool.submit(quick) for _ in range(200)]
+        await asyncio.sleep(0.01)  # some complete, some still queued
+        await pool.abort()
+        await asyncio.wait(futs, timeout=5.0)
+    finally:
+        await pool.close()
+    err = capsys.readouterr().err
+    assert "InvalidStateError" not in err
+
+
+@pytest.mark.asyncio
+async def test_submit_propagates_contextvars():
+    """R4-FIX-24 (probe R4-A): the caller's contextvars must reach the worker
+    task — pre-fix the worker read 'missing' instead of the caller's value."""
+    import contextvars
+
+    var = contextvars.ContextVar("audit_var", default="missing")
+    seen: dict[str, str] = {}
+
+    async def read_var() -> None:
+        seen["value"] = var.get()
+
+    async with EventLoopThreadPool(num_threads=1) as pool:
+        token = var.set("caller-value")
+        try:
+            await asyncio.wait_for(pool.submit(read_var), timeout=5.0)
+        finally:
+            var.reset(token)
+    assert seen.get("value") == "caller-value"
+
+
+@pytest.mark.asyncio
+async def test_submit_no_ctx_backward_compat():
+    """FIX-24: without a caller-set ContextVar the default path is unchanged
+    (the worker sees the variable's default, not a corrupted context)."""
+    import contextvars
+
+    var = contextvars.ContextVar("audit_var2", default="missing")
+
+    async def read_var() -> str:
+        return var.get()
+
+    async with EventLoopThreadPool(num_threads=1) as pool:
+        res = await asyncio.wait_for(pool.submit(read_var), timeout=5.0)
+    assert res == "missing"

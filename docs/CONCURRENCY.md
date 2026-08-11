@@ -22,7 +22,7 @@ are never touched directly from another thread.
 
 | Component | Lock / primitive | Waiter structure | Key invariant |
 |---|---|---|---|
-| Rust `FastChannel` | flume channel (bounded/unbounded) + `AtomicBool is_closed` | none | `try_send` returning `false` means only "full"; closed ⇒ always error (`src/lib.rs:387-418`) |
+| Rust `FastChannel` | flume channel (bounded/unbounded) + `AtomicBool is_closed` | none | `try_send` returning `false` means only "full"; **closed ⇒ errors once drained** — a send racing `close()` may still enqueue (the flume side is closed lazily), so a "closed" channel can briefly accept then drain, after which every operation errors (`src/lib.rs:387-418`; R4 decision: tolerant vs Go's panic-on-send-after-close) |
 | Python `_BaseChannel` | `threading.Lock` (`_lock`) | `_getters` / `_putters` deques of `(loop, future)` | waiter registration and wakeup must happen under `_lock` (`src/gsyncio/_channel_base.py:75-78`) |
 | Wakeup protocol | — | — | `_wake_all` consumes from the deque **left side**: one wakeup pops one entry, stale futures are dropped naturally (`_channel_base.py:29-50`) |
 
@@ -51,7 +51,7 @@ lock → await → unregister under the lock on cancellation」
 
 | Primitive | Guarding lock | Waiter structure | Key invariant |
 |---|---|---|---|
-| `Barrier` | `threading.Mutex` | `list[(loop, asyncio.Event)]` | `_generation` counter binds each waiter to its round; cancellation handlers check the generation before removing an entry (`_sync.py:628-643`) |
+| `Barrier` | `threading.Mutex` | `list[(loop, asyncio.Event)]` | `_generation` counter binds each waiter to its round; cancellation handlers check the generation before removing an entry (`_sync.py:628-643`). **Cancellation caveat (FIX-12)**: a party cancelled *before* the round completes leaves the remaining parties blocked forever — the barrier has no automatic broken state; `abort()` is the documented escape hatch |
 | `AsyncWaitGroup` | Rust: `AtomicUsize` counter + parking_lot `Mutex` | `Vec[(loop, future)]` | `done()` to zero hands over the whole waiter list via `mem::take` (`lib.rs:443-457`); `register_waiter` double-checks: lock-free fast path + re-check under the lock (`lib.rs:473-487`) |
 | `AsyncOnce` | `threading.Lock` | `deque[(loop, future)]` | leader/follower: the lock decides who executes; followers register under the lock; the leader `_wake_all`s **while holding the lock** in `finally` — registration and wakeup share one lock, so there is no lost-wakeup window (`primitives.py:377-416`) |
 
@@ -60,7 +60,7 @@ lock → await → unregister under the lock on cancellation」
 | Component | Mechanism | Key point |
 |---|---|---|
 | `CancelScope` | per-task contextvars stack + `task.cancelling()`/`uncancel()` | shield snapshots and clears the cancellation count on entry, restores it on exit (`_cancel.py:141-146, 184-189`) |
-| `select_channel` | `TaskGroup` + one reader per channel | a successful reader **deliberately raises `CancelledError`** to make the group exit early — a normal return would make the group wait for every channel (`primitives.py:248-255`) |
+| `select_channel` | `TaskGroup` + one reader per channel | a successful reader **deliberately raises `CancelledError`** to make the group exit early — a normal return would make the group wait for every channel (`primitives.py:248-255`). **Arbitration is non-atomic (FIX-16)**: readiness is reported without consuming; a concurrent consumer may steal the item between the report and the winner's `try_recv`, so select loops and re-registers — under heavy contention this can delay/stall a specific channel (documented behaviour, not a bug) |
 
 ---
 
@@ -136,6 +136,17 @@ the cancellation handler compares the generation before deciding to remove.
 **Examples**: `Barrier.wait()` (`_sync.py:628-643`); the same technique in
 `Semaphore._cancel_waiter` (token forwarding instead of blind removal,
 `_sync.py:192-213`).
+
+**FIX-12 note**: the generation guard protects *next-round* entries, but a
+cancelled party whose round never completes leaves the other parties parked
+forever — `Barrier` has no automatic broken state (deliberate, R4
+decision).  Use `abort()` as the escape hatch.
+
+**Known limitation (FIX-15)**: the cancellation-handler removal in
+`Barrier`/`Condition`/`Semaphore` is O(n) per waiter (list/dict rebuild), so
+a cancellation storm on N parked waiters costs O(n²) — measured 5000
+waiters ≈ 560 ms (R2 probe E2).  Acceptable for realistic party counts;
+documented so nobody "optimises" it into a wrong-round bug.
 
 ### Pattern 6: register-after-done race
 

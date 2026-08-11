@@ -258,3 +258,50 @@ async def test_vulnerability_server_abrupt_disconnect():
         await asyncio.sleep(0.05)
 
         await server.close()
+
+
+# ── U7 FIX-17 + FIX-23: start idempotence + handler exception hygiene ──────
+
+
+@pytest.mark.asyncio
+async def test_server_start_idempotent():
+    """R2-FIX-17: calling start() twice must be a no-op — no second
+    acceptor, port unchanged (pre-fix: a second bind grabbed a fresh
+    ephemeral port and orphaned the first acceptor set)."""
+    async with EventLoopThreadPool(num_threads=2) as pool:
+        server = ConnectionPinningServer(pool, host="127.0.0.1", port=0)
+        await server.start()
+        port = server.port
+        acceptors = len(server._accept_tasks)
+        await server.start()  # second call — must be a no-op
+        assert server.port == port
+        assert len(server._accept_tasks) == acceptors
+        assert server.is_running
+        await server.close()
+
+
+@pytest.mark.asyncio
+async def test_server_handler_exception_no_noise(capsys):
+    """R3-FIX-23: a handler raising a non-OSError (ValueError) must not
+    surface as 'Task exception was never retrieved' noise — the failure is
+    intentional and consumed by the done-callback."""
+    async with EventLoopThreadPool(num_threads=1) as pool:
+
+        async def bad_handler(
+            reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+        ) -> None:
+            raise ValueError("boom")
+
+        server = ConnectionPinningServer(pool, handler=bad_handler)
+        await server.start()
+        try:
+            _reader, writer = await asyncio.open_connection(
+                "127.0.0.1", server.port
+            )
+            writer.close()
+            await asyncio.sleep(0.1)  # let the handler run and fail
+        finally:
+            await server.close()
+    err = capsys.readouterr().err
+    assert "never retrieved" not in err
+

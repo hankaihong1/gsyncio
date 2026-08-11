@@ -548,3 +548,67 @@ async def test_select_timeout_no_loss() -> None:
         assert ch.qsize() + consumed == 1, (
             f"round {i}: item lost (qsize={ch.qsize()}, consumed={consumed})"
         )
+
+
+# ── U5 FIX-19: select_channel closed-channel semantics ─────────────────────
+
+
+@pytest.mark.asyncio
+async def test_select_all_closed_raises() -> None:
+    """R3-FIX-19 (probe R3-B): selecting on channels that are closed AND empty
+    must raise ChannelClosedError instead of hanging forever (pre-fix: the
+    notifier registered successfully and nobody ever woke it)."""
+    ch1 = FastChannel()
+    ch2 = FastChannel()
+    ch1.close()
+    ch2.close()
+    with pytest.raises(ChannelClosedError):
+        await asyncio.wait_for(select_channel(ch1, ch2), timeout=0.5)
+
+
+@pytest.mark.asyncio
+async def test_select_closed_with_data_returns_data() -> None:
+    """FIX-19: a closed channel that still holds buffered items reports ready
+    and yields its data — closing must not destroy buffered values."""
+    ch1 = FastChannel()
+    ch2 = FastChannel()
+    await ch1.send("value")
+    ch1.close()
+    ch2.close()
+    ch, val = await asyncio.wait_for(select_channel(ch1, ch2), timeout=1.0)
+    assert (ch, val) == (ch1, "value")
+
+
+@pytest.mark.asyncio
+async def test_select_one_closed_one_open_waits() -> None:
+    """FIX-19: with one closed-empty channel and one open channel, select must
+    ignore the closed one and wait for the open channel (no spurious raise)."""
+    ch1 = FastChannel()
+    ch2 = FastChannel()
+    ch1.close()
+    task = asyncio.create_task(select_channel(ch1, ch2))
+    await asyncio.sleep(0.05)
+    assert not task.done()
+    await ch2.send("data")
+    ch, val = await asyncio.wait_for(task, timeout=1.0)
+    assert (ch, val) == (ch2, "data")
+
+
+@pytest.mark.asyncio
+async def test_select_close_race() -> None:
+    """FIX-19: close racing with select must never hang — either the buffered
+    item wins or the select raises ChannelClosedError."""
+    for _ in range(20):
+        ch1 = FastChannel()
+        ch2 = FastChannel()
+        await ch1.send("x")
+        task = asyncio.create_task(select_channel(ch1, ch2))
+        await asyncio.sleep(0)
+        ch1.close()
+        ch2.close()
+        try:
+            ch, val = await asyncio.wait_for(task, timeout=1.0)
+            assert ch in (ch1, ch2)
+            assert val == "x"
+        except ChannelClosedError:
+            pass

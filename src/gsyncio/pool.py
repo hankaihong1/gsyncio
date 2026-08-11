@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import os
 import threading
 import types
@@ -21,6 +22,47 @@ _logger = get_logger("pool")
 _WORKER_POLL_INTERVAL = 0.05  # Dispatcher wait_for timeout while idle (s)
 _MAX_DRAIN_ITERATIONS = 50  # Max drain polls (~5 s) before force-stopping loops
 _DRAIN_GRACE_PERIOD = 0.05  # Initial grace before first drain active==0 check (s)
+
+
+def _safe_complete(
+    loop: asyncio.AbstractEventLoop,
+    fut: asyncio.Future[Any],
+    result: Any = None,
+    exc: BaseException | None = None,
+) -> None:
+    """Complete *fut* on its owning loop, tolerating a raced completion.
+
+    WHY: several parties can race to complete the same future — the worker
+    task delivering the real result, and abort() completing it with a
+    ThreadPoolClosedError.  The guard lives INSIDE the scheduled callback
+    (same shape as ``_channel_base._set_soon``), so an InvalidStateError from
+    a lost race is contained instead of surfacing in the loop exception
+    handler (R2 FIX-13 修订 B).  If the caller loop is already closed, fall
+    back to completing the future directly — nobody can be consuming it, so
+    there is no concurrent reader to race (TS-12 pattern).
+    """
+
+    def _do() -> None:
+        try:
+            if exc is not None:
+                fut.set_exception(exc)
+            else:
+                fut.set_result(result)
+        except asyncio.InvalidStateError:
+            # A concurrent completion (abort vs worker delivery) won the
+            # race — nothing to deliver.
+            pass
+
+    try:
+        loop.call_soon_threadsafe(_do)
+    except RuntimeError:
+        try:
+            if exc is not None:
+                fut.set_exception(exc)
+            else:
+                fut.set_result(result)
+        except asyncio.InvalidStateError:
+            pass
 
 
 class _WorkerPoolProtocol(Protocol):
@@ -101,6 +143,10 @@ class EventLoopThreadPool:
         self._lock = threading.Lock()
         self._running = False
         self._index = 0
+        # WHY: every live submit future is registered here so abort() can
+        # complete the ones that never ran.  All access under _lock: the
+        # caller thread registers, worker threads discard on completion.
+        self._outstanding: set[asyncio.Future[Any]] = set()
 
         # Native Rust lock-free pool controller
         self._native_pool: _WorkerPoolProtocol | None = None
@@ -173,7 +219,13 @@ class EventLoopThreadPool:
         loop = asyncio.get_running_loop()
 
         def _process_one(task_func: Callable[[], Any]) -> None:
-            loop.create_task(self._run_task_wrapper(index, task_func))
+            # WHY: submit() stamps the task function with the caller's
+            # contextvars; run the worker task under that context so the
+            # caller's task-local state (spans, request ids, …) survives
+            # the thread hop (R4 FIX-24).  getattr keeps the pre-existing
+            # behaviour (loop's own context) when the attribute is absent.
+            ctx = getattr(task_func, "_gsyncio_ctx", None)
+            loop.create_task(self._run_task_wrapper(index, task_func), context=ctx)
 
         while True:
             if self._native_pool is None:
@@ -375,6 +427,9 @@ class EventLoopThreadPool:
 
         Unlike :meth:`close`, this skips the drain-grace period and immediately
         stops every worker loop, discarding any queued but unexecuted work.
+        Every outstanding submit future is completed with
+        :class:`ThreadPoolClosedError` so callers never hang on work that
+        will not run (R2 FIX-13).
         """
         with self._lock:
             if not self._running:
@@ -385,6 +440,12 @@ class EventLoopThreadPool:
             threads = list(self._threads)
             self._loops.clear()
             self._threads.clear()
+            # WHY: snapshot under the lock and clear — tasks still queued in
+            # the Rust pool will never execute (no _execute_task finally to
+            # discard them), so the set must be emptied here or the futures
+            # leak for the pool's lifetime.
+            outstanding = list(self._outstanding)
+            self._outstanding.clear()
 
         if self._native_pool:
             self._native_pool.close()
@@ -396,6 +457,14 @@ class EventLoopThreadPool:
 
         for t in threads:
             t.join(timeout=2.0)
+
+        # Complete every future that never ran.  Delivery goes through the
+        # same safe wrapper as the worker path, so a worker that did finish
+        # just before the abort wins the race cleanly (修订 B).
+        abort_exc = ThreadPoolClosedError("Pool aborted")
+        for fut in outstanding:
+            if not fut.done():
+                _safe_complete(fut.get_loop(), fut, exc=abort_exc)
 
         self._closed_event.set()
         _logger.info(
@@ -494,6 +563,8 @@ class EventLoopThreadPool:
                 "submit() must be called from a thread with a running asyncio event loop"
             )
         fut: asyncio.Future[Any] = caller_loop.create_future()
+        with self._lock:
+            self._outstanding.add(fut)
 
         _logger.debug(
             "EventLoopThreadPool submit",
@@ -514,27 +585,28 @@ class EventLoopThreadPool:
                 if cancel_scope is not None and cancel_scope.cancel_called:
                     return
                 if not fut.done():
-                    if caller_loop and not caller_loop.is_closed():
-                        try:
-                            caller_loop.call_soon_threadsafe(fut.set_result, res)
-                        except RuntimeError:
-                            # WHY: the caller loop closed between the
-                            # is_closed() check and the delivery (TS-12) —
-                            # nobody will ever consume the future.
-                            fut.set_result(res)
-                    else:
-                        fut.set_result(res)
+                    _safe_complete(caller_loop, fut, result=res)
             except BaseException as exc:  # noqa: BLE001
                 if cancel_scope is not None and cancel_scope.cancel_called:
                     return
                 if not fut.done():
-                    if caller_loop and not caller_loop.is_closed():
-                        try:
-                            caller_loop.call_soon_threadsafe(fut.set_exception, exc)
-                        except RuntimeError:
-                            fut.set_exception(exc)
-                    else:
-                        fut.set_exception(exc)
+                    _safe_complete(caller_loop, fut, exc=exc)
+            finally:
+                # WHY: every executed task releases its outstanding slot;
+                # abort() snapshots the set to complete whatever never ran
+                # (R2 FIX-13).
+                with self._lock:
+                    self._outstanding.discard(fut)
+
+        # WHY: the caller's contextvars must reach the worker task — without
+        # this, a submit from inside a task-local context (e.g. a tracing
+        # span or a request-scoped variable) would run with the worker
+        # loop's bare context (R4 probe A: 'missing' instead of the caller's
+        # value).  _process_one reads it back via getattr; None keeps the
+        # existing behaviour when the attribute is absent.  setattr (not
+        # plain assignment) keeps mypy strict happy: the attribute is added
+        # dynamically to a closure function.
+        setattr(_execute_task, "_gsyncio_ctx", contextvars.copy_context())  # noqa: B010
 
         if pinned_info is not None:
             # Pinned to specific local queue in Rust Native Pool & trigger instant wakeup
@@ -545,6 +617,8 @@ class EventLoopThreadPool:
                     self._notify_worker(target_idx)
                 except Exception as exc:  # noqa: BLE001
                     if _RustPoolClosedError is not None and isinstance(exc, _RustPoolClosedError):
+                        with self._lock:
+                            self._outstanding.discard(fut)
                         raise ThreadPoolClosedError("ThreadPool is closed") from exc
                     raise
         else:
@@ -554,6 +628,8 @@ class EventLoopThreadPool:
                     self._native_pool.push_global(_execute_task)
                 except Exception as exc:  # noqa: BLE001
                     if _RustPoolClosedError is not None and isinstance(exc, _RustPoolClosedError):
+                        with self._lock:
+                            self._outstanding.discard(fut)
                         raise ThreadPoolClosedError("ThreadPool is closed") from exc
                     raise
 

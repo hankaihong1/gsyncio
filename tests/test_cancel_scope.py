@@ -429,3 +429,147 @@ async def test_cancel_scope_cannot_share_across_tasks() -> None:
     tb = asyncio.create_task(enter_b())
     await asyncio.wait_for(asyncio.gather(ta, tb, return_exceptions=True), timeout=3.0)
     assert results.get("b") == "RuntimeError"
+
+
+# ============================================================================
+# R1 FIX-2 / R3 FIX-18 regression tests — aenter rollback + deadline edges
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_aenter_raise_does_not_leak_stack() -> None:
+    """R1-FIX-2: entering a scope under a cancelled ancestor raises, but must
+    not leave a stale scope on the task-local stack, a live deadline timer,
+    or a retained _task binding (__aexit__ is never called on aenter raise).
+    """
+    from gsyncio._cancel import _get_scope_stack
+
+    outer = CancelScope()
+    await outer.__aenter__()
+    # Mark the ancestor cancelled WITHOUT task.cancel(): the point here is the
+    # aenter-time _effectively_cancelled() check, not loop-injected cancels.
+    outer._cancel_called = True  # type: ignore[reportAttributeAccessIssue]
+    assert _get_scope_stack() == [outer]
+
+    inner = CancelScope(deadline=asyncio.get_running_loop().time() + 60)
+    with pytest.raises(asyncio.CancelledError):
+        await inner.__aenter__()
+    assert _get_scope_stack() == [outer]            # stale entry popped
+    assert inner._task is None  # type: ignore[reportAttributeAccessIssue]
+    assert inner._deadline_handle is None  # type: ignore[reportAttributeAccessIssue]
+    assert inner._reset_token is None  # type: ignore[reportAttributeAccessIssue]
+
+    await outer.__aexit__(None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_fail_after_zero_raises_timeout() -> None:
+    """R3-FIX-18: fail_after(0) raises TimeoutError and leaks no cancel count
+    (previously: bare CancelledError + task.cancelling() == 1).
+    """
+    task = asyncio.current_task()
+    assert task is not None
+    with pytest.raises(TimeoutError):
+        async with fail_after(0):
+            await asyncio.sleep(0.1)
+    assert task.cancelling() == 0
+
+
+@pytest.mark.asyncio
+async def test_move_on_zero_silent_with_await() -> None:
+    """R3-FIX-18: move_on_after(0) is silent; the body's first await is
+    cancelled and the injected count is undone on exit.
+    """
+    task = asyncio.current_task()
+    assert task is not None
+    body_ran = False
+    async with move_on_after(0) as scope:
+        await asyncio.sleep(0.1)
+        body_ran = True
+    assert not body_ran
+    assert scope.cancelled_caught
+    assert task.cancelling() == 0
+
+
+@pytest.mark.asyncio
+async def test_move_on_zero_silent_no_await() -> None:
+    """R3-FIX-18: move_on_after(0) with an await-free body completes cleanly —
+    the __aexit__ compensation uncancels the injection that was never delivered.
+    """
+    task = asyncio.current_task()
+    assert task is not None
+    async with move_on_after(0) as scope:
+        pass  # no await — injection must be compensated on exit
+    assert scope.cancelled_caught
+    assert task.cancelling() == 0
+
+
+@pytest.mark.asyncio
+async def test_deadline_nan_rejected() -> None:
+    """R3-FIX-18: NaN deadlines raise ValueError at construction — previously
+    call_later(NaN) corrupted the loop's selector timeout and crashed it with
+    TypeError (probe R3-F).
+    """
+    with pytest.raises(ValueError):
+        CancelScope(deadline=float("nan"))
+    with pytest.raises(ValueError):
+        fail_after(float("nan"))
+    with pytest.raises(ValueError):
+        fail_at(float("nan"))
+    # -inf is rejected too: express "already expired" with fail_after(0).
+    with pytest.raises(ValueError):
+        CancelScope(deadline=float("-inf"))
+
+
+@pytest.mark.asyncio
+async def test_no_scope_poisoning_after_expiry() -> None:
+    """R1-FIX-2/R3-FIX-18: after an expired-deadline entry (or a cancelled-
+    ancestor entry), the same task can still enter fresh scopes and TaskGroups
+    (probe R2 chain: the leaked scope poisoned every later __aenter__).
+    """
+    from gsyncio import TaskGroup
+
+    async def noop() -> None:
+        pass
+
+    with pytest.raises(TimeoutError):
+        async with fail_after(0):
+            await asyncio.sleep(0.1)
+
+    async with CancelScope():
+        pass
+
+    async with TaskGroup() as tg:
+        tg.start_soon(noop)
+
+    assert asyncio.current_task() is not None
+    assert asyncio.current_task().cancelling() == 0  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+async def test_shield_expired_deadline_restores_cancel_count() -> None:
+    """U1 re-audit: a shielded scope whose __aenter__ raises must restore the
+    cancellation count it cleared, or the parent cancellation is silently lost.
+
+    The shield snapshots and clears task.cancelling() on enter and re-injects
+    it on exit — but __aexit__ never runs when __aenter__ raises.  The
+    expired-deadline path rolls back and raises, skipping the restoration:
+    pre-fix the task ends with cancelling() == 0 while two parent cancels
+    were pending, so the next external cancel delivery is swallowed.
+    """
+    task = asyncio.current_task()
+    assert task is not None
+    task.cancel()
+    task.cancel()
+    assert task.cancelling() == 2
+    with pytest.raises(asyncio.CancelledError):
+        async with CancelScope(
+            deadline=asyncio.get_running_loop().time() - 1, shield=True
+        ):
+            pass  # pragma: no cover — __aenter__ raises before the body
+    # Pre-fix: 0 (count lost); fixed: 2 (restored, parent cancel preserved).
+    assert task.cancelling() == 2
+    task.uncancel()
+    task.uncancel()
+    assert task.cancelling() == 0
+

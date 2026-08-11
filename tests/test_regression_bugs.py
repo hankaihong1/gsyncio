@@ -194,3 +194,184 @@ async def test_regression_bug_d_select_channel_timeout_leak():
         f"Bug D (select_channel): ch2 leaked {len(ch2._getters)} waiter(s) "
         "in _getters — CancelledError escaped cleanup"
     )
+
+
+# ── R2 FIX-9: Lock re-entrancy + cancellation ownership theft ─────────────
+
+
+@pytest.mark.asyncio
+async def test_lock_reentrant_acquire_raises():
+    """R2-FIX-9 (probe R2-A2): same-task re-acquire raises RuntimeError
+    (asyncio.Lock parity) instead of silently queueing into a self-deadlock.
+
+    Pre-fix: the inner acquire parks forever (deadlock); when an external
+    timeout breaks it, the outer holder loses ownership (see the next test).
+    """
+    lock = gsyncio.Lock()
+    async with lock:
+        with pytest.raises(RuntimeError):
+            async with lock:
+                pass
+
+
+@pytest.mark.asyncio
+async def test_lock_reentrant_cancel_no_ownership_theft():
+    """R2-FIX-9 (probe R2-A1): a cancelled re-entrant acquire must NOT hand
+    the lock to a queued waiter while the outer holder is still inside its
+    critical section — that violates mutual exclusion.
+
+    Pre-fix log (probe): T2 entered its critical section while T1 was still
+    inside, and T1's outer __aexit__ then raised "does not own the lock".
+    """
+    lock = gsyncio.Lock()
+    t1_in_cs = {"v": False}
+
+    async def t1():
+        try:
+            async with lock:
+                t1_in_cs["v"] = True
+                try:
+                    async with asyncio.timeout(0.2):
+                        async with lock:  # re-entrant acquire — must raise
+                            pass
+                except (TimeoutError, RuntimeError):
+                    pass
+                await asyncio.sleep(0.3)  # keep the outer critical section
+                t1_in_cs["v"] = False
+        except RuntimeError:
+            pass  # pre-fix: outer __aexit__ loses ownership
+
+    async def t2():
+        async with lock:
+            # Entering here means T1 has fully exited its critical section.
+            assert t1_in_cs["v"] is False
+
+    t1_task = asyncio.create_task(t1())
+    await asyncio.sleep(0.05)  # T1 holds the lock and is inside the re-acquire
+    t2_task = asyncio.create_task(t2())
+    results = await asyncio.wait_for(
+        asyncio.gather(t1_task, t2_task, return_exceptions=True), timeout=5
+    )
+    assert not any(isinstance(r, BaseException) for r in results), results
+
+
+# ── U3 FIX-1 + FIX-10: AsyncRWMutex release shielding + nesting ────────────
+
+
+@pytest.mark.asyncio
+async def test_rwmutex_cancel_cleanup_leak():
+    """R1-FIX-1 contract: a cancelled *holder* must complete its release path
+    (readers back to 0, a queued writer admitted).  The finally block re-
+    acquires the inner Lock, and that re-acquire must never be interrupted by
+    a pending cancellation (R1 probe A observed readers stuck at 1 and the
+    writer hanging forever).  On 3.14 the single-shot delivery semantics make
+    the plain single-cancel path safe; the shield guards the residual-count
+    paths (user shield restore leaving _must_cancel set).  This test pins the
+    observable contract.
+    """
+    rw = gsyncio.AsyncRWMutex()
+    entered = asyncio.Event()
+
+    async def holder() -> None:
+        async with rw.reader():
+            entered.set()
+            await asyncio.Event().wait()
+
+    h = asyncio.create_task(holder())
+    await entered.wait()
+    w_cm = rw.writer()
+    w = asyncio.create_task(w_cm.__aenter__())
+    await asyncio.sleep(0.01)  # w queued (writer priority)
+
+    h.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await h
+
+    # Holder's release completed: readers back to 0, writer admitted.
+    async with asyncio.timeout(1.0):
+        await w
+    await w_cm.__aexit__(None, None, None)
+    assert rw._readers == 0  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_rwmutex_nesting_rejected():
+    """R2-FIX-10: reader→writer / writer→reader / writer→writer nesting
+    raises RuntimeError instead of silently self-deadlocking; reader→reader
+    re-entry stays legal."""
+    rw = gsyncio.AsyncRWMutex()
+
+    with pytest.raises(RuntimeError):
+        async with rw.reader():
+            async with asyncio.timeout(0.5):
+                async with rw.writer():
+                    pass  # pragma: no cover — pre-fix hangs until timeout
+
+    with pytest.raises(RuntimeError):
+        async with rw.writer():
+            async with asyncio.timeout(0.5):
+                async with rw.reader():
+                    pass  # pragma: no cover
+
+    with pytest.raises(RuntimeError):
+        async with rw.writer():
+            async with asyncio.timeout(0.5):
+                async with rw.writer():
+                    pass  # pragma: no cover
+
+    # Re-entrant reads are allowed (shared lock).
+    async with rw.reader(), rw.reader():
+        pass
+
+
+@pytest.mark.asyncio
+async def test_rwmutex_double_reader_writer_still_rejected():
+    """R5 修订 A: reader depth counting — after the *first* nested reader
+    exits (still inside the second), writer() must still be rejected.  A
+    plain set would drop the registration on the first exit and let the
+    writer hang (pre-fix behavior: no detection at all → hangs)."""
+    rw = gsyncio.AsyncRWMutex()
+    async with rw.reader():
+        async with rw.reader():
+            pass  # first exit: depth 2 → 1, task still registered
+        with pytest.raises(RuntimeError):
+            async with asyncio.timeout(0.5):
+                async with rw.writer():
+                    pass  # pragma: no cover
+
+
+@pytest.mark.asyncio
+async def test_rwmutex_cancelled_writer_preserves_holder_state():
+    """U3 contract: a *queued* writer cancelled while another writer holds
+    the lock must not touch the holder's state.  Structurally the acquire
+    phase throws before the outer ``try: yield`` is entered, so only the
+    inner finally (pending_writers decrement) runs — this test pins that
+    contract (and the explicit ``acquired`` guard in the release path) so a
+    future restructure cannot let a cancelled queued writer flip _writer to
+    False and admit readers while the holder is still inside."""
+    rw = gsyncio.AsyncRWMutex()
+    async with rw.writer():
+        w2_entered = asyncio.Event()
+
+        async def queued_writer() -> None:
+            async with rw.writer():
+                w2_entered.set()
+                await asyncio.Event().wait()
+
+        w2 = asyncio.create_task(queued_writer())
+        await asyncio.sleep(0.01)  # w2 queued
+        w2.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await w2
+        r = asyncio.create_task(rw.reader().__aenter__())
+        await asyncio.sleep(0.01)
+        # Holder state intact → reader stays blocked.
+        assert not r.done()
+        r.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await r
+    # After the holder exits, reads work normally.
+    async with asyncio.timeout(1.0):
+        async with rw.reader():
+            pass
+

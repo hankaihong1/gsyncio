@@ -590,7 +590,12 @@ Selects the first ready channel from multiple `FastChannel` instances (Go `selec
 
 - **Returns**: `(selected_channel, value)`.
 - **`default`**: When provided, `select_channel` is non-blocking: it tries each channel with `try_recv()` and returns `(channel, value)` for the first ready channel, or `default` if none is ready.
-- **Raises**: `ValueError` if no channels are given, `TimeoutError` if `timeout` is reached before any channel becomes ready.
+- **Raises**: `ValueError` if no channels are given, `TimeoutError` if `timeout` is reached before any channel becomes ready, `ChannelClosedError` if **every** channel is closed and empty (a closed-empty channel can never become ready, so waiting would hang forever).
+
+**Closed-channel semantics** (U5-FIX-19):
+- A closed channel that still holds buffered items reports ready and yields its data — closing never destroys buffered values.
+- A closed-and-empty channel is silently ignored while any other channel is still open (select keeps waiting for the open one).
+- When **all** channels are closed and empty, `select_channel` raises `ChannelClosedError` instead of hanging.
 
 **Example**:
 ```python
@@ -613,7 +618,9 @@ async with TaskGroup(name=None) as tg:
 ```
 
 - **`start_soon(coro_fn, *args)` -> `TaskHandle`**: Spawns a child task and returns its handle immediately without blocking.
+  - **Raises**: `RuntimeError` if called after the group has exited (a task spawned then would be an orphan nobody waits for); the orphan is cancelled and its exception consumed.
 - **`start(coro_fn, *args)` -> `TaskHandle`**: Spawns a child task, blocking until it calls `task_status.started()`.
+  - **Raises**: `RuntimeError` if called after the group has exited (same orphan guard as `start_soon`).
 - **Raises**: Child exceptions are re-raised on exit; multiple failures surface as an `ExceptionGroup`.
 
 ### `TaskHandle`
@@ -692,6 +699,8 @@ async with lock:
 
 - **`locked`** -> `bool`: `True` if the lock is held.
 - **`owner`** -> `asyncio.Task | None`: The task currently holding the lock, if any.
+
+> **Diagnostic properties** (`locked`/`owner`/`Semaphore.value`/`qsize`/`Event.is_set`/`TaskHandle.status`) are consistent snapshots taken under the relevant internal lock — they are **not** atomic across each other and not a substitute for the actual acquire/wait operations under concurrency (FIX-14).
 - **`acquire()`**: Acquires the lock, suspending until it is free.
 - **`release()`**: Releases the lock. Must be called by the owner.
 

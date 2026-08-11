@@ -214,3 +214,110 @@ async def test_capacity_limiter_concurrent_total_tokens():
         t.join()
 
     assert len(errors) == 0, f"Concurrent mutations caused: {errors}"
+
+
+# ---------------------------------------------------------------------------
+# R1 FIX-3 / R2 FIX-11 regression tests — release bound + limiter accounting
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_semaphore_release_beyond_max_raises():
+    """R1-FIX-3: over-release raises ValueError (asyncio.Semaphore parity);
+    pre-fix the value silently exceeded max_value."""
+    sem = Semaphore(2)  # starts full — releasing without acquiring is over-release
+    with pytest.raises(ValueError):
+        sem.release()
+    await sem.acquire()  # value 1
+    sem.release()        # back to max — legal
+    with pytest.raises(ValueError):
+        sem.release()    # over-release
+
+
+def test_semaphore_zero_ok():
+    """R2-FIX-11: Semaphore(0) is legal (asyncio parity) — a closed gate."""
+    sem = Semaphore(0)
+    assert sem.value == 0
+    with pytest.raises(ValueError):
+        sem.release()
+
+
+@pytest.mark.asyncio
+async def test_semaphore_zero_acquire_blocks():
+    """R2-FIX-11: acquiring a zero-capacity semaphore blocks."""
+    sem = Semaphore(0)
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(sem.acquire(), timeout=0.2)
+
+
+@pytest.mark.asyncio
+async def test_limiter_shrink_below_borrowed_accounting():
+    """R1-FIX-3 (probe R1-B): shrinking below the borrowed count must report
+    the REAL borrowed count, not a value derived from the semaphore value."""
+    limiter = CapacityLimiter(5)
+    for _ in range(3):
+        await limiter.acquire()
+    limiter.total_tokens = 1
+    total, avail, borrowed = limiter.snapshot()
+    assert borrowed == 3
+    assert avail == total - borrowed
+    for _ in range(3):
+        limiter.release()
+    total, avail, borrowed = limiter.snapshot()
+    assert borrowed == 0
+    assert avail == total
+
+
+@pytest.mark.asyncio
+async def test_limiter_regrow_after_shrink():
+    """R5 修订 D: regrowing after a shrink must not trip the bounded release —
+    the setter must update the semaphore max_value BEFORE releasing tokens."""
+    limiter = CapacityLimiter(5)
+    for _ in range(3):
+        await limiter.acquire()
+    limiter.total_tokens = 1
+    limiter.total_tokens = 5  # regrow — bounded release() must not raise
+    total, avail, borrowed = limiter.snapshot()
+    assert borrowed == 3
+    assert avail == total - borrowed
+    for _ in range(3):
+        limiter.release()
+    assert limiter.available_tokens == limiter.total_tokens
+
+
+def test_limiter_overrelease_keeps_borrowed():
+    """R5 修订 D: a failing (over-)release must not half-update the borrowed
+    count (release first, then bookkeeping, in one _total_lock region)."""
+    limiter = CapacityLimiter(1)
+    with pytest.raises(ValueError):
+        limiter.release()  # nothing borrowed — over-release
+    assert limiter.borrowed_tokens == 0
+    assert limiter.available_tokens == limiter.total_tokens
+
+
+@pytest.mark.asyncio
+async def test_limiter_fractional_lt_one():
+    """R2-FIX-11 (probe R2-C): total_tokens in (0,1) is a capacity-0 gate —
+    pre-fix it crashed with ValueError from Semaphore(int(0.5)) == Semaphore(0)."""
+    limiter = CapacityLimiter(0.5)
+    assert limiter.total_tokens == 0.5
+    assert limiter.available_tokens == 0.5
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(limiter.acquire(), timeout=0.2)
+    limiter.total_tokens = 1.5
+    await asyncio.wait_for(limiter.acquire(), timeout=1.0)
+    limiter.release()
+
+
+def test_semaphore_max_value_consistent_after_resize():
+    """U2 re-audit: max_value is read under the lock, so a concurrent
+    CapacityLimiter resize (which rewrites _max_value from another thread)
+    can never be observed as a torn value."""
+    s = Semaphore(2)
+    assert s.max_value == 2
+    limiter = CapacityLimiter(1.0)
+    limiter.total_tokens = 5.0
+    assert limiter._semaphore.max_value == 5  # type: ignore[attr-defined]
+    limiter.total_tokens = 2.5
+    assert limiter._semaphore.max_value == 2  # type: ignore[attr-defined]
+

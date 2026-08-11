@@ -26,7 +26,10 @@ class AsyncContext:
         self._lock = threading.Lock()
         self._cancel_scope = CancelScope()
         self._children: list[AsyncContext] = []
-        self._futures: list[tuple[asyncio.AbstractEventLoop | None, asyncio.Future[Any]]] = []
+        # WHY: a dict future → owning loop (None when no loop was running at
+        # submit time) so a done-callback can drop entries in O(1) — a list
+        # would keep every completed submission forever (R3 FIX-21).
+        self._futures: dict[asyncio.Future[Any], asyncio.AbstractEventLoop | None] = {}
 
         if parent:
             parent._add_child(self)
@@ -107,9 +110,23 @@ class AsyncContext:
                     loop = asyncio.get_running_loop()
                 except RuntimeError:
                     loop = None
-                self._futures.append((loop, fut_res))
+                self._futures[fut_res] = loop
+                # WHY: drop the entry as soon as the task finishes — without
+                # this every completed submission stays tracked forever and
+                # cancel() walks stale futures (R3 FIX-21).
+                fut_res.add_done_callback(self._discard_future)
 
         return fut_res
+
+    def _discard_future(self, fut: asyncio.Future[Any]) -> None:
+        """Remove a finished future from the tracking dict (done-callback).
+
+        The callback runs on the future's owning loop, so the dict access is
+        serialised with submit()/cancel() via ``_lock``; a completed entry is
+        simply absent the next time cancel() walks the dict.
+        """
+        with self._lock:
+            self._futures.pop(fut, None)
 
     def cancel(self) -> None:
         """Cancel this context and thread-safely cascade to all child contexts and futures."""
@@ -119,14 +136,14 @@ class AsyncContext:
             self._cancelled = True
             self._cancel_scope.cancel()
             children = list(self._children)
-            futures = list(self._futures)
+            futures = list(self._futures.items())
             self._children.clear()
             self._futures.clear()
 
         for child in children:
             child.cancel()
 
-        for loop, fut in futures:
+        for fut, loop in futures:
             if not fut.done():
                 if loop and loop.is_running():
                     loop.call_soon_threadsafe(fut.cancel)
