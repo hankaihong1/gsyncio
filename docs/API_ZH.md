@@ -624,7 +624,16 @@ async def select_channel(
   尝试每个通道，第一个就绪的返回 `(channel, value)`，全不就绪返回
   `default`。
 - **抛出**：无通道传入抛 `ValueError`，`timeout` 到期仍无通道就绪抛
-  `TimeoutError`。
+  `TimeoutError`，**所有**通道都已关闭且为空时抛 `ChannelClosedError`
+  （关闭且为空的通道永远不会就绪，等待会永久挂起）。
+
+**关闭语义**（U5-FIX-19）：
+- 已关闭但仍缓冲着数据的通道照常报告就绪并返回数据——关闭不会销毁
+  缓冲值。
+- 只要还有通道开着，关闭且为空的通道会被静默忽略（select 继续等待
+  开着的通道）。
+- 当**所有**通道都关闭且为空时，`select_channel` 抛
+  `ChannelClosedError` 而不是挂起。
 
 **示例**：
 ```python
@@ -735,6 +744,8 @@ async with lock:
 
 - **`locked`** -> `bool`：锁是否被持有。
 - **`owner`** -> `asyncio.Task | None`：当前持有锁的任务（如有）。
+
+> **诊断属性**（`locked`/`owner`/`Semaphore.value`/`qsize`/`Event.is_set`/`TaskHandle.status`）是各自内部锁下的一致快照——彼此之间**不是**原子的，也不能替代并发下的真实 acquire/wait 操作（FIX-14）。
 - **`acquire()`**：获取锁，挂起直到空闲。
 - **`release()`**：释放锁。必须由持有者调用。
 

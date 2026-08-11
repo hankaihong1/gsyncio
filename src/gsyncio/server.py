@@ -91,7 +91,15 @@ class ConnectionPinningServer:
         :param handler:
             Optional connection handler function `(reader, writer)`.
 
+        Idempotent: calling :meth:`start` while the server is already
+        running is a no-op (no second acceptor, port unchanged).  Set the
+        handler before the first start — a handler passed to a second
+        (no-op) call is not picked up (R2 FIX-17).
+
         """
+        with self._running_lock:
+            if self._running:
+                return
         if handler is not None:
             self.handler = handler
 
@@ -165,7 +173,21 @@ class ConnectionPinningServer:
                 backoff = min(backoff * 2, 0.1)
 
     def _discard_conn_task(self, task: asyncio.Task[Any]) -> None:
-        """Done-callback: remove *task* from the tracked connection set."""
+        """Done-callback: remove *task* from the tracked connection set.
+
+        Also consumes the task's exception: a handler that raises a
+        non-OSError (e.g. ValueError) would otherwise surface as "Task
+        exception was never retrieved" noise — the failure is intentional
+        and already reported by the handler itself (R3 FIX-23).
+        """
+        # WHY: on 3.14 task.exception() raises CancelledError for cancelled
+        # tasks — cancellation is the normal shutdown path here, not an
+        # error to log.
+        if not task.cancelled():
+            try:
+                task.exception()
+            except asyncio.CancelledError:
+                pass
         with self._conn_tasks_lock:
             self._conn_tasks.discard(task)
 

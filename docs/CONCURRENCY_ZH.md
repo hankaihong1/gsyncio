@@ -18,7 +18,7 @@ waiter 结构，Rust 侧用原子操作 + flume 承载数据面**。跨线程唤
 
 | 组件 | 锁/原语 | waiter 结构 | 关键不变量 |
 |---|---|---|---|
-| Rust `FastChannel` | flume channel（有界/无界）+ `AtomicBool is_closed` | 无 | `try_send` 返回 `false` 仅表示满；closed 后一律报错（`src/lib.rs:387-418`） |
+| Rust `FastChannel` | flume channel（有界/无界）+ `AtomicBool is_closed` | 无 | `try_send` 返回 `false` 仅表示满；**关闭后先排空再报错**——与 `close()` 竞争的 send 可能仍短暂入队（flume 侧惰性关闭），因此"已关闭"通道可能先短暂接收再排空，之后所有操作才报错（`src/lib.rs:387-418`；R4 决议：比 Go 的关闭后 send panic 更宽容） |
 | Python `_BaseChannel` | `threading.Lock`（`_lock`） | `_getters` / `_putters` 两个 `deque[(loop, future)]` | waiter 注册与唤醒必须在 `_lock` 下完成（`src/gsyncio/_channel_base.py:75-78`） |
 | 唤醒协议 | — | — | `_wake_all` 从 deque **左侧消费式**唤醒：唤醒一个就弹出，stale future 自然丢弃（`_channel_base.py:29-50`） |
 
@@ -45,7 +45,7 @@ waiter 结构，Rust 侧用原子操作 + flume 承载数据面**。跨线程唤
 
 | 原语 | 保护锁 | waiter 结构 | 关键不变量 |
 |---|---|---|---|
-| `Barrier` | `threading.Mutex` | `list[(loop, asyncio.Event)]` | `_generation` 计数器绑定轮次；取消处理先查 generation 再删条目（`_sync.py:628-643`） |
+| `Barrier` | `threading.Mutex` | `list[(loop, asyncio.Event)]` | `_generation` 计数器绑定轮次；取消处理先查 generation 再删条目（`_sync.py:628-643`）。**取消注意（FIX-12）**：轮次凑齐前有 party 被取消，其余 party 将永久阻塞——barrier 没有自动 broken 状态；`abort()` 是文档化的逃生通道 |
 | `AsyncWaitGroup` | Rust：`AtomicUsize` counter + parking_lot `Mutex` | `Vec[(loop, future)]` | `done()` 到 0 时 `mem::take` 整体移交 waiter 列表（`lib.rs:443-457`）；`register_waiter` 双检：无锁快路径 + 锁内复检（`lib.rs:473-487`） |
 | `AsyncOnce` | `threading.Lock` | `deque[(loop, future)]` | leader/follower：锁内决定谁执行、follower 锁内注册，leader 在 finally 中**持锁** `_wake_all`——注册与唤醒在同一把锁下，无 lost-wakeup 窗口（`primitives.py:377-416`） |
 
@@ -54,7 +54,7 @@ waiter 结构，Rust 侧用原子操作 + flume 承载数据面**。跨线程唤
 | 组件 | 机制 | 关键点 |
 |---|---|---|
 | `CancelScope` | 每任务 contextvars 栈 + `task.cancelling()`/`uncancel()` | shield 进入时 snapshot 取消计数并清零，退出时恢复（`_cancel.py:141-146, 184-189`） |
-| `select_channel` | `TaskGroup` + 每个 channel 一个 reader | reader 成功读到后**主动抛 `CancelledError`** 触发组提前退出——正常 return 会让组等所有通道（`primitives.py:248-255`） |
+| `select_channel` | `TaskGroup` + 每个 channel 一个 reader | reader 成功读到后**主动抛 `CancelledError`** 触发组提前退出——正常 return 会让组等所有通道（`primitives.py:248-255`）。**仲裁非原子（FIX-16）**：就绪报告不消费；并发消费者可能在报告与赢家 `try_recv` 之间抢走数据，select 因此循环重注册——高竞争下特定通道可能被延迟/饿着（文档化行为，非 bug） |
 
 ---
 
@@ -118,6 +118,15 @@ snapshot/restore 实现（`_cancel.py:141-146, 184-189`）。
 generation 再决定是否删除。
 **例证**：`Barrier.wait()`（`_sync.py:628-643`）；同样手法在
 `Semaphore._cancel_waiter`（令牌转发而非盲删，`_sync.py:192-213`）。
+
+**FIX-12 注**：generation 守卫保护的是*下一轮*条目，但轮次凑齐前被取消的
+party 会让其余 party 永久停在屏障上——`Barrier` 没有自动 broken 状态
+（刻意为之，R4 决议）。逃生通道用 `abort()`。
+
+**已知限制（FIX-15）**：`Barrier`/`Condition`/`Semaphore` 取消处理里的
+删除是每个 waiter O(n)（重建列表/dict），N 个 waiter 的取消风暴总成本
+O(n²)——实测 5000 waiter ≈ 560 ms（R2 探针 E2）。真实 party 数量级下可
+接受；记录在案，防止后人"优化"成 wrong-round bug。
 
 ### 模式 6：注册-完成竞态（register-after-done）
 

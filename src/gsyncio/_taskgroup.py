@@ -13,6 +13,17 @@ from typing import Any, Self
 from gsyncio._cancel import CancelScope
 
 
+def _retrieve_task_exception(task: asyncio.Task[Any]) -> None:
+    """Consume a finished task's exception so asyncio does not log it.
+
+    Used for orphan tasks we cancel on start_soon-after-exit: the task's
+    CancelledError would otherwise surface as "exception was never
+    retrieved" noise once the task finishes.
+    """
+    if not task.cancelled():
+        task.exception()
+
+
 class _TaskStatus(enum.Enum):
     """Internal task lifecycle states."""
 
@@ -109,6 +120,11 @@ class TaskGroup:
         # and quick snapshots.
         self._children_lock = threading.Lock()
         self._cancel_scope: CancelScope = CancelScope()
+        # WHY: start_soon/start must reject new tasks once the group has
+        # exited — a task spawned after __aexit__ would be an orphan nobody
+        # waits for (R3 FIX-20).  Written in __aexit__'s finally, reset in
+        # __aenter__, checked under _children_lock.
+        self._exited = False
 
     # -- context manager -------------------------------------------------------
 
@@ -120,10 +136,35 @@ class TaskGroup:
         # never called when __aenter__ raises (a pushed scope would leak).
         if self._cancel_scope.cancel_called:
             raise RuntimeError("TaskGroup is not reusable after failure")
+        with self._children_lock:
+            self._exited = False
+            # WHY: re-entry starts a fresh lifecycle.  The previous run's
+            # children are all finished (__aexit__ waits for them), so
+            # clearing is safe — and necessary: on the body-exception path
+            # the scope is NOT cancelled (pre-cancel path), so re-entry is
+            # admitted and the old cancelled children would be re-collected,
+            # resurfacing their CancelledError as a stale failure (R5 修订 C).
+            self._children.clear()
         await self._cancel_scope.__aenter__()
         return self
 
     async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: object,
+    ) -> bool | None:
+        try:
+            return await self._aexit_impl(exc_type, exc_val, exc_tb)
+        finally:
+            # WHY: every exit path (normal, body exception, cancellation,
+            # child failure) ends the group's life — the flag must be set
+            # even when _wait_children itself raises, so start_soon/start
+            # can never spawn an orphan after the group ended (R3 FIX-20).
+            with self._children_lock:
+                self._exited = True
+
+    async def _aexit_impl(
         self,
         exc_type: type[BaseException] | None,
         exc_val: BaseException | None,
@@ -273,6 +314,16 @@ class TaskGroup:
         task = asyncio.create_task(coro_fn(*args))
         handle = TaskHandle(task)
         with self._children_lock:
+            if self._exited:
+                # WHY: the group already ended — this task would be an
+                # orphan nobody waits for.  Cancel it and consume its
+                # eventual CancelledError so it cannot surface as
+                # "exception was never retrieved" noise.
+                task.cancel()
+                task.add_done_callback(_retrieve_task_exception)
+                raise RuntimeError(
+                    "TaskGroup is not active: cannot start_soon() after the group exited"
+                )
             self._children.add(handle)
         return handle
 
@@ -287,6 +338,13 @@ class TaskGroup:
         handle = TaskHandle(task)
         handle._start_event = task_status._started
         with self._children_lock:
+            if self._exited:
+                # WHY: same orphan guard as start_soon (R3 FIX-20).
+                task.cancel()
+                task.add_done_callback(_retrieve_task_exception)
+                raise RuntimeError(
+                    "TaskGroup is not active: cannot start() after the group exited"
+                )
             self._children.add(handle)
         try:
             await task_status._started.wait()

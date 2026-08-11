@@ -2,6 +2,7 @@
 
 import asyncio
 import contextvars
+import math
 import threading
 from typing import Self
 
@@ -37,6 +38,12 @@ class CancelScope:
     """
 
     def __init__(self, deadline: float = float("inf"), shield: bool = False) -> None:
+        # WHY: a NaN deadline would flow into loop.call_later's timer heap,
+        # corrupt the loop's selector-timeout computation and crash the whole
+        # event loop with TypeError (probe R3-F). -inf is rejected too —
+        # "already expired" is expressed with fail_after(0) / fail_at(past).
+        if not (math.isfinite(deadline) or deadline == float("inf")):
+            raise ValueError("deadline must be a finite number or float('inf')")
         self._cancel_called = False
         self._cancel_lock = threading.Lock()
         self._deadline = deadline
@@ -107,7 +114,7 @@ class CancelScope:
         shielded scope is never *effectively* cancelled by its ancestors
         (though a direct :meth:`cancel` call still affects it).
         """
-        if self._cancel_called:
+        if self.cancel_called:
             return True
         if self._shield:
             return False
@@ -117,7 +124,7 @@ class CancelScope:
         except ValueError:
             return False
         for i in range(idx - 1, -1, -1):
-            if stack[i]._cancel_called:
+            if stack[i].cancel_called:
                 return True
             if stack[i]._shield:
                 return False
@@ -129,6 +136,52 @@ class CancelScope:
         """Event-loop callback fired when the deadline expires."""
         self._deadline_handle = None
         self.cancel()
+
+    def _rollback_aenter(self, clear_binding: bool = True) -> None:
+        """Undo the ``__aenter__`` side effects before raising from it.
+
+        WHY: ``__aexit__`` is never called when ``__aenter__`` raises
+        (with-statement semantics), so a bare raise would leak a stale scope
+        on the task-local stack, a live deadline timer that later cancels a
+        task which already left the scope, the ``_reset_token``, and the
+        ``_task``/``_loop`` binding (R1 FIX-2).
+
+        ``clear_binding=False`` keeps the host binding: the move_on expired-
+        deadline path returns normally, so ``__aexit__`` runs and needs the
+        binding to uncancel the injection (its ``finally`` clears it).
+        """
+        stack = _get_scope_stack()
+        if stack and stack[-1] is self:
+            stack.pop()
+        else:
+            stack = [s for s in stack if s is not self]
+        _scope_stack_var.set(stack)
+        if self._deadline_handle is not None:
+            self._deadline_handle.cancel()
+            self._deadline_handle = None
+        self._reset_token = None
+        if clear_binding:
+            # The binding is cleared under the lock — cancel() reads
+            # _task/_loop from any thread and must never see a torn binding.
+            with self._cancel_lock:
+                self._task = None
+                self._loop = None
+
+    def _restore_saved_cancel_count(self) -> None:
+        """Re-inject the cancellation count a shielded enter cleared.
+
+        Called on the aenter-raise paths where ``__aexit__`` never runs:
+        the shield must give back what it took, or the task's pending
+        cancellation is silently lost (U1 re-audit).  ``__aexit__`` uses
+        the same helper so there is exactly one restoration implementation.
+        """
+        if not self._shield or self._saved_cancel_count <= 0:
+            return
+        with self._cancel_lock:
+            task = self._task
+        if task is not None:
+            for _ in range(self._saved_cancel_count):
+                task.cancel()
 
     # -- context manager protocol ---------------------------------------------
 
@@ -168,13 +221,41 @@ class CancelScope:
             loop = asyncio.get_running_loop()
             delta = self._deadline - loop.time()
             if delta <= 0:
-                self.cancel()
+                # WHY: the deadline is already expired.  self.cancel() followed
+                # by a bare raise would (a) leak the injected cancellation
+                # count — __aexit__ never runs, so the conversion paths below
+                # would never uncancel — and (b) surface the wrong exception
+                # class: fail_after(0) must raise TimeoutError and
+                # move_on_after(0) must be silent (probe R3-A).
+                if self._convert_to_timeout:
+                    self._restore_saved_cancel_count()
+                    self._rollback_aenter()
+                    raise TimeoutError() from None
+                if self._cancelled_caught:
+                    # Inject one cancellation: the body's first await raises
+                    # CancelledError and __aexit__'s swallow branch uncancels
+                    # it; an await-free body is compensated in __aexit__'s
+                    # normal path instead.  The binding must survive the
+                    # rollback — __aexit__ needs it to uncancel.
+                    self.cancel()
+                    self._rollback_aenter(clear_binding=False)
+                    return self
+                self._restore_saved_cancel_count()
+                self._rollback_aenter()
+                raise asyncio.CancelledError()
             else:
                 self._deadline_handle = loop.call_later(delta, self._deadline_callback)
 
         # If an ancestor is already cancelled (and we are not shielded),
-        # surface that cancellation immediately.
+        # surface that cancellation immediately — but undo the stack push and
+        # the deadline timer first (see _rollback_aenter).
         if self._effectively_cancelled():
+            # WHY: the shield branch above may already have cleared the task's
+            # pending cancellation (a shielded scope can still be effectively
+            # cancelled by a direct cancel() call) — restore it before the
+            # rollback drops the binding, or __aexit__ never gets to run.
+            self._restore_saved_cancel_count()
+            self._rollback_aenter()
             raise asyncio.CancelledError()
 
         return self
@@ -205,9 +286,7 @@ class CancelScope:
                 self._deadline_handle = None
 
             # Restore saved cancel count for shielded scopes.
-            if self._shield and self._saved_cancel_count > 0 and task is not None:
-                for _ in range(self._saved_cancel_count):
-                    task.cancel()
+            self._restore_saved_cancel_count()
 
             # fail_after / fail_at: convert CancelledError → TimeoutError
             # (only when this scope's own deadline fired / cancel was called).
@@ -215,7 +294,7 @@ class CancelScope:
                 exc_type is not None
                 and issubclass(exc_type, asyncio.CancelledError)
                 and self._convert_to_timeout
-                and self._cancel_called
+                and self.cancel_called
             ):
                 # WHY: The deadline cancel was counted on this task.  asyncio
                 # only decrements the count when CancelledError propagates out
@@ -236,11 +315,23 @@ class CancelScope:
                 exc_type is not None
                 and issubclass(exc_type, asyncio.CancelledError)
                 and self._cancelled_caught
-                and self._cancel_called
+                and self.cancel_called
             ):
                 if task is not None:
                     task.uncancel()
                 return True
+
+            # move_on with an await-free body: the deadline-expired injection
+            # (__aenter__'s delta <= 0 branch) was never delivered by an await,
+            # so the swallow branch above did not run — compensate the count
+            # here or it leaks into outer scopes (R3 FIX-18).
+            if (
+                exc_type is None
+                and self._cancelled_caught
+                and self.cancel_called
+                and task is not None
+            ):
+                task.uncancel()
 
             return None
         finally:

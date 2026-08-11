@@ -19,9 +19,13 @@ from typing import Any, Self
 class Lock:
     """A fair FIFO mutex that is safe to use across event loops and OS threads.
 
-    Unlike :class:`asyncio.Lock`, a :class:`gsyncio.Lock` may be acquired in
-    one event loop and released from another — or from a non-asyncio thread
-    — as long as the release happens on the correct *owning* task.
+    The lock itself is thread-safe, but release is bound to the *owning
+    task*: the task that acquired the lock must release it (calling
+    :meth:`release` from any other task — or from a thread with no running
+    asyncio task — raises :class:`RuntimeError`).  Unlike
+    :class:`asyncio.Lock`, the same lock may be acquired by tasks living on
+    different event loops, so a hand-off between loops is possible by
+    design — the owner task is the only authority over release (FIX-5).
     """
 
     def __init__(self) -> None:
@@ -55,6 +59,13 @@ class Lock:
             raise RuntimeError("acquire() must be called from an asyncio task")
 
         with self._lock:
+            # WHY: asyncio.Lock rejects same-task re-acquisition up front;
+            # silently queueing would self-deadlock, and a cancelled
+            # re-entrant acquire would hit the ambiguous _owner-is-task check
+            # in the cancel path below, handing the lock to a waiter while
+            # the still-running outer holder believes it owns it (R2 FIX-9).
+            if self._owner is task:
+                raise RuntimeError("Lock is not reentrant: already held by the current task")
             # WHY: The owner task can die without releasing (CancelledError racing
             # release). Without this break every future acquirer waits forever on
             # a lock whose owner will never call release(); the check recycles the
@@ -73,14 +84,18 @@ class Lock:
             await event.wait()
         except asyncio.CancelledError:
             with self._lock:
-                self._discard_waiter(task)
                 # WHY: release() may already have popped this waiter and handed
                 # it ownership (BUG-8).  The lock would then belong to a dead
                 # task and every later FIFO waiter starves.  Forward it to the
                 # next live waiter — the same token-forwarding pattern as
                 # Semaphore._cancel_waiter; a cancelled successor forwards
                 # again via its own cancel handler (chain forwarding).
-                if self._owner is task:
+                # was_waiter discriminates: only an entry that release() had
+                # already popped (ownership handed to us) must be forwarded —
+                # a task still queued as a waiter is a re-entrant acquire whose
+                # outer holder still legitimately owns the lock (R2 FIX-9).
+                was_waiter = self._discard_waiter(task)
+                if self._owner is task and not was_waiter:
                     self._release_locked()
             raise
 
@@ -127,13 +142,20 @@ class Lock:
         self.release()
         return None
 
-    def _discard_waiter(self, task: asyncio.Task[Any]) -> None:
-        """Remove *task* from ``_waiters`` (caller must hold ``_lock``)."""
+    def _discard_waiter(self, task: asyncio.Task[Any]) -> bool:
+        """Remove *task* from ``_waiters`` (caller must hold ``_lock``).
+
+        Returns ``True`` if the entry was still queued, ``False`` if it had
+        already been popped (e.g. by ``_release_locked``) — the discrimination
+        the cancel path needs to decide whether ownership must be forwarded.
+        """
         remaining: collections.deque[tuple[asyncio.Task[Any], asyncio.Event]] = collections.deque(
             w for w in self._waiters if w[0] is not task
         )
+        was_present = len(remaining) != len(self._waiters)
         self._waiters.clear()
         self._waiters.extend(remaining)
+        return was_present
 
 
 # ============================================================================
@@ -156,8 +178,11 @@ class Semaphore:
     """
 
     def __init__(self, max_value: int) -> None:
-        if max_value <= 0:
-            raise ValueError("max_value must be >= 1")
+        # WHY: asyncio.Semaphore(0) is legal — a gate that starts closed and
+        # is opened by release().  Rejecting it broke CapacityLimiter with
+        # fractional totals in (0,1) (R2 FIX-11).
+        if max_value < 0:
+            raise ValueError("max_value must be >= 0")
         self._value = max_value
         self._max_value = max_value
         self._lock = threading.Lock()
@@ -182,7 +207,11 @@ class Semaphore:
     @property
     def max_value(self) -> int:
         """Maximum number of permits."""
-        return self._max_value
+        # WHY: CapacityLimiter's total_tokens setter rewrites _max_value from
+        # another thread — the read must be under the same lock or the
+        # free-threaded build races (U2 re-audit).
+        with self._lock:
+            return self._max_value
 
     async def acquire(self) -> None:
         """Acquire a permit, blocking in FIFO order if none are available.
@@ -229,12 +258,19 @@ class Semaphore:
                     self._value += 1
 
     def release(self) -> None:
-        """Release a permit, waking the first FIFO waiter if any."""
+        """Release a permit, waking the first FIFO waiter if any.
+
+        :raises ValueError: if the semaphore already holds ``max_value``
+            permits and no waiter is parked (asyncio.Semaphore parity —
+            a silent over-release would corrupt the count forever, R1 FIX-3).
+        """
         with self._lock:
             if self._waiters:
                 loop, event = self._waiters.popleft()
                 loop.call_soon_threadsafe(event.set)
             else:
+                if self._value >= self._max_value:
+                    raise ValueError("Semaphore released too many times")
                 self._value += 1
 
     async def __aenter__(self) -> Self:
@@ -270,6 +306,12 @@ class CapacityLimiter:
             raise ValueError("total_tokens must be positive")
         self._semaphore = Semaphore(int(total_tokens))
         self._total_tokens = total_tokens
+        # WHY: borrowed is tracked explicitly instead of being derived from the
+        # semaphore value — shrinking the total below the borrowed count used
+        # to make the derived numbers fictional (probe R1-B: claimed borrowed=1
+        # while 3 were held).  avail + borrowed == total now holds by
+        # construction (R1 FIX-3).
+        self._borrowed = 0
         self._total_lock = threading.Lock()
 
     def __repr__(self) -> str:
@@ -294,11 +336,29 @@ class CapacityLimiter:
             self._total_tokens = value
             new_int = int(value)
             old_int = int(old)
+            # WHY: the semaphore max must be updated BEFORE releasing tokens —
+            # release() is now bounded (R1 FIX-3), so regrowing against a stale
+            # max would raise ValueError (R5 修订 D).
+            self._semaphore._max_value = new_int
             diff = new_int - old_int
             if diff > 0:
-                for _ in range(diff):
-                    self._semaphore.release()
+                # WHY: only tokens NOT currently borrowed may become
+                # available — with 3 borrowed, growing 1 → 5 must yield
+                # exactly 2 available tokens, not diff=4 (R5 修订 D).
+                target_value = max(0, new_int - self._borrowed)
+                while True:
+                    with self._semaphore._lock:
+                        if self._semaphore._value >= target_value:
+                            break
+                        if self._semaphore._waiters:
+                            loop, event = self._semaphore._waiters.popleft()
+                            loop.call_soon_threadsafe(event.set)
+                        else:
+                            self._semaphore._value += 1
             elif diff < 0:
+                # Shrink only reclaims AVAILABLE tokens (value); borrowed ones
+                # are untouched — the cap below is inherent (value cannot go
+                # negative), so shrinking below the borrowed count is safe.
                 to_reduce = -diff
                 for _ in range(to_reduce):
                     with self._semaphore._lock:
@@ -333,19 +393,44 @@ class CapacityLimiter:
             return (self._total_tokens, avail, self._total_tokens - avail)
 
     def _available_locked(self) -> float:
-        """Compute available tokens while ``_total_lock`` is held."""
-        sem_val = self._semaphore.value
-        return self._total_tokens - (
-            int(self._total_tokens) - sem_val if sem_val <= int(self._total_tokens) else 0
-        )
+        """Compute available tokens while ``_total_lock`` is held.
+
+        May be negative when the total was shrunk below the borrowed count —
+        the real state (anyio semantics), never a fictional number.
+        """
+        return self._total_tokens - self._borrowed
 
     async def acquire(self) -> None:
         """Acquire one token, blocking if none are available."""
         await self._semaphore.acquire()
+        # No await between the successful acquire and the increment — a
+        # concurrent resize can never observe a half-registered borrow, and
+        # cancellation cannot be delivered in between.
+        with self._total_lock:
+            self._borrowed += 1
 
     def release(self) -> None:
-        """Release one token."""
-        self._semaphore.release()
+        """Release one token.
+
+        :raises ValueError: if released more times than acquired (borrowed
+            count is already zero — the over-release case).
+        WHY the cap is clamped, not propagated: after the total was shrunk
+        below the borrowed count, returning a token is a legal return of an
+        over-budget borrow — the token is absorbed (value stays at max)
+        instead of raising, so the accounting ``avail + borrowed == total``
+        converges back to the real state (R5 修订 D).
+        """
+        with self._total_lock:
+            if self._borrowed <= 0:
+                raise ValueError("CapacityLimiter released too many times")
+            with self._semaphore._lock:
+                if self._semaphore._waiters:
+                    loop, event = self._semaphore._waiters.popleft()
+                    loop.call_soon_threadsafe(event.set)
+                elif self._semaphore._value < self._semaphore._max_value:
+                    self._semaphore._value += 1
+                # else: over-budget return — absorbed; value stays at max
+            self._borrowed -= 1
 
     async def __aenter__(self) -> Self:
         await self.acquire()

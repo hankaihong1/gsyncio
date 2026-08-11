@@ -335,3 +335,57 @@ async def test_cancel_all_concurrent_start_soon() -> None:
     tg.cancel_all()
     handles = list(tg._children)
     await asyncio.gather(*(h._task for h in handles), return_exceptions=True)
+
+
+# ── U4 FIX-20: exit guard + re-entry cleanup ───────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_start_soon_after_exit_raises() -> None:
+    """R3-FIX-20 (probe R3-C): start_soon() after the group exited must raise
+    instead of silently spawning an orphan task that nobody waits for —
+    and the orphan must be cancelled, not left running."""
+    tg = TaskGroup()
+    async with tg:
+        pass
+    with pytest.raises(RuntimeError, match="not active"):
+        tg.start_soon(_worker, "x")
+    await asyncio.sleep(0.01)
+    assert not tg._children
+
+
+@pytest.mark.asyncio
+async def test_reenter_after_body_exception_clean() -> None:
+    """R5 修订 C: re-entering after a body-exception exit must start a fresh
+    lifecycle — the old children (pre-cancelled by __aexit__) must not be
+    re-collected, or their stale CancelledError resurfaces on the second
+    exit (probe R5: the body-exception path leaves the scope uncancelled,
+    so re-entry was admitted and then re-raised the stale error)."""
+    tg = TaskGroup()
+
+    async def boom() -> None:
+        await asyncio.sleep(0.01)
+        raise KeyError("child")
+
+    with pytest.raises(KeyError, match="body"):
+        async with tg:
+            tg.start_soon(boom)
+            raise KeyError("body")  # body fails first → pre-cancel path
+
+    # Pre-fix: the second exit re-collected the cancelled child and raised
+    # a stale CancelledError here.  Fixed: fresh lifecycle, clean exit.
+    async with tg:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_reenter_after_normal_exit_ok() -> None:
+    """FIX-20: normal exit → re-enter is a fresh lifecycle (children cleared,
+    start_soon works again)."""
+    tg = TaskGroup()
+    async with tg:
+        h = tg.start_soon(_worker, "a")
+        assert await h == "a"
+    async with tg:
+        h = tg.start_soon(_worker, "b")
+        assert await h == "b"

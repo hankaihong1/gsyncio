@@ -110,8 +110,18 @@ class _BaseChannel:  # pyright: ignore[reportUnusedClass]
         should try_recv immediately) — checking under ``_lock`` closes the
         lost-wakeup window: a send that lands between the qsize check and the
         registration would otherwise wake nobody.
+
+        Raises :class:`ChannelClosedError` when the channel is closed AND
+        empty: such a channel can never become ready, so a select waiting on
+        it alone would hang forever (R3 FIX-19).  The check runs under
+        ``_lock``, so the close-vs-register race is resolved either way: a
+        close that lands after registration wakes the notifier (see
+        ``_close_waiters``), and a close that lands before it is observed
+        here.
         """
         with self._lock:
+            if self.is_closed and self.qsize() == 0:
+                raise ChannelClosedError(_CHANNEL_CLOSED_MSG)
             if self.qsize() > 0:
                 return None
             event = asyncio.Event()
@@ -162,6 +172,11 @@ class _BaseChannel:  # pyright: ignore[reportUnusedClass]
 
     def qsize(self) -> int:
         """Number of items currently buffered."""
+        raise NotImplementedError
+
+    @property
+    def is_closed(self) -> bool:
+        """Whether the channel is closed (implemented by subclasses)."""
         raise NotImplementedError
 
     def _close_waiters(self) -> None:
