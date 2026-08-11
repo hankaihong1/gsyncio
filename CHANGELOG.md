@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-08-11
+
+### Fixed
+- **Concurrency audit (U1–U8)**: `CancelScope` aenter rollback, expired-
+  deadline triage (`fail_after(0)` → `TimeoutError`, `move_on_after(0)`
+  silent), NaN deadline rejection, and shield cancellation-count
+  restoration on aenter-raise paths.
+- **`Lock`/`Semaphore`/`CapacityLimiter`**: same-task re-entrant acquire
+  raises `RuntimeError` (asyncio parity); `Semaphore.release()` beyond
+  `max_value` raises `ValueError`; `Semaphore(0)` is legal; the limiter
+  tracks borrows independently (`available + borrowed == total` survives
+  resizes); `max_value` reads are locked.
+- **`AsyncRWMutex`**: release paths run under a cancellation shield;
+  reader→writer / writer→reader / writer→writer nesting raises
+  `RuntimeError` (depth-counted reader registration).
+- **`TaskGroup`**: `start_soon()`/`start()` after exit raise `RuntimeError`
+  (orphan task is cancelled); re-entry clears stale children so a
+  body-exception exit cannot resurface old `CancelledError`s.
+- **`select_channel`**: raises `ChannelClosedError` when **all** channels
+  are closed and empty (was: hang forever); closed channels with buffered
+  data still report ready; partially closed selects keep waiting.
+- **`EventLoopThreadPool.abort()`**: completes every outstanding future
+  (was: up to thousands hung); delivery unified through a race-safe
+  wrapper; caller `contextvars` now propagate to worker tasks.
+- **`AsyncContext`**: finished submissions are dropped from the tracking
+  set (done-callback).
+- **`ConnectionPinningServer`**: `start()` is idempotent; handler
+  exceptions are consumed (no "exception was never retrieved" noise).
+- **Docs**: EN/ZH synced for closed-channel semantics, barrier
+  cancellation caveat, O(n²) cancellation-storm limitation, diagnostic
+  property semantics, `AsyncOnce` recursion deadlock, and
+  `AsyncWaitGroup` cancellation entries.
+
 ## [0.1.1] - 2026-08-10
 
 ### Added
