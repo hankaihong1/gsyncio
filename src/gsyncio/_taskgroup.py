@@ -36,14 +36,18 @@ class TaskStatus:
     """Status tracker used with :meth:`TaskGroup.start`.
 
     Call :meth:`started` once the spawned coroutine has initialised so that
-    :meth:`TaskGroup.start` can return the handle.
+    :meth:`TaskGroup.start` can return the handle.  A child that exits
+    without calling :meth:`started` makes :meth:`TaskGroup.start` raise
+    :class:`RuntimeError` (trio/anyio parity).
     """
 
     def __init__(self) -> None:
         self._started: asyncio.Event = asyncio.Event()
+        self._called = False
 
     def started(self) -> None:
         """Mark the task as started, unblocking :meth:`TaskGroup.start`."""
+        self._called = True
         self._started.set()
 
 
@@ -395,6 +399,13 @@ class TaskGroup:
                     sibling.cancel()
                 if exc is not None:
                     raise exc
+            elif task.done() and not task_status._called:
+                # WHY: the child finished without ever calling started() — a
+                # silently returned handle to a dead task hides the protocol
+                # violation (trio/anyio raise RuntimeError here).  No
+                # _consumed entry needed: the task has no exception, so
+                # _wait_children skips it (task_exc is None -> continue).
+                raise RuntimeError("Child exited without calling task_status.started()")
         return handle
 
     def cancel_all(self) -> None:

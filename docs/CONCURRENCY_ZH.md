@@ -93,10 +93,8 @@ lock in FastChannel"。
 卡死在清理路径，锁泄漏。
 **根因**：Python 的取消是"每次 await 都会重抛"的，清理代码里的 await
 不能执行。
-**正确姿势**：清理路径用 `CancelScope(shield=True)` 包住重获取，把父作用域
-注入的取消计数清零，等锁拿回后再让取消生效。
-**例证**：`Condition.wait()` 的取消分支（`_sync.py:493-500`）；shield 的
-snapshot/restore 实现（`_cancel.py:141-146, 184-189`）。
+**正确姿势**：用"取消重试循环"重获取锁——`asyncio.Condition.wait` 的官方模式（bpo-34094 家族）：吞掉每次重获取尝试抛出的 `CancelledError` 并重试，直到锁拿回，再重抛取消。每次被吞的取消都会让 `Lock` 保持干净（其取消路径会清理 waiter 条目），所以重试是安全的——而且能扛住重获取期间*反复*到达的取消。`CancelScope(shield=True)` 做不到这一点：它是快照/恢复式，只吸收*进入前*已注入的取消；屏蔽期间到达的取消会打断 body 的 await。
+**例证**：`Condition._reacquire_lock`（`_sync.py:718-738`）；`AsyncRWMutex` 的 reader/writer 释放路径（`rwlock.py:78-111, 153-175`）。
 
 ### 模式 4：通知与等待的锁不一致
 

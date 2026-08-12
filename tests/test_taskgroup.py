@@ -418,3 +418,15 @@ async def test_start_child_failure_reported_once() -> None:
         async with TaskGroup() as tg:
             await asyncio.wait_for(tg.start(_child_fails_before_started), timeout=2.0)
     assert not isinstance(excinfo.value, BaseExceptionGroup)
+
+
+@pytest.mark.asyncio
+async def test_start_child_exits_without_started_raises() -> None:
+    """子任务未调用 started() 即正常退出 → RuntimeError（对齐 trio/anyio）。"""
+
+    async def no_started(task_status: TaskStatus) -> None:
+        return None
+
+    with pytest.raises(RuntimeError, match="started"):
+        async with TaskGroup() as tg:
+            await tg.start(no_started)

@@ -316,3 +316,44 @@ async def test_condition_barrier_combined():
     t2 = asyncio.create_task(consumer())
     await asyncio.wait_for(asyncio.gather(t1, t2), timeout=5)
     assert shared == [42]
+
+
+@pytest.mark.asyncio
+async def test_condition_wait_reacquires_lock_through_cancellation():
+    """取消重试循环契约：重获锁期间到达的取消不得中断重获。
+
+    Pre-fix 行为（F-0 穿透）：第二次取消穿透 snapshot/restore shield，
+    wait() 未重获锁即抛 CE，调用方 __aexit__ 的 release() 抛 RuntimeError
+    掩盖 CE —— 断言任务以 CancelledError 结束将失败。
+    """
+    lock = Lock()
+    cond = Condition(lock)
+    holder_gate = asyncio.Event()
+    holder_done = asyncio.Event()
+
+    async def holder() -> None:
+        await cond.acquire()
+        holder_gate.set()
+        await holder_done.wait()
+        cond.release()
+
+    async def waiter() -> None:
+        await cond.acquire()
+        try:
+            await cond.wait()
+        finally:
+            cond.release()
+
+    w = asyncio.create_task(waiter())
+    await wait_all_tasks_blocked()  # waiter 已 acquire 并 park 在 cond.wait()（锁已释放）
+    h = asyncio.create_task(holder())
+    await holder_gate.wait()  # holder 持锁
+    w.cancel()  # 取消 #1：waiter 进入重获锁路径
+    await wait_all_tasks_blocked()  # 重获尝试已阻塞在 Lock 等待队列（holder 持锁）
+    assert len(lock._waiters) == 1  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType, reportUnknownArgumentType]
+    w.cancel()  # 取消 #2：在重获锁阻塞窗口内到达
+    holder_done.set()
+    await h
+    with pytest.raises(asyncio.CancelledError):
+        await w
+    assert not lock.locked  # 锁已由 waiter 的 finally 正确释放

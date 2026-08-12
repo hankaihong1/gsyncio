@@ -105,12 +105,18 @@ the cleanup path immediately re-raises `CancelledError`; the lock is never
 taken back → the task is stuck in cleanup and the lock leaks.
 **Root cause**: Python cancellation re-raises at every `await`, so cleanup
 code cannot `await`.
-**Correct approach**: wrap the re-acquisition in
-`CancelScope(shield=True)` — clear the injected cancellation count, take the
-lock, then let cancellation fire.
-**Examples**: the cancellation branch of `Condition.wait()`
-(`_sync.py:493-500`); the shield snapshot/restore implementation
-(`_cancel.py:141-146, 184-189`).
+**Correct approach**: retry-loop re-acquisition — the canonical
+`asyncio.Condition.wait` pattern (bpo-34094 family): swallow
+`CancelledError` from each re-acquire attempt and retry until the lock is
+held, then re-raise the cancellation.  Each swallowed cancellation leaves
+`Lock` clean (its cancel path discards the waiter entry), so retrying is
+safe — and it survives *repeated* cancels during the re-acquisition, which a
+`CancelScope(shield=True)` wrapper cannot do: that shield is
+snapshot/restore only and absorbs just the cancellations already injected
+*before* entry; a cancel delivered while inside the shield interrupts the
+body's await.
+**Examples**: `Condition._reacquire_lock` (`_sync.py:718-738`); the
+`AsyncRWMutex` reader/writer release paths (`rwlock.py:78-111, 153-175`).
 
 ### Pattern 4: notify/wait lock mismatch
 

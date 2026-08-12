@@ -60,8 +60,13 @@ async def test_nested_respects_parent() -> None:
 @pytest.mark.asyncio
 async def test_fail_after_timeout() -> None:
     """fail_after(0.001) raises TimeoutError (gsyncio.TimeoutError)."""
+    # Bind the scope BEFORE the with: on a slow loop the 1ms deadline can
+    # expire between creation and entry, and __aenter__ then raises
+    # TimeoutError directly — `as scope` would never bind (UnboundLocalError
+    # under --count=50 stress).
+    scope = fail_after(0.001)
     with pytest.raises(TimeoutError):
-        async with fail_after(0.001) as scope:
+        async with scope:
             await asyncio.sleep(0.1)
     assert scope.cancel_called
 
@@ -323,6 +328,40 @@ async def test_async_context_cross_thread_cancellation():
             await fut
 
 
+@pytest.mark.asyncio
+async def test_async_context_cancel_survives_dead_loop() -> None:
+    """cancel() 级联遇到死 loop 必须跳过并继续，不得中断（R5 FIX-E 补齐）。
+
+    Pre-fix：context.py 的 futures 循环没有 per-call RuntimeError 防护，
+    一个死 loop 使 cancel() 直接抛 RuntimeError，后续 future 永不取消。
+    """
+    ctx = AsyncContext()
+    loop = asyncio.get_running_loop()
+    fut1 = loop.create_future()
+    fut2 = loop.create_future()
+    ctx._futures[fut1] = loop  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType]
+    ctx._futures[fut2] = loop  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType]
+
+    orig = loop.call_soon_threadsafe
+    raised = False
+
+    def exploding(cb, *args):  # type: ignore[no-untyped-def]  # noqa: ANN001, ANN002
+        nonlocal raised
+        if not raised:
+            raised = True
+            raise RuntimeError("Event loop is closed")
+        return orig(cb, *args)
+
+    loop.call_soon_threadsafe = exploding  # type: ignore[method-assign]
+    try:
+        ctx.cancel()
+    finally:
+        loop.call_soon_threadsafe = orig  # type: ignore[method-assign]
+    assert raised
+    await asyncio.sleep(0)  # 让调度出去的 fut2.cancel 回调执行
+    assert fut2.cancelled(), "级联必须在死 loop 之后继续, fut2 仍应被取消"
+
+
 # ---------------------------------------------------------------------------
 # FIX-1 regression tests (BUG-1/5: cancellation-count leaks & swallowed
 # external cancels) — 2026-08-10 audit
@@ -570,3 +609,77 @@ async def test_shield_expired_deadline_restores_cancel_count() -> None:
     task.uncancel()
     task.uncancel()
     assert task.cancelling() == 0
+
+
+@pytest.mark.asyncio
+async def test_precancelled_fail_after_raises_timeout() -> None:
+    """预取消的 fail_after 必须在入口转 TimeoutError（对齐 anyio）。"""
+    scope = fail_after(60)
+    scope.cancel()
+    with pytest.raises(TimeoutError):
+        async with scope:
+            await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_precancelled_move_on_swallows() -> None:
+    """预取消的 move_on 必须静默吞掉（对齐 anyio），cancelled_caught=True。"""
+    scope = move_on_after(60)
+    scope.cancel()
+    async with scope:
+        await asyncio.sleep(0)
+    assert scope.cancelled_caught
+
+
+@pytest.mark.asyncio
+async def test_precancelled_move_on_await_free_body() -> None:
+    """预取消 move_on + 无 await body：注入计数由 __aexit__ 补偿，不泄漏。"""
+    scope = move_on_after(60)
+    scope.cancel()
+    async with scope:
+        pass
+    task = asyncio.current_task()
+    assert task is not None
+    assert task.cancelling() == 0
+
+
+@pytest.mark.asyncio
+async def test_precancelled_plain_scope_raises_cancelled() -> None:
+    """预取消的普通 scope 入口抛 CancelledError（现状保持）。"""
+    scope = CancelScope()
+    scope.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        async with scope:
+            await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_inherited_cancel_not_converted() -> None:
+    """祖先取消不被 fail_after 转换（只处理自己的取消，trio 语义）。"""
+    outer = CancelScope()
+    async with outer:
+        outer.cancel()
+        scope = fail_after(60)
+        with pytest.raises(asyncio.CancelledError):
+            async with scope:
+                await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_precancelled_move_on_body_raises_no_count_leak() -> None:
+    """N1: 预取消 move_on + body 同步抛非 CE 异常 → 注入计数必须被补偿。
+
+    Pre-fix：__aexit__ 的补偿分支只处理 exc_type is None，body 抛 ValueError
+    时注入的计数 1 泄漏，下一个 await 抛 spurious CancelledError。
+    """
+    scope = move_on_after(60)
+    scope.cancel()
+    try:
+        async with scope:
+            raise ValueError("boom")  # 同步抛，无 await
+    except ValueError:
+        pass
+    task = asyncio.current_task()
+    assert task is not None
+    assert task.cancelling() == 0
+    await asyncio.sleep(0)  # 下一个 await 不得抛 spurious CE

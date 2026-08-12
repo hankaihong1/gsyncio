@@ -102,7 +102,14 @@ class AsyncContext:
                 if not fut_res.done():
                     fut_loop = fut_res.get_loop()
                     if fut_loop and fut_loop.is_running():
-                        fut_loop.call_soon_threadsafe(fut_res.cancel)
+                        try:
+                            fut_loop.call_soon_threadsafe(fut_res.cancel)
+                        except RuntimeError:
+                            # WHY: the future's loop closed between the
+                            # snapshot and the wakeup — the future is gone
+                            # with it; skip instead of surfacing a spurious
+                            # error to the submitter (R5 FIX-E pattern).
+                            pass
                     else:
                         fut_res.cancel()
             else:
@@ -146,6 +153,14 @@ class AsyncContext:
         for fut, loop in futures:
             if not fut.done():
                 if loop and loop.is_running():
-                    loop.call_soon_threadsafe(fut.cancel)
+                    try:
+                        loop.call_soon_threadsafe(fut.cancel)
+                    except RuntimeError:
+                        # WHY: the future's loop closed between the snapshot
+                        # and the wakeup — the future is gone with it; skip
+                        # it instead of aborting the whole cascade, which
+                        # would leave the remaining futures and children
+                        # uncancelled (R5 FIX-E pattern).
+                        pass
                 else:
                     fut.cancel()
