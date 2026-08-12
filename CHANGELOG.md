@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-08-12
+
+### Fixed
+- **`CancelScope`**: the scope's own injected cancellation is now consumed on
+  exit even when the body caught the `CancelledError` (or the injection was
+  never delivered) — a leaked `cancelling()` count was snapshotted by an
+  enclosing shield as a real cancellation and re-injected, raising a spurious
+  `CancelledError` in unrelated code (anyio `_pending_uncancellations`
+  parity). Injection accounting (`_injected`, under `_cancel_lock`) ensures
+  the exit compensation only consumes injections that actually happened, and
+  is reset on re-entry.
+- **`checkpoint()`**: the raise now consumes the task's pending cancellation
+  count, making it the single delivery — previously the pending `_must_cancel`
+  fired a second `CancelledError` at the next real await (double delivery).
+- **`AsyncOnce`**: a cancelled leader re-raises `CancelledError` itself, but
+  followers and later callers now receive `RuntimeError("AsyncOnce execution
+  was cancelled")` (chained via `__cause__`) instead of the stored
+  `CancelledError` — raising a user-level `CancelledError` in an unrelated
+  task silently marked that task as cancelled.
+
+### Changed
+- Code comments across `src/`, `tests/`, `examples/`, and `benchmarks/` are
+  now English-only (no mixed-language comments).
+
+### Docs
+- `docs/API.md` (+ ZH mirror): `checkpoint()` single-delivery semantics,
+  `CancelScope` exit consumption of its own injection, `AsyncOnce`
+  cancelled-leader failure semantics.
+
 ## [0.1.2] - 2026-08-11
 
 ### Fixed

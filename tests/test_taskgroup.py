@@ -356,7 +356,7 @@ async def test_start_soon_after_exit_raises() -> None:
 
 @pytest.mark.asyncio
 async def test_reenter_after_body_exception_clean() -> None:
-    """R5 修订 C: re-entering after a body-exception exit must start a fresh
+    """R5 revision C: re-entering after a body-exception exit must start a fresh
     lifecycle — the old children (pre-cancelled by __aexit__) must not be
     re-collected, or their stale CancelledError resurfaces on the second
     exit (probe R5: the body-exception path leaves the scope uncancelled,
@@ -422,7 +422,8 @@ async def test_start_child_failure_reported_once() -> None:
 
 @pytest.mark.asyncio
 async def test_start_child_exits_without_started_raises() -> None:
-    """子任务未调用 started() 即正常退出 → RuntimeError（对齐 trio/anyio）。"""
+    """A child that exits normally without calling started() raises
+    RuntimeError (trio/anyio parity)."""
 
     async def no_started(task_status: TaskStatus) -> None:
         return None

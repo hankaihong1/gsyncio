@@ -37,7 +37,7 @@ def _safe_complete(
     ThreadPoolClosedError.  The guard lives INSIDE the scheduled callback
     (same shape as ``_channel_base._set_soon``), so an InvalidStateError from
     a lost race is contained instead of surfacing in the loop exception
-    handler (R2 FIX-13 修订 B).  If the caller loop is already closed, fall
+    handler (R2 FIX-13 revision B).  If the caller loop is already closed, fall
     back to completing the future directly — nobody can be consuming it, so
     there is no concurrent reader to race (TS-12 pattern).
     """
@@ -496,7 +496,7 @@ class EventLoopThreadPool:
 
         # Complete every future that never ran.  Delivery goes through the
         # same safe wrapper as the worker path, so a worker that did finish
-        # just before the abort wins the race cleanly (修订 B).
+        # just before the abort wins the race cleanly (revision B).
         abort_exc = ThreadPoolClosedError("Pool aborted")
         for fut in outstanding:
             if not fut.done():

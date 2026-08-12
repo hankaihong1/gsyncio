@@ -270,7 +270,7 @@ async def test_limiter_shrink_below_borrowed_accounting():
 
 @pytest.mark.asyncio
 async def test_limiter_regrow_after_shrink():
-    """R5 修订 D: regrowing after a shrink must not trip the bounded release —
+    """R5 revision D: regrowing after a shrink must not trip the bounded release —
     the setter must update the semaphore max_value BEFORE releasing tokens."""
     limiter = CapacityLimiter(5)
     for _ in range(3):
@@ -286,7 +286,7 @@ async def test_limiter_regrow_after_shrink():
 
 
 def test_limiter_overrelease_keeps_borrowed():
-    """R5 修订 D: a failing (over-)release must not half-update the borrowed
+    """R5 revision D: a failing (over-)release must not half-update the borrowed
     count (release first, then bookkeeping, in one _total_lock region)."""
     limiter = CapacityLimiter(1)
     with pytest.raises(ValueError):

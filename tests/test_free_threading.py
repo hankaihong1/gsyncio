@@ -18,10 +18,11 @@ import pytest
 
 free_threaded = hasattr(sys, "_is_gil_enabled") and sys._is_gil_enabled() is False
 
-# 注意：pyproject.toml 的 markers 定义了 free_threading 标记，这里把它和
-# skipif 一起挂到 pytestmark 上——这样 -m "not free_threading" 可以整体
-# deselection 本文件（GIL 版解释器下本文件本来就因 skipif 全跳，deselect
-# 只对需要区分 free_threading 场景的 CI 矩阵有意义）。
+# Note: pyproject.toml's markers define the free_threading marker; it is
+# attached to pytestmark together with skipif so that `-m "not free_threading"`
+# deselects this whole file (under a GIL build the file is skipped anyway via
+# skipif; the deselection only matters for CI matrices that distinguish
+# free-threading scenarios).
 pytestmark = [
     pytest.mark.skipif(not free_threaded, reason="requires Python 3.14t (free-threaded) build"),
     pytest.mark.free_threading,
@@ -49,9 +50,10 @@ async def test_cancel_scope_cross_thread_stress():
     mutex = threading.Lock()
 
     async def worker():
-        # WHY: 不能在这里捕获 CancelledError。scope.cancel() 注入的取消必须
-        # 穿透到 task 本身，否则 worker 正常完成、await task 永不 raise，
-        # 与下方 pytest.raises(CancelledError) 断言自相矛盾。
+        # WHY: do NOT catch CancelledError here.  The cancellation injected by
+        # scope.cancel() must penetrate to the task itself; otherwise the
+        # worker completes normally, `await task` never raises, and the
+        # pytest.raises(CancelledError) assertion below contradicts itself.
         async with scope:
             await asyncio.sleep(5)
 
@@ -108,10 +110,11 @@ async def test_capacity_limiter_concurrent_mutations():
             for i in range(200):
                 new_total = float(50 + ((i + seed) % 50))
                 limiter.total_tokens = new_total
-                # snapshot() 在单次 _total_lock 内读齐三个值——分开读三个
-                # property 的话，另一线程在两次读之间改 total_tokens 会把
-                # 基于不同 total 的值混在一起，不变量必然被"破坏"（这是
-                # 跨锁区快照不一致，不是数据竞态）。
+                # snapshot() reads all three values under a single
+                # _total_lock acquisition — reading the three properties
+                # separately lets another thread change total_tokens between
+                # two reads, mixing values computed against different totals
+                # (cross-lock-region snapshot inconsistency, not a data race).
                 total, avail, borrowed = limiter.snapshot()
                 # Invariant: available + borrowed ≈ total
                 if not (abs((avail + borrowed) - total) < 1.0):

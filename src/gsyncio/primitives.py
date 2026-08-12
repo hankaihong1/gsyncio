@@ -502,7 +502,20 @@ class AsyncOnce:
                 res = await res
             self._result = res
         except BaseException as e:
-            self._exc = e
+            if isinstance(e, asyncio.CancelledError):
+                # R7-D: a cancelled leader is not a function failure — convert
+                # the CancelledError at the boundary into a stable exception.
+                # Storing the CE in _exc would make later unrelated callers
+                # raise it (this file, :474), and a user-level CancelledError
+                # marks its task as cancelled (probe R7-BD).  The leader itself
+                # still re-raises the original CE; followers and new callers
+                # get a RuntimeError.  Note: `RuntimeError(...) from e` is a
+                # SyntaxError in assignment context (`from` is only valid in
+                # raise statements) — keep the chain via __cause__.
+                self._exc = RuntimeError("AsyncOnce execution was cancelled")
+                self._exc.__cause__ = e
+            else:
+                self._exc = e
             raise
         finally:
             with self._thread_lock:

@@ -320,11 +320,13 @@ async def test_condition_barrier_combined():
 
 @pytest.mark.asyncio
 async def test_condition_wait_reacquires_lock_through_cancellation():
-    """取消重试循环契约：重获锁期间到达的取消不得中断重获。
+    """Cancel-retry-loop contract: a cancellation arriving while re-acquiring
+    the lock must not abort the re-acquisition.
 
-    Pre-fix 行为（F-0 穿透）：第二次取消穿透 snapshot/restore shield，
-    wait() 未重获锁即抛 CE，调用方 __aexit__ 的 release() 抛 RuntimeError
-    掩盖 CE —— 断言任务以 CancelledError 结束将失败。
+    Pre-fix behavior (F-0 penetration): the second cancel pierced the
+    snapshot/restore shield, wait() raised CE without re-acquiring the lock,
+    and the caller's __aexit__ release() raised RuntimeError masking the CE —
+    asserting the task ends with CancelledError would fail.
     """
     lock = Lock()
     cond = Condition(lock)
@@ -345,15 +347,15 @@ async def test_condition_wait_reacquires_lock_through_cancellation():
             cond.release()
 
     w = asyncio.create_task(waiter())
-    await wait_all_tasks_blocked()  # waiter 已 acquire 并 park 在 cond.wait()（锁已释放）
+    await wait_all_tasks_blocked()  # waiter acquired and parked in cond.wait() (lock released)
     h = asyncio.create_task(holder())
-    await holder_gate.wait()  # holder 持锁
-    w.cancel()  # 取消 #1：waiter 进入重获锁路径
-    await wait_all_tasks_blocked()  # 重获尝试已阻塞在 Lock 等待队列（holder 持锁）
+    await holder_gate.wait()  # holder holds the lock
+    w.cancel()  # cancel #1: the waiter enters the re-acquire path
+    await wait_all_tasks_blocked()  # re-acquire blocked on the Lock queue (holder holds it)
     assert len(lock._waiters) == 1  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType, reportUnknownArgumentType]
-    w.cancel()  # 取消 #2：在重获锁阻塞窗口内到达
+    w.cancel()  # cancel #2: arrives inside the blocked re-acquire window
     holder_done.set()
     await h
     with pytest.raises(asyncio.CancelledError):
         await w
-    assert not lock.locked  # 锁已由 waiter 的 finally 正确释放
+    assert not lock.locked  # the waiter's finally released the lock properly

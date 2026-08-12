@@ -57,7 +57,7 @@ from gsyncio.primitives import (
 from gsyncio.rwlock import AsyncRWMutex
 from gsyncio.server import ConnectionPinningServer
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 
 
 async def run_in_pool(coro: Any, *args: Any, num_threads: int = 0, **kwargs: Any) -> Any:
