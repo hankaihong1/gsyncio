@@ -330,10 +330,12 @@ async def test_async_context_cross_thread_cancellation():
 
 @pytest.mark.asyncio
 async def test_async_context_cancel_survives_dead_loop() -> None:
-    """cancel() 级联遇到死 loop 必须跳过并继续，不得中断（R5 FIX-E 补齐）。
+    """A dead loop in the cancel() cascade must be skipped, not abort the
+    whole cascade (R5 FIX-E completion).
 
-    Pre-fix：context.py 的 futures 循环没有 per-call RuntimeError 防护，
-    一个死 loop 使 cancel() 直接抛 RuntimeError，后续 future 永不取消。
+    Pre-fix: context.py's futures loop had no per-call RuntimeError guard,
+    so one dead loop made cancel() raise RuntimeError and later futures were
+    never cancelled.
     """
     ctx = AsyncContext()
     loop = asyncio.get_running_loop()
@@ -358,8 +360,8 @@ async def test_async_context_cancel_survives_dead_loop() -> None:
     finally:
         loop.call_soon_threadsafe = orig  # type: ignore[method-assign]
     assert raised
-    await asyncio.sleep(0)  # 让调度出去的 fut2.cancel 回调执行
-    assert fut2.cancelled(), "级联必须在死 loop 之后继续, fut2 仍应被取消"
+    await asyncio.sleep(0)  # let the scheduled fut2.cancel callback run
+    assert fut2.cancelled(), "cascade must continue after the dead loop; fut2 must still be cancelled"
 
 
 # ---------------------------------------------------------------------------
@@ -613,7 +615,7 @@ async def test_shield_expired_deadline_restores_cancel_count() -> None:
 
 @pytest.mark.asyncio
 async def test_precancelled_fail_after_raises_timeout() -> None:
-    """预取消的 fail_after 必须在入口转 TimeoutError（对齐 anyio）。"""
+    """A pre-cancelled fail_after must convert to TimeoutError at entry (anyio parity)."""
     scope = fail_after(60)
     scope.cancel()
     with pytest.raises(TimeoutError):
@@ -623,7 +625,7 @@ async def test_precancelled_fail_after_raises_timeout() -> None:
 
 @pytest.mark.asyncio
 async def test_precancelled_move_on_swallows() -> None:
-    """预取消的 move_on 必须静默吞掉（对齐 anyio），cancelled_caught=True。"""
+    """A pre-cancelled move_on must swallow silently (anyio parity), cancelled_caught=True."""
     scope = move_on_after(60)
     scope.cancel()
     async with scope:
@@ -633,7 +635,8 @@ async def test_precancelled_move_on_swallows() -> None:
 
 @pytest.mark.asyncio
 async def test_precancelled_move_on_await_free_body() -> None:
-    """预取消 move_on + 无 await body：注入计数由 __aexit__ 补偿，不泄漏。"""
+    """Pre-cancelled move_on with an await-free body: the injection count is
+    compensated by __aexit__, no leak."""
     scope = move_on_after(60)
     scope.cancel()
     async with scope:
@@ -645,7 +648,7 @@ async def test_precancelled_move_on_await_free_body() -> None:
 
 @pytest.mark.asyncio
 async def test_precancelled_plain_scope_raises_cancelled() -> None:
-    """预取消的普通 scope 入口抛 CancelledError（现状保持）。"""
+    """A pre-cancelled plain scope raises CancelledError at entry (status quo)."""
     scope = CancelScope()
     scope.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -655,7 +658,8 @@ async def test_precancelled_plain_scope_raises_cancelled() -> None:
 
 @pytest.mark.asyncio
 async def test_inherited_cancel_not_converted() -> None:
-    """祖先取消不被 fail_after 转换（只处理自己的取消，trio 语义）。"""
+    """Ancestor cancellation is not converted by fail_after (only its own
+    cancel is handled — trio semantics)."""
     outer = CancelScope()
     async with outer:
         outer.cancel()
@@ -667,19 +671,136 @@ async def test_inherited_cancel_not_converted() -> None:
 
 @pytest.mark.asyncio
 async def test_precancelled_move_on_body_raises_no_count_leak() -> None:
-    """N1: 预取消 move_on + body 同步抛非 CE 异常 → 注入计数必须被补偿。
+    """N1: pre-cancelled move_on + body raising a non-CE exception
+    synchronously — the injection count must be compensated.
 
-    Pre-fix：__aexit__ 的补偿分支只处理 exc_type is None，body 抛 ValueError
-    时注入的计数 1 泄漏，下一个 await 抛 spurious CancelledError。
+    Pre-fix: __aexit__'s compensation branch only handled exc_type is None;
+    with the body raising ValueError the injected count 1 leaked and the next
+    await raised a spurious CancelledError.
     """
     scope = move_on_after(60)
     scope.cancel()
     try:
         async with scope:
-            raise ValueError("boom")  # 同步抛，无 await
+            raise ValueError("boom")  # sync raise, no await
     except ValueError:
         pass
     task = asyncio.current_task()
     assert task is not None
     assert task.cancelling() == 0
-    await asyncio.sleep(0)  # 下一个 await 不得抛 spurious CE
+    await asyncio.sleep(0)  # the next await must not raise a spurious CE
+
+
+@pytest.mark.asyncio
+async def test_fail_after_caught_cancel_leaves_zero_count() -> None:
+    """R7-A: a fail_after CE caught inside the body, body exits normally —
+    the count must return to zero.
+
+    Pre-fix: the injected cancel count had no __aexit__ compensation
+    (convert/swallow branches both require the CE in flight), so the residual
+    cancelling()=1 leaked into the outer scope.
+    """
+    task = asyncio.current_task()
+    assert task is not None
+    async with fail_after(0.01):
+        try:
+            await asyncio.sleep(0.05)
+        except asyncio.CancelledError:
+            pass
+    assert task.cancelling() == 0
+    await asyncio.sleep(0.001)  # real future await: no spurious CE allowed
+
+
+@pytest.mark.asyncio
+async def test_plain_scope_caught_cancel_leaves_zero_count() -> None:
+    """R7-A: same scenario for a plain CancelScope (deadline cancel caught,
+    body exits normally)."""
+    task = asyncio.current_task()
+    assert task is not None
+    loop = asyncio.get_running_loop()
+    async with CancelScope(deadline=loop.time() + 0.01):
+        try:
+            await asyncio.sleep(0.05)
+        except asyncio.CancelledError:
+            pass
+    assert task.cancelling() == 0
+
+
+@pytest.mark.asyncio
+async def test_leaked_count_not_amplified_by_shield() -> None:
+    """R7-A real damage: a leaked count must not be snapshotted by a shield
+    and re-injected (probe R7-A2).
+
+    Pre-fix: the residual count was snapshotted by the shield's __aenter__ as
+    a "real cancellation"; on exit _restore_saved_cancel_count re-injected
+    task.cancel(), raising a spurious CancelledError in unrelated code at the
+    first real await after the shield.
+    """
+    task = asyncio.current_task()
+    assert task is not None
+    async with fail_after(0.01):
+        try:
+            await asyncio.sleep(0.05)
+        except asyncio.CancelledError:
+            pass
+    async with CancelScope(shield=True):
+        await asyncio.sleep(0.001)
+    assert task.cancelling() == 0
+    await asyncio.sleep(0.001)  # delivery point of the shield restore: must be clean
+    assert task.cancelling() == 0
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_consumes_pending_cancel() -> None:
+    """R7-B: checkpoint()'s raise must consume the pending count — no double
+    delivery.
+
+    Pre-fix: with the injection pending (sync code section, _must_cancel
+    undelivered), checkpoint()'s user-level raise did not decrement
+    cancelling(); the next real future await delivered a second
+    CancelledError (probe R7-B: DOUBLE-DELIVERY).
+    """
+    task = asyncio.current_task()
+    assert task is not None
+    async with CancelScope() as scope:
+        scope.cancel()  # inject from a sync section: _must_cancel pending
+        try:
+            await checkpoint()
+        except asyncio.CancelledError:
+            pass
+        assert task.cancelling() == 0
+        await asyncio.sleep(0.001)  # real future await: no double delivery
+    assert task.cancelling() == 0
+
+
+@pytest.mark.asyncio
+async def test_scope_reentry_resets_injected_accounting() -> None:
+    """R7-A refinement: re-entering a scope must reset the injection
+    accounting.
+
+    Round 1: normal enter/exit (flag False, no compensation).  Round 2:
+    cancel + catch + normal exit (cancel() re-records, compensation consumes,
+    flag cleared).  Round 3 locks in the existing F-1 semantics: re-entering
+    a cancelled scope raises CancelledError at entry (cancel_called is
+    permanent — same as test_precancelled_plain_scope_raises_cancelled).
+    """
+    task = asyncio.current_task()
+    assert task is not None
+    scope = CancelScope()
+    # Round 1: normal enter/exit
+    async with scope:
+        await asyncio.sleep(0)
+    assert task.cancelling() == 0
+    # Round 2: cancel + catch + normal exit
+    async with scope:
+        scope.cancel()
+        try:
+            await asyncio.sleep(0.001)
+        except asyncio.CancelledError:
+            pass
+    assert task.cancelling() == 0
+    # Round 3: re-entering a cancelled scope = pre-cancelled plain scope ->
+    # entry raises CE (existing semantics)
+    with pytest.raises(asyncio.CancelledError):
+        async with scope:
+            await asyncio.sleep(0)

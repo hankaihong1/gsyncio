@@ -1,6 +1,6 @@
-"""示例 1：Go 风格通道 —— 发送/接收、优雅迭代、select 多路复用。
+"""Example 1: Go-style channels — send/recv, graceful iteration, select multiplexing.
 
-运行: uv run python examples/01_channels_select.py
+Run: uv run python examples/01_channels_select.py
 """
 
 import asyncio
@@ -9,23 +9,24 @@ import gsyncio
 
 
 async def main() -> None:
-    # 1. 基础 send/recv（跨任务安全）
+    # 1. Basic send/recv (safe across tasks)
     ch = gsyncio.FastChannel()
     await ch.send("hello")
     print("recv:", await ch.recv())  # hello
 
-    # 2. async for 优雅迭代：生产者发完调用 close()，迭代自动终止
+    # 2. Graceful iteration via async for: the producer calls close() when
+    #    done and iteration terminates automatically
     ch2 = gsyncio.FastChannel()
 
     async def producer() -> None:
         for i in range(3):
             await ch2.send(i)
-        ch2.close()  # 发送完毕信号
+        ch2.close()  # signal "no more items"
 
     asyncio.create_task(producer())
-    print("迭代:", [item async for item in ch2])  # [0, 1, 2]
+    print("iteration:", [item async for item in ch2])  # [0, 1, 2]
 
-    # 3. select_channel：等待最先就绪的通道（Go select 风格）
+    # 3. select_channel: wait for the first ready channel (Go select style)
     ch3, ch4 = gsyncio.FastChannel(), gsyncio.FastChannel()
 
     async def slow_sender() -> None:
@@ -39,11 +40,12 @@ async def main() -> None:
     asyncio.create_task(slow_sender())
     asyncio.create_task(fast_sender())
     selected_ch, val = await gsyncio.select_channel(ch3, ch4)
-    print("select 胜出:", selected_ch is ch4, val)  # True from ch4
+    print("select winner:", selected_ch is ch4, val)  # True from ch4
 
-    # 4. 非阻塞轮询：default= 参数，没有数据立即返回默认值
+    # 4. Non-blocking polling: with default=, returns the default immediately
+    #    when no channel has data
     ch5 = gsyncio.FastChannel()
-    print("非阻塞:", await gsyncio.select_channel(ch5, default="nothing ready"))
+    print("non-blocking:", await gsyncio.select_channel(ch5, default="nothing ready"))
 
 
 if __name__ == "__main__":

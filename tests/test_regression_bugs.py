@@ -327,7 +327,7 @@ async def test_rwmutex_nesting_rejected():
 
 @pytest.mark.asyncio
 async def test_rwmutex_double_reader_writer_still_rejected():
-    """R5 修订 A: reader depth counting — after the *first* nested reader
+    """R5 revision A: reader depth counting — after the *first* nested reader
     exits (still inside the second), writer() must still be rejected.  A
     plain set would drop the registration on the first exit and let the
     writer hang (pre-fix behavior: no detection at all → hangs)."""

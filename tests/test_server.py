@@ -68,7 +68,7 @@ async def test_server_lifecycle_close():
 
 
 # Define a simple compliant ASGI 3.0 async app (simulating FastAPI/Starlette).
-# WHY: 模块级辅助函数——供下面两个 GsyncioASGIWorker 测试共用。
+# WHY: module-level helper shared by the two GsyncioASGIWorker tests below.
 async def mock_fastapi_app(scope, receive, send):
     if scope["type"] != "http":
         return

@@ -443,6 +443,9 @@ async def checkpoint() -> None
 抛出 `asyncio.CancelledError`。在无法频繁 `await` 的长运行代码中周期性
 调用。
 
+该 raise 会消费任务挂起的取消计数，使其成为*唯一*投递——在
+`checkpoint()` 的 raise 处被捕获的取消绝不会在下一个 await 处二次投递。
+
 ### `fail_after`
 
 ```text
@@ -725,6 +728,10 @@ CancelScope(deadline: float = float("inf"), shield: bool = False)
 - **`shield`** -> `bool`：是否阻止父取消。
 - **`cancel()`**：把 scope 标记为已取消并向宿主任务注入取消。幂等。
 
+退出时 scope 总是消费自己的注入：*在 body 内被捕获*（或从未投递）的取消
+绝不会把计数泄漏到外层作用域——泄漏的计数会被外层 shield 当作真实取消
+快照，并在其退出后重新注入。
+
 #### 上下文管理器
 `async with CancelScope(...) as scope:` 把 scope 压入当前任务的 scope 栈。
 
@@ -865,6 +872,10 @@ Go `sync.Once` 风格的跨事件循环线程单次执行原语。
 once = AsyncOnce()
 res = await once.do(init_function, arg1)
 ```
+
+若执行抛出异常，后续调用者重抛同一异常。若领袖任务被**取消**，领袖重抛
+`CancelledError`，而后续调用者收到 `RuntimeError("AsyncOnce execution was cancelled")`
+——在无关任务中抛出的 `CancelledError` 会静默地把该任务标记为已取消。
 
 ---
 

@@ -374,14 +374,14 @@ class CapacityLimiter:
             # under the semaphore lock — release() checks value against max
             # under that same lock, so it can never observe an intermediate
             # resize state (max lowered, tokens not yet reclaimed) and raise
-            # a false over-release ValueError (R5 FIX-I / 修订 D).
+            # a false over-release ValueError (R5 FIX-I / revision D).
             with self._semaphore._lock:
                 self._semaphore._max_value = new_int
                 diff = new_int - old_int
                 if diff > 0:
                     # WHY: only tokens NOT currently borrowed may become
                     # available — with 3 borrowed, growing 1 → 5 must yield
-                    # exactly 2 available tokens, not diff=4 (R5 修订 D).
+                    # exactly 2 available tokens, not diff=4 (R5 revision D).
                     target_value = max(0, new_int - self._borrowed)
                     while self._semaphore._value < target_value:
                         if self._semaphore._waiters:
@@ -457,7 +457,7 @@ class CapacityLimiter:
         below the borrowed count, returning a token is a legal return of an
         over-budget borrow — the token is absorbed (value stays at max)
         instead of raising, so the accounting ``avail + borrowed == total``
-        converges back to the real state (R5 修订 D).
+        converges back to the real state (R5 revision D).
         """
         with self._total_lock:
             if self._borrowed <= 0:

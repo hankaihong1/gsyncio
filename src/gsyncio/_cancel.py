@@ -60,6 +60,13 @@ class CancelScope:
         self._deadline_handle: asyncio.TimerHandle | None = None
         self._reset_token: contextvars.Token[list[CancelScope]] | None = None
         self._saved_cancel_count = 0
+        # R7-A accounting refinement (anyio `_pending_uncancellations` parity):
+        # cancel() can set cancel_called WITHOUT injecting (task already done /
+        # binding cleared by a racing __aexit__), so the __aexit__ compensation
+        # must uncancel only the injections that actually happened — otherwise
+        # it would consume a residual external/ancestor count.  Read and
+        # written under _cancel_lock (cancel/__aenter__/__aexit__).
+        self._injected = False
 
     # -- inspectable properties ------------------------------------------------
 
@@ -101,6 +108,12 @@ class CancelScope:
             # clearing the binding.
             task = self._task
             loop = self._loop
+            # R7-A injection accounting: decided under the lock from the same
+            # snapshot.  When the task is done or the binding was cleared
+            # (cross-thread race) nothing is injected and nothing is recorded —
+            # the __aexit__ compensation only consumes recorded injections and
+            # can never swallow external/ancestor counts.
+            self._injected = task is not None and not task.done()
 
         if task is not None and not task.done():
             try:
@@ -209,6 +222,11 @@ class CancelScope:
                 )
             self._task = host
             self._loop = asyncio.get_running_loop()
+            # R7-A: re-entry resets the injection accounting — the previous
+            # round's compensation already consumed it (or nothing was
+            # injected); the flag must be clean or a cancel-free round would
+            # spuriously uncancel.
+            self._injected = False
 
         stack = _get_scope_stack()
         stack.append(self)
@@ -286,6 +304,13 @@ class CancelScope:
                 # The binding must survive the rollback — __aexit__ needs it
                 # to uncancel.
                 if host is not None and not host.done():
+                    # R7-A injection accounting: the F-1 pre-cancelled path
+                    # bypasses self.cancel() (idempotent early return) and
+                    # injects directly — record it manually so the __aexit__
+                    # compensation can consume it (otherwise cancel_called is
+                    # True but injected is False and the count leaks again).
+                    with self._cancel_lock:
+                        self._injected = True
                     host.cancel()
                 self._rollback_aenter(clear_binding=False)
                 return self
@@ -315,6 +340,7 @@ class CancelScope:
         # binding is cleared in the finally block below.
         with self._cancel_lock:
             task = self._task
+            injected = self._injected
         try:
             # Pop self from the task-local stack.
             stack = _get_scope_stack()
@@ -381,6 +407,29 @@ class CancelScope:
                 and task is not None
             ):
                 task.uncancel()
+
+            # R7-A (anyio `_pending_uncancellations` parity): the scope's own
+            # injection must be consumed when the body exits without the
+            # scope's CancelledError in flight — a caught or never-delivered
+            # cancellation would otherwise leak its count into outer scopes,
+            # where an enclosing shield snapshots it as a real cancel and
+            # re-injects it on exit (probe R7-A2: spurious CE in unrelated
+            # code), and _wait_children's uncancel accounting would consume
+            # the wrong count.  uncancel() clamps at 0, so this is idempotent
+            # with the three branches above (convert/swallow/N1); the shield
+            # ancestor counts already restored by _restore_saved_cancel_count
+            # are untouched.  The `injected` record guarantees only actual
+            # injections are consumed — cancel() with a cleared binding or a
+            # done host neither injects nor records, so the compensation can
+            # never swallow external or ancestor counts.  The reset below is
+            # a lock-free write: the host is inside its own synchronous
+            # __aexit__ section, so a cross-thread cancel() callback cannot
+            # run until the host yields and cannot rewrite the flag in this
+            # window; __aenter__'s locked reset is the second line of defense
+            # on re-entry.
+            if self.cancel_called and injected and task is not None:
+                task.uncancel()
+                self._injected = False
 
             return None
         finally:
@@ -460,6 +509,18 @@ async def checkpoint() -> None:
         return
     current = stack[-1]
     if current._effectively_cancelled():
+        task = asyncio.current_task()
+        if task is not None:
+            # R7-B: consume the pending injection so this raise IS the single
+            # delivery — a user-level CancelledError raise does not decrement
+            # cancelling() (same reasoning as __aenter__'s consume branch);
+            # without it the pending _must_cancel fires a second CancelledError
+            # at the next real await (probe R7-B: DOUBLE-DELIVERY).  Shielded
+            # scopes never reach this branch (_effectively_cancelled returns
+            # False for them), so a shield-deferred ancestor cancellation is
+            # never consumed here.
+            for _ in range(task.cancelling()):
+                task.uncancel()
         raise asyncio.CancelledError()
 
 

@@ -195,3 +195,59 @@ async def test_waitgroup_cancelled_wait_unregisters() -> None:
     waiters = wg._inner.done()  # returns the handed-over waiter list
     n = len(waiters) if waiters else 0
     assert n == 0, f"{n} stale waiter entries left after cancellation"
+
+
+# ---------------------------------------------------------------------------
+# R7-D: cancelled AsyncOnce leader must not poison later callers with CE
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_once_cancelled_leader_does_not_poison_later_callers() -> None:
+    """R7-D: after the leader is cancelled, a later caller's do() gets a
+    RuntimeError instead of a CancelledError.
+
+    Pre-fix: _exc stored the CancelledError, so an unrelated later caller's
+    do() raised it — a user-level CE marks its task as cancelled (probe R7-BD).
+    """
+    once = AsyncOnce()
+    started = asyncio.Event()
+
+    async def fn() -> None:
+        started.set()
+        await asyncio.sleep(60)
+
+    lt = asyncio.create_task(once.do(fn))
+    await started.wait()
+    await asyncio.sleep(0.01)
+    lt.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await lt  # the leader itself re-raises the original CE (correct)
+
+    ct = asyncio.create_task(once.do(fn))
+    with pytest.raises(RuntimeError, match="cancelled"):
+        await ct
+    assert not ct.cancelled()  # pre-fix: True (CE poisoning)
+
+
+@pytest.mark.asyncio
+async def test_once_cancelled_leader_follower_gets_runtime_error() -> None:
+    """R7-D: a follower waiting alongside the leader gets a RuntimeError
+    instead of a CancelledError."""
+    once = AsyncOnce()
+    started = asyncio.Event()
+
+    async def fn() -> None:
+        started.set()
+        await asyncio.sleep(60)
+
+    lt = asyncio.create_task(once.do(fn))
+    await started.wait()
+    ft = asyncio.create_task(once.do(fn))
+    await asyncio.sleep(0.01)
+    lt.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await lt  # the leader itself re-raises the original CE (correct)
+    with pytest.raises(RuntimeError, match="cancelled"):
+        await ft
+    assert not ft.cancelled()  # pre-fix: True (CE poisoning)

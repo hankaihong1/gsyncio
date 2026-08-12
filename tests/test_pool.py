@@ -631,7 +631,7 @@ async def test_abort_completes_all_futures():
 
 @pytest.mark.asyncio
 async def test_abort_delivery_no_invalid_state(capsys):
-    """R2-FIX-13 修订 B: abort racing a worker's own delivery must not
+    """R2-FIX-13 revision B: abort racing a worker's own delivery must not
     surface InvalidStateError noise (the guard lives inside the scheduled
     callback, like _channel_base._set_soon)."""
     pool = EventLoopThreadPool(num_threads=1)

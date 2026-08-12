@@ -15,7 +15,7 @@ from gsyncio.pool import EventLoopThreadPool
 thread_counter = Counter()
 
 
-# 模拟典型的 FastAPI / Starlette 异步业务接口
+# Simulate a typical FastAPI / Starlette async business endpoint
 async def fastapi_demo_app(scope, receive, send):
     if scope["type"] != "http":
         return
@@ -26,7 +26,7 @@ async def fastapi_demo_app(scope, receive, send):
     thread_counter[threading.current_thread().name] += 1
 
     if path == "/api/compute":
-        # 模拟 FastAPI 中的异步 I/O 挂起与业务数据计算
+        # Simulate async I/O suspension and business data computation in FastAPI
         await asyncio.sleep(0.001)
 
         data = b"fastapi_demo_payload_for_python314t_benchmarks"

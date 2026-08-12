@@ -29,7 +29,7 @@ class AsyncRWMutex:
         # re-enters n times must stay registered until its *outermost* exit.
         # A set drops the registration on the first exit and would let a
         # writer() slip in while the task is still inside an inner reader
-        # (R2 FIX-10 修订 A).
+        # (R2 FIX-10 revision A).
         self._reader_depth: dict[asyncio.Task[Any], int] = {}
         self._writer = False
         self._writer_task: asyncio.Task[Any] | None = None

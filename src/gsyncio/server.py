@@ -129,14 +129,16 @@ class ConnectionPinningServer:
             self._running = True
         self._accept_tasks = []
 
-        # 多 acceptor 共享同一 listener socket（Thundering Herd）：
-        # macOS/Linux 的 Selector 支持多个 loop 对同一 fd 做 read 监听，
-        # accept 竞争由内核裁决（EWOULDBLOCK 重试）。但 Windows 的
-        # Proactor 里一个 socket 只能关联**一个** IOCP（CreateIoCompletionPort
-        # 对已关联句柄是 no-op），第二个 loop 的 AcceptEx 完成通知会投递到
-        # 第一个 loop 的 IOCP——跨线程完成 future 的调度有竞态：连接被 accept
-        # 但 handler 协程可能永不恢复，客户端连接挂起（实测 Windows 上
-        # httpx 请求永久挂起）。所以 Windows 上只启动一个 acceptor。
+        # Multiple acceptors share one listener socket (thundering herd):
+        # macOS/Linux selectors let several loops read-listen on the same fd,
+        # with the kernel arbitrating accept contention (EWOULDBLOCK retries).
+        # Windows Proactor differs: a socket can be associated with only ONE
+        # IOCP (CreateIoCompletionPort is a no-op for an already-associated
+        # handle), so a second loop's AcceptEx completion would be delivered to
+        # the first loop's IOCP — cross-thread completion scheduling races:
+        # the connection is accepted but the handler coroutine may never
+        # resume, hanging the client (verified: httpx requests hang forever on
+        # Windows).  Hence exactly one acceptor on Windows.
         acceptor_count = 1 if sys.platform == "win32" else self.pool.num_threads
         for i in range(acceptor_count):
             fut = asyncio.run_coroutine_threadsafe(

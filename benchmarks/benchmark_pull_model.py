@@ -4,7 +4,7 @@ import time
 from gsyncio import EventLoopThreadPool
 
 
-# 模拟 CPU 计算任务
+# Simulate a CPU-bound computation task
 def cpu_heavy_work(n: int) -> int:
     s = 0
     for i in range(n):
@@ -16,7 +16,7 @@ async def cpu_coro(n: int) -> int:
     return cpu_heavy_work(n)
 
 
-# 批量计算任务 (Chunked Work) - 摊薄跨线程 Future 派发开销
+# Batched work (chunked) — amortizes the cross-thread future dispatch overhead
 async def batched_cpu_coro(batch_size: int, iterations_per_item: int) -> list[int]:
     return [cpu_heavy_work(iterations_per_item) for _ in range(batch_size)]
 
@@ -27,7 +27,7 @@ async def run_benchmark():
     print("==================================================")
 
     # -------------------------------------------------------------
-    # 场景 1: 单任务微粒度派发 (40 个单独 submit 的任务)
+    # Scenario 1: fine-grained single-task dispatch (40 individual submit calls)
     # -------------------------------------------------------------
     num_tasks = 40
     calc_iterations = 2_000_000
@@ -52,13 +52,14 @@ async def run_benchmark():
         )
 
     # -------------------------------------------------------------
-    # 场景 2: 批量粒度派发 (Batched / Chunked Dispatch) - 摊薄跨线程通信开销
+    # Scenario 2: batched dispatch (chunked) — amortizes cross-thread
+    # communication overhead
     # -------------------------------------------------------------
     print("\n📊 Scenario 2: Batched Task Dispatch (4 Batches x 10 Items - Reduced IPC Overhead)")
 
     async with EventLoopThreadPool(num_threads=4) as pool:
         t0 = time.perf_counter()
-        # 派发 4 个 Batch 任务给 4 个 Worker
+        # Dispatch 4 batch tasks to 4 workers
         futs = [pool.submit(batched_cpu_coro, 10, calc_iterations) for _ in range(4)]
         await asyncio.gather(*futs)
         t1 = time.perf_counter()

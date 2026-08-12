@@ -153,7 +153,7 @@ class TaskGroup:
             # clearing is safe — and necessary: on the body-exception path
             # the scope is NOT cancelled (pre-cancel path), so re-entry is
             # admitted and the old cancelled children would be re-collected,
-            # resurfacing their CancelledError as a stale failure (R5 修订 C).
+            # resurfacing their CancelledError as a stale failure (R5 revision C).
             self._children.clear()
             self._consumed.clear()
         await self._cancel_scope.__aenter__()

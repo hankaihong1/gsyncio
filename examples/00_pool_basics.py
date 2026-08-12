@@ -1,6 +1,6 @@
-"""示例 0：线程池基础 —— 提交任务、指定 worker、批量提交、健康指标。
+"""Example 0: thread-pool basics — submitting tasks, pinning workers, health metrics.
 
-运行: uv run python examples/00_pool_basics.py
+Run: uv run python examples/00_pool_basics.py
 """
 
 import asyncio
@@ -9,25 +9,26 @@ import gsyncio
 
 
 async def heavy_task(x: int) -> int:
-    """模拟一个耗时任务：睡 10ms 后返回翻倍结果。"""
+    """Simulate a slow task: sleep 10ms, then return the doubled value."""
     await asyncio.sleep(0.01)
     return x * 2
 
 
 async def main() -> None:
-    # 池是异步上下文管理器：进入时启动 worker 线程，退出时优雅关闭。
+    # The pool is an async context manager: entering starts the worker
+    # threads, exiting shuts them down gracefully.
     async with gsyncio.EventLoopThreadPool(num_threads=4) as pool:
-        # 1. 提交单个任务（全局队列 + 工作窃取）
+        # 1. Submit a single task (global queue + work stealing)
         fut1 = pool.submit(heavy_task, 21)
-        print("单个任务:", await fut1)  # 42
+        print("single task:", await fut1)  # 42
 
-        # 2. 钉到指定 worker（pin_to=0），确定性路由
+        # 2. Pin to a specific worker (pin_to=0) for deterministic routing
         fut2 = pool.submit(heavy_task, 21, pin_to=0)
-        print("钉到 worker 0:", await fut2)  # 42
+        print("pinned to worker 0:", await fut2)  # 42
 
-        # 3. 池健康指标（每个 worker 的活跃/完成计数）
+        # 3. Pool health metrics (per-worker active/completed counters)
         metrics = pool.get_metrics()
-        print("metrics 键:", sorted(metrics.keys()))
+        print("metrics keys:", sorted(metrics.keys()))
 
 
 if __name__ == "__main__":

@@ -424,6 +424,8 @@ async def checkpoint() -> None
 
 Checks for effective cancellation and raises `asyncio.CancelledError` if the current scope, or any unshielded ancestor, has been cancelled. Call periodically inside long-running code that cannot `await` frequently.
 
+The raise consumes the task's pending cancellation count, making it the *single* delivery — a cancellation caught at the `checkpoint()` raise never double-delivers at the next await.
+
 ### `fail_after`
 
 ```text
@@ -679,6 +681,8 @@ CancelScope(deadline: float = float("inf"), shield: bool = False)
 - **`shield`** -> `bool`: Whether the scope blocks parent cancellation.
 - **`cancel()`**: Marks the scope as cancelled and injects cancellation into the hosting task. Idempotent.
 
+On exit the scope always consumes its own injection: a cancellation *caught inside the body* (or never delivered) never leaks its count into outer scopes — leaked counts would be snapshotted by an enclosing shield as real cancellations and re-injected after it exits.
+
 #### Context Manager
 `async with CancelScope(...) as scope:` enters the scope on the current task's scope stack.
 
@@ -818,6 +822,8 @@ Go `sync.Once`-style single execution primitive across multiple event loop threa
 once = AsyncOnce()
 res = await once.do(init_function, arg1)
 ```
+
+If the execution raises, subsequent callers re-raise the same exception. If the leader task is **cancelled**, the leader re-raises `CancelledError` while later callers receive `RuntimeError("AsyncOnce execution was cancelled")` — a `CancelledError` raised in an unrelated task would silently mark that task as cancelled.
 
 ---
 
