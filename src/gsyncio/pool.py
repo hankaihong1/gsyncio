@@ -378,24 +378,6 @@ class EventLoopThreadPool:
             # wakeup (shutdown race) — nothing to wake (FIX-E).
             pass
 
-    def _notify_all_workers(self) -> None:
-        """Trigger instant Pipe/EventFD wakeup across all worker event loops."""
-        with self._lock:
-            if not self._running:
-                return
-            loops = list(self._loops)
-            events = list(self._notify_events)
-
-        for loop, event in zip(loops, events, strict=False):
-
-            def _wake(evt: asyncio.Event = event) -> None:
-                evt.set()
-
-            try:
-                loop.call_soon_threadsafe(_wake)
-            except RuntimeError:
-                pass
-
     async def close(self) -> None:
         """Gracefully stop all event loop threads and join worker threads."""
         with self._lock:
@@ -410,8 +392,6 @@ class EventLoopThreadPool:
 
         if self._native_pool:
             self._native_pool.close()
-
-        self._notify_all_workers()
 
         # Wait for workers to drain remaining buffered tasks and complete
         # them.  Workers pull items from the queue, execute them, then exit
@@ -482,8 +462,6 @@ class EventLoopThreadPool:
 
         if self._native_pool:
             self._native_pool.close()
-
-        self._notify_all_workers()
 
         for loop in loops:
             try:

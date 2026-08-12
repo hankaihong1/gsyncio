@@ -431,3 +431,137 @@ async def test_start_child_exits_without_started_raises() -> None:
     with pytest.raises(RuntimeError, match="started"):
         async with TaskGroup() as tg:
             await tg.start(no_started)
+
+
+# ---------------------------------------------------------------------------
+# R8 Unit 1: cancelled children are not errors (trio/anyio parity)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cancel_all_then_normal_exit_is_silent() -> None:
+    """R8 Unit 1: cancel_all() victims must not be reported at group exit.
+
+    Pre-fix the soft-exit branch raised the victims' CancelledErrors into
+    the host task (probe R8-D): a public-API cancel_all() followed by a
+    normal body exit failed the whole task with a spurious CE group.
+    """
+
+    async def child() -> None:
+        await asyncio.sleep(30)
+
+    async with TaskGroup() as tg:
+        tg.start_soon(child)
+        tg.start_soon(child)
+        await asyncio.sleep(0.05)
+        tg.cancel_all()
+    # No raise: the group exits cleanly.
+
+
+@pytest.mark.asyncio
+async def test_start_failure_siblings_not_reported() -> None:
+    """R8 Unit 1: siblings cancelled by start()'s failure path are silent.
+
+    Pre-fix the sibling's CancelledError was collected (not in
+    cancelled_by_scope) and the group exit raised it via the soft-exit
+    branch while the real ValueError had already been delivered by
+    start() (probe R8-B2)."""
+
+    async def failing_child(task_status: TaskStatus) -> None:
+        task_status.started()
+        raise ValueError("boom after started")
+
+    async def sibling() -> None:
+        await asyncio.sleep(30)
+
+    async with TaskGroup() as tg:
+        tg.start_soon(sibling)
+        with pytest.raises(ValueError, match="boom after started"):
+            await tg.start(failing_child)
+    # No raise at exit.
+
+
+@pytest.mark.asyncio
+async def test_externally_cancelled_child_is_silent() -> None:
+    """R8 Unit 1: a child cancelled by task.cancel() is not an error.
+
+    trio/anyio both absorb externally cancelled children (anyio filters
+    every child CancelledError in task_done); gsyncio previously raised
+    the CE out of the group and spuriously cancelled the host task
+    (probe R8-A)."""
+
+    async def child() -> None:
+        await asyncio.sleep(30)
+
+    async with TaskGroup() as tg:
+        h = tg.start_soon(child)
+        await asyncio.sleep(0.05)
+        h._task.cancel()
+    # No raise: external child cancellation is absorbed.
+
+
+# ---------------------------------------------------------------------------
+# R8 Unit 2: host cancellation waits for children before the group exits
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_host_cancel_waits_for_children_to_finish() -> None:
+    """R8 Unit 2: when the host is cancelled while the group waits, all
+    children must be FINISHED before the block exits (trio/anyio parity).
+
+    Pre-fix the host's except handler ran while the child's finally had
+    not (probe R8-C2: gsyncio False vs anyio True) — the structured-
+    concurrency guarantee was broken on the cancellation path."""
+
+    child_finally_ran = asyncio.Event()
+
+    async def slow_child() -> None:
+        try:
+            await asyncio.sleep(30)
+        finally:
+            child_finally_ran.set()
+
+    saw_flag_inside_except: dict[str, bool] = {}
+
+    async def host() -> None:
+        try:
+            async with TaskGroup() as tg:
+                tg.start_soon(slow_child)
+                await asyncio.sleep(0.05)  # let the child start
+        except BaseException:
+            saw_flag_inside_except["flag"] = child_finally_ran.is_set()
+            raise
+
+    host_task = asyncio.create_task(host())
+    await asyncio.sleep(0.1)  # host is now blocked waiting on the child
+    host_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await host_task
+    assert saw_flag_inside_except["flag"] is True
+    assert child_finally_ran.is_set()
+
+
+# ---------------------------------------------------------------------------
+# R8 Unit 3: children spawned before the first entry stay tracked
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_preexisting_children_tracked_through_first_entry() -> None:
+    """R8 Unit 3: children spawned BEFORE the first entry stay tracked —
+    the group waits for them at exit (probe R8-E: previously the entry
+    cleared _children, silently orphaning the task)."""
+
+    finished = asyncio.Event()
+
+    async def child() -> None:
+        await asyncio.sleep(0.1)
+        finished.set()
+
+    tg = TaskGroup()
+    h = tg.start_soon(child)
+    async with tg:
+        await asyncio.sleep(0.02)
+    assert h._task.done()
+    assert finished.is_set()

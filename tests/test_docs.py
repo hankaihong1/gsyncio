@@ -54,7 +54,9 @@ def test_doc_code_blocks_parse() -> None:
             try:
                 ast.parse(block)
             except SyntaxError as exc:
-                raise AssertionError(f"{name} code block #{i + 1} has a syntax error: {exc}") from exc
+                raise AssertionError(
+                    f"{name} code block #{i + 1} has a syntax error: {exc}"
+                ) from exc
 
 
 def test_examples_parse() -> None:
@@ -98,7 +100,9 @@ def test_api_mirror_symbols_match() -> None:
     """The ### `X` symbol sets of API.md and API_ZH.md must be identical (symbols are not translated)."""
     en = _extract_api_symbols(ROOT / "docs" / "API.md")
     zh = _extract_api_symbols(ROOT / "docs" / "API_ZH.md")
-    assert en == zh, f"API mirror symbol sets differ: only-EN={sorted(en - zh)}, only-ZH={sorted(zh - en)}"
+    assert en == zh, (
+        f"API mirror symbol sets differ: only-EN={sorted(en - zh)}, only-ZH={sorted(zh - en)}"
+    )
 
 
 def test_doc_mirror_headings_count_match() -> None:

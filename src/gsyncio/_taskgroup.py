@@ -147,15 +147,18 @@ class TaskGroup:
         if self._cancel_scope.cancel_called:
             raise RuntimeError("TaskGroup is not reusable after failure")
         with self._children_lock:
+            # WHY: children spawned BEFORE the first entry are part of the
+            # first cycle — clearing them would silently orphan the tasks
+            # (group exit neither waits nor cancels; probe R8-E).  Only
+            # RE-entry starts a fresh lifecycle: the previous run's
+            # children are all finished (__aexit__ waited for them), so
+            # the clear is gated on having exited before (R5 revision C,
+            # refined in R8).
+            was_exited = self._exited
             self._exited = False
-            # WHY: re-entry starts a fresh lifecycle.  The previous run's
-            # children are all finished (__aexit__ waits for them), so
-            # clearing is safe — and necessary: on the body-exception path
-            # the scope is NOT cancelled (pre-cancel path), so re-entry is
-            # admitted and the old cancelled children would be re-collected,
-            # resurfacing their CancelledError as a stale failure (R5 revision C).
-            self._children.clear()
-            self._consumed.clear()
+            if was_exited:
+                self._children.clear()
+                self._consumed.clear()
         await self._cancel_scope.__aenter__()
         return self
 
@@ -206,14 +209,22 @@ class TaskGroup:
             # WHY: the group's host was cancelled WHILE waiting for the
             # children (e.g. Task.cancel() cascades into this group's host
             # through the awaited task's _fut_waiter, as in select_channel's
-            # caller-cancel).  The pre-cancel branch above never ran, so the
-            # children would be orphaned with their registrations still in
-            # place — cancel every remaining child before propagating (R5
-            # FIX-F).
+            # caller-cancel).  The pre-cancel branch above never ran, so
+            # cancel every remaining child — then WAIT for them to finish
+            # before propagating (R8 Unit 2): the structured-concurrency
+            # guarantee must hold on the cancellation path too, and the
+            # R5 FIX-F teardown needs the notifiers fully unwound before
+            # the CE escapes (probe R8-C2: trio/anyio wait, we did not).
             with self._children_lock:
+                # Reject new spawns while we drain: a task spawned from
+                # another thread mid-drain would be missed by the snapshot
+                # below and orphaned.  __aexit__'s finally sets the same
+                # flag — idempotent.
+                self._exited = True
                 remaining = [h._task for h in self._children if not h._task.done()]
             for task in remaining:
                 task.cancel()
+            await self._drain_cancelled_children(remaining)
             raise
 
         # Cancellation wins: never merge CancelledError into the group —
@@ -304,8 +315,19 @@ class TaskGroup:
                             continue
                         exc = task_exc
 
-                    # Was this CancelledError caused by *our* sibling-cancel?
-                    if isinstance(exc, asyncio.CancelledError) and task in cancelled_by_scope:
+                    # A cancelled child is not an error (trio/anyio/stdlib
+                    # asyncio.TaskGroup parity; probes R8-A/D): the soft-exit
+                    # branch below must only see children that RAISED
+                    # CancelledError themselves (select_channel's notifier
+                    # readiness signal).  The discriminator is the pending
+                    # cancel count at death: an injected cancel leaves
+                    # cancelling() > 0 (cancel() on a done task is a no-op,
+                    # and nothing decrements the count when the task dies),
+                    # while a self-raised CancelledError never touched it
+                    # (probe-verified on 3.14t: 1 vs 0).
+                    if isinstance(exc, asyncio.CancelledError) and (
+                        task in cancelled_by_scope or task.cancelling() > 0
+                    ):
                         continue
 
                     exceptions.append(exc)
@@ -330,6 +352,33 @@ class TaskGroup:
                         scope_cancelled = True
 
         return exceptions
+
+    async def _drain_cancelled_children(self, tasks: list[asyncio.Task[Any]]) -> None:
+        """Wait for cancelled children to finish before the group exits.
+
+        The host is being cancelled: the first CancelledError was already
+        delivered inside _wait_children (one-shot _must_cancel), so the
+        next await is not re-interrupted by THAT cancel.  A FURTHER
+        external cancel can land while we wait — each one is swallowed
+        and the loop keeps waiting; the children finish on their own once
+        cancelled (a cancellation-proof child blocks the exit — the same
+        accepted semantics as trio/anyio).  The residual cancelling()
+        count is left untouched: it is native asyncio semantics for a
+        caught external cancel (R7), and consuming it here would risk
+        swallowing a foreign count (R7-A accounting).  The caller
+        re-raises the original exception after this returns.
+        """
+        pending = {t for t in tasks if not t.done()}
+        while pending:
+            try:
+                done, pending = await asyncio.wait(pending)
+            except asyncio.CancelledError:
+                continue
+            # asyncio.wait does not retrieve exceptions — consume them so
+            # a child that failed (rather than being cancelled) never
+            # surfaces as "Task exception was never retrieved" noise.
+            for t in done:
+                _retrieve_task_exception(t)
 
     # -- public API ------------------------------------------------------------
 
