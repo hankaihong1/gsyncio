@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`TaskGroup`**: cancelled children are no longer reported at group exit —
+  an injected cancellation (`cancel_all()`, the `start()` failure path, or an
+  external `task.cancel()`) previously left a `CancelledError` in the
+  soft-exit branch that was raised into the host task, spuriously cancelling
+  it (trio/anyio/stdlib parity; the discriminator is the dead task's
+  `cancelling()` count — 0 for a self-raised `CancelledError`, > 0 for an
+  injected one — so `select_channel`'s notifier readiness signal is
+  unaffected).
+- **`TaskGroup`**: when the host is cancelled while the group waits for its
+  children, the remaining children are now cancelled **and awaited** before
+  the block exits — previously the group returned while a child's `finally`
+  had not yet run (structured-concurrency guarantee restored; anyio parity).
+- **`TaskGroup`**: children spawned before the first entry are now tracked by
+  that entry instead of being silently orphaned when `__aenter__` cleared the
+  child set.
+- **`EventLoopThreadPool`**: removed the dead `_notify_all_workers()` calls
+  from `close()`/`abort()` (they ran after `_running` was cleared and always
+  returned immediately; workers wake via their poll timeout and `loop.stop`).
+
 ## [0.1.3] - 2026-08-12
 
 ### Fixed

@@ -449,36 +449,6 @@ async def test_resolve_target_worker_lock_concurrent():
 
 
 @pytest.mark.asyncio
-async def test_notify_all_workers_toctou():
-    """_notify_all_workers is safe when called concurrently with pool close.
-
-    The method captures loops/events under lock then calls
-    call_soon_threadsafe outside — must not raise AttributeError or
-    crash when close() clears the lists between capture and use.
-    """
-    pool = EventLoopThreadPool(num_threads=2)
-    await pool.start()
-
-    errors: list[Exception] = []
-
-    def hammer_notify() -> None:
-        try:
-            for _ in range(50):
-                pool._notify_all_workers()
-        except Exception as exc:
-            errors.append(exc)
-
-    t = threading.Thread(target=hammer_notify)
-    t.start()
-
-    # Close during hammering — exercises TOCTOU between list copy and loop access.
-    await pool.close()
-    t.join(timeout=5)
-
-    assert len(errors) == 0, f"TOCTOU errors: {errors}"
-
-
-@pytest.mark.asyncio
 async def test_repr_implementations():
     """Verify friendly debug diagnostic output of __repr__ for core classes"""
     async with EventLoopThreadPool(num_threads=2) as pool:

@@ -619,11 +619,11 @@ async with TaskGroup(name=None) as tg:
 # Both tasks are guaranteed finished here.
 ```
 
-- **`start_soon(coro_fn, *args)` -> `TaskHandle`**: Spawns a child task and returns its handle immediately without blocking.
+- **`start_soon(coro_fn, *args)` -> `TaskHandle`**: Spawns a child task and returns its handle immediately without blocking. Children spawned before the group is entered are tracked by the first entry.
   - **Raises**: `RuntimeError` if called after the group has exited (a task spawned then would be an orphan nobody waits for); the orphan is cancelled and its exception consumed.
 - **`start(coro_fn, *args)` -> `TaskHandle`**: Spawns a child task, blocking until it calls `task_status.started()`.
   - **Raises**: `RuntimeError` if called after the group has exited (same orphan guard as `start_soon`), or if the child exits without calling `task_status.started()` (trio/anyio parity — a silent handle to a dead task would hide the protocol violation).
-- **Raises**: Child exceptions are re-raised on exit; multiple failures surface as an `ExceptionGroup`.
+- **Raises**: Child exceptions are re-raised on exit; multiple failures surface as an `ExceptionGroup`. Cancelled children are not reported as errors (trio/anyio parity), and when the host is cancelled while the group waits, all children are guaranteed finished before the block exits.
 
 ### `TaskHandle`
 

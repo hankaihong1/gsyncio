@@ -361,7 +361,9 @@ async def test_async_context_cancel_survives_dead_loop() -> None:
         loop.call_soon_threadsafe = orig  # type: ignore[method-assign]
     assert raised
     await asyncio.sleep(0)  # let the scheduled fut2.cancel callback run
-    assert fut2.cancelled(), "cascade must continue after the dead loop; fut2 must still be cancelled"
+    assert fut2.cancelled(), (
+        "cascade must continue after the dead loop; fut2 must still be cancelled"
+    )
 
 
 # ---------------------------------------------------------------------------
