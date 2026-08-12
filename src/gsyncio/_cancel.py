@@ -28,7 +28,12 @@ class CancelScope:
 
     Each scope lives on a per-task stack managed via :data:`contextvars.ContextVar`.
     Entered scopes track their own cancellation flag, an optional absolute deadline,
-    and a *shield* that blocks parent-scope cancellation from penetrating inward.
+    and a *shield* that snapshots and clears the task's pending cancellation count
+    on entry, restoring it on exit — it absorbs cancellations *already injected*
+    before entry.  A cancellation delivered *while* inside a shielded scope is not
+    deferred (unlike trio/anyio shields): it interrupts the body's next await.  For
+    cleanup that must survive mid-flight cancellation, use a retry loop (see
+    ``Condition._reacquire_lock``) instead of relying on the shield.
 
     Typical use::
 
@@ -233,6 +238,12 @@ class CancelScope:
                 # class: fail_after(0) must raise TimeoutError and
                 # move_on_after(0) must be silent (probe R3-A).
                 if self._convert_to_timeout:
+                    # WHY: the deadline expired without ever running its
+                    # callback — mark the scope cancelled so cancel_called
+                    # reflects the fired deadline (anyio parity), then roll
+                    # back and raise; there is no injection to undo.
+                    with self._cancel_lock:
+                        self._cancel_called = True
                     self._restore_saved_cancel_count()
                     self._rollback_aenter()
                     raise TimeoutError() from None
@@ -245,6 +256,8 @@ class CancelScope:
                     self.cancel()
                     self._rollback_aenter(clear_binding=False)
                     return self
+                with self._cancel_lock:
+                    self._cancel_called = True
                 self._restore_saved_cancel_count()
                 self._rollback_aenter()
                 raise asyncio.CancelledError()
@@ -255,10 +268,37 @@ class CancelScope:
         # surface that cancellation immediately — but undo the stack push and
         # the deadline timer first (see _rollback_aenter).
         if self._effectively_cancelled():
-            # WHY: the shield branch above may already have cleared the task's
-            # pending cancellation (a shielded scope can still be effectively
-            # cancelled by a direct cancel() call) — restore it before the
-            # rollback drops the binding, or __aexit__ never gets to run.
+            # WHY: only the scope's OWN pre-entry cancel is converted or
+            # swallowed — inherited cancellation must pass through untouched
+            # (trio/anyio: fail_after/move_on handle only their own cancel).
+            if self._cancel_called and self._convert_to_timeout:
+                # Mirror the delta <= 0 branch: __aexit__ never runs on an
+                # entry raise, so the deadline conversion happens here.
+                self._restore_saved_cancel_count()
+                self._rollback_aenter()
+                raise TimeoutError() from None
+            if self._cancel_called and self._cancelled_caught:
+                # WHY: move_on semantics — the body's first await raises
+                # CancelledError and __aexit__'s swallow branch uncancels it
+                # (an await-free body is compensated there instead).  Inject
+                # via host.cancel() directly: self.cancel() is an idempotent
+                # early-return once the flag is set, so it would not inject.
+                # The binding must survive the rollback — __aexit__ needs it
+                # to uncancel.
+                if host is not None and not host.done():
+                    host.cancel()
+                self._rollback_aenter(clear_binding=False)
+                return self
+            # WHY: the raise below is a user-level raise — it does NOT
+            # consume the task's pending cancellation count, so an ancestor's
+            # injected cancel would deliver AGAIN at the next await (double
+            # delivery of one cancellation).  Consume the pending count so
+            # this raise IS the single delivery.  A shielded scope skips the
+            # consume: its count was just restored above (the shield-deferred
+            # parent cancellation) and must stay pending to surface.
+            if not self._shield and host is not None:
+                for _ in range(host.cancelling()):
+                    host.uncancel()
             self._restore_saved_cancel_count()
             self._rollback_aenter()
             raise asyncio.CancelledError()
@@ -329,9 +369,13 @@ class CancelScope:
             # move_on with an await-free body: the deadline-expired injection
             # (__aenter__'s delta <= 0 branch) was never delivered by an await,
             # so the swallow branch above did not run — compensate the count
-            # here or it leaks into outer scopes (R3 FIX-18).
+            # here or it leaks into outer scopes (R3 FIX-18).  The same
+            # compensation covers a body that exits with a NON-Cancelled
+            # exception before its first await: the injection is still
+            # undelivered and would otherwise fire a spurious CancelledError
+            # at the next await (N1 — pre-cancelled move_on + sync body raise).
             if (
-                exc_type is None
+                (exc_type is None or not issubclass(exc_type, asyncio.CancelledError))
                 and self._cancelled_caught
                 and self.cancel_called
                 and task is not None

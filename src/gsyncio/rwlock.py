@@ -5,7 +5,6 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from typing import Any
 
-from gsyncio._cancel import CancelScope
 from gsyncio._sync import Condition, Lock
 
 
@@ -77,12 +76,21 @@ class AsyncRWMutex:
             yield
         finally:
             # WHY: the release path re-acquires the inner lock, and a
-            # cancellation delivered on that re-acquire would abort the
-            # cleanup — leaking a reader slot and hanging every queued writer
-            # (R1 probe A).  The shield absorbs any pending cancellation that
-            # entered before the shield; its exit restores the count, so the
-            # cancellation still fires right after the cleanup completes.
-            async with CancelScope(shield=True), self._lock:
+            # cancellation delivered on that re-acquire must not abort the
+            # cleanup — a leaked reader slot hangs every queued writer
+            # forever (R1 probe A).  Retry-loop (asyncio.Condition.wait
+            # pattern): each swallowed CancelledError leaves the inner Lock
+            # clean (its cancel path discards the waiter entry), so the
+            # bookkeeping always runs; the cancellation is re-raised after
+            # it completes.
+            cancelled = False
+            while True:
+                try:
+                    await self._lock.acquire()
+                    break
+                except asyncio.CancelledError:
+                    cancelled = True
+            try:
                 depth = self._reader_depth.get(task, 0)
                 if depth > 0:
                     if depth == 1:
@@ -93,6 +101,10 @@ class AsyncRWMutex:
                             self._write_ok.notify_all()
                     else:
                         self._reader_depth[task] = depth - 1
+            finally:
+                self._lock.release()
+            if cancelled:
+                raise asyncio.CancelledError()
 
     @asynccontextmanager
     async def writer(self) -> AsyncGenerator[None]:
@@ -137,10 +149,17 @@ class AsyncRWMutex:
             # suspenders), but it keeps the invariant local and explicit: a
             # queued writer must never flip _writer while the real holder is
             # still inside its critical section (U3 contract test).  Like
-            # reader(), the release runs under a shield so a pending cancel
-            # cannot interrupt the bookkeeping.
+            # reader(), the release re-acquires with the retry-loop pattern
+            # so a pending cancel cannot interrupt the bookkeeping.
             if acquired:
-                async with CancelScope(shield=True), self._lock:
+                cancelled = False
+                while True:
+                    try:
+                        await self._lock.acquire()
+                        break
+                    except asyncio.CancelledError:
+                        cancelled = True
+                try:
                     self._writer = False
                     self._writer_task = None
                     # If pending writers exist, wake them first (writer priority).
@@ -149,3 +168,7 @@ class AsyncRWMutex:
                         self._write_ok.notify_all()
                     else:
                         self._read_ok.notify_all()
+                finally:
+                    self._lock.release()
+                if cancelled:
+                    raise asyncio.CancelledError()

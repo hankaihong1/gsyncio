@@ -640,16 +640,10 @@ class Condition:
             was_present = self._discard_waiter(event)
             if not was_present:
                 self._forward_notify()
-            from gsyncio._cancel import CancelScope
-
-            async with CancelScope(shield=True):
-                await self._lock.acquire()
+            await self._reacquire_lock()
             raise
         else:
-            from gsyncio._cancel import CancelScope
-
-            async with CancelScope(shield=True):
-                await self._lock.acquire()
+            await self._reacquire_lock()
 
     def notify(self, n: int = 1) -> None:
         """Wake up to *n* waiters (default: 1).
@@ -720,6 +714,27 @@ class Condition:
                     # waiter; the notification dies only when no live waiter
                     # remains (R5 FIX-E).
                     continue
+
+    async def _reacquire_lock(self) -> None:
+        """Re-acquire the underlying lock, retrying through cancellations.
+
+        Canonical ``asyncio.Condition.wait`` pattern (bpo-34094 family): a
+        cancellation delivered while re-acquiring must not abort the
+        re-acquisition — the caller's eventual ``release()`` would then
+        raise on a lock it no longer owns, masking the cancellation.  Each
+        swallowed CancelledError leaves ``Lock`` in a clean state (its
+        cancel path discards the waiter entry), so retrying is safe; the
+        cancellation is re-raised once the lock is held again.
+        """
+        cancelled = False
+        while True:
+            try:
+                await self._lock.acquire()
+                break
+            except asyncio.CancelledError:
+                cancelled = True
+        if cancelled:
+            raise asyncio.CancelledError()
 
 
 # ============================================================================

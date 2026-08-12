@@ -620,7 +620,7 @@ async with TaskGroup(name=None) as tg:
 - **`start_soon(coro_fn, *args)` -> `TaskHandle`**: Spawns a child task and returns its handle immediately without blocking.
   - **Raises**: `RuntimeError` if called after the group has exited (a task spawned then would be an orphan nobody waits for); the orphan is cancelled and its exception consumed.
 - **`start(coro_fn, *args)` -> `TaskHandle`**: Spawns a child task, blocking until it calls `task_status.started()`.
-  - **Raises**: `RuntimeError` if called after the group has exited (same orphan guard as `start_soon`).
+  - **Raises**: `RuntimeError` if called after the group has exited (same orphan guard as `start_soon`), or if the child exits without calling `task_status.started()` (trio/anyio parity — a silent handle to a dead task would hide the protocol violation).
 - **Raises**: Child exceptions are re-raised on exit; multiple failures surface as an `ExceptionGroup`.
 
 ### `TaskHandle`
@@ -669,7 +669,7 @@ CancelScope(deadline: float = float("inf"), shield: bool = False)
 ```
 
 - **`deadline`** (*float*): Absolute monotonic deadline. `float("inf")` means no deadline.
-- **`shield`** (*bool*): When `True`, blocks parent-scope cancellation from penetrating inward.
+- **`shield`** (*bool*): Snapshot/restore shield: snapshots and clears the task's pending cancellation count on entry, restores it on exit. Absorbs cancellations injected *before* entry; a cancel delivered *while* inside the shield is **not** deferred (unlike trio/anyio) — for cleanup that must survive mid-flight cancellation use a retry loop (see `Condition.wait`).
 
 #### Properties & Methods
 

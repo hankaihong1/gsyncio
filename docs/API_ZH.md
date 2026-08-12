@@ -660,6 +660,7 @@ async with TaskGroup(name=None) as tg:
   句柄，不阻塞。
 - **`start(coro_fn, *args)` -> `TaskHandle`**：派生子任务，阻塞直到子任务
   调用 `task_status.started()`。
+  - **抛出**：组退出后调用抛 `RuntimeError`（与 `start_soon` 相同的孤儿防护）；子任务未调用 `task_status.started()` 即退出也抛 `RuntimeError`（trio/anyio 对齐——静默返回已死任务的句柄会掩盖协议违规）。
 - **抛出**：子任务异常在退出时重抛；多个失败以 `ExceptionGroup` 聚合。
 
 ### `TaskHandle`
@@ -713,7 +714,7 @@ CancelScope(deadline: float = float("inf"), shield: bool = False)
 ```
 
 - **`deadline`** (*float*)：绝对单调截止时间。`float("inf")` 表示无截止。
-- **`shield`** (*bool*)：为 `True` 时阻止父作用域的取消向内穿透。
+- **`shield`** (*bool*)：快照/恢复式屏蔽：进入时快照并清除任务挂起的取消计数，退出时恢复。只吸收*进入前*已注入的取消；屏蔽*期间*到达的取消**不会**被延迟（与 trio/anyio 不同）——需要在中途取消下完成清理的代码应使用重试循环（见 `Condition.wait`）。
 
 #### 属性与方法
 
