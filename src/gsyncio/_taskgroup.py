@@ -227,6 +227,14 @@ class TaskGroup:
             await self._drain_cancelled_children(remaining)
             raise
 
+        # WHY (R9 guardrail 3): the wait is over — reject new spawns BEFORE
+        # the next await (e.g. a done-callback could spawn during the
+        # scope-exit await below and would otherwise be orphaned).  trio's
+        # nursery closes lazily at the next spawn attempt; raising here is
+        # the same observable.  Idempotent with __aexit__'s finally.
+        with self._children_lock:
+            self._exited = True
+
         # Cancellation wins: never merge CancelledError into the group —
         # merging would swallow the cancellation and hang outer timeouts.
         if exc_val is not None and isinstance(exc_val, asyncio.CancelledError):
@@ -282,75 +290,94 @@ class TaskGroup:
         this method runs (``pre_cancelled``).
         """
         exceptions: list[BaseException] = []
-        with self._children_lock:
-            tasks = [h._task for h in self._children]
-        if not tasks:
-            return exceptions
-
-        pending: set[asyncio.Task[Any]] = set(tasks)
         cancelled_by_scope: set[asyncio.Task[Any]] = set(pre_cancelled or ())
         scope_cancelled = False
+        processed: set[asyncio.Task[Any]] = set()
+        pending: set[asyncio.Task[Any]] = set()
+
+        def cancel_siblings() -> None:
+            # Cancel every pending sibling (absorbed spawns included); mark
+            # the scope cancelled so parent scopes see the failure, and
+            # un-cancel the host so it can keep collecting.
+            nonlocal scope_cancelled
+            for p in pending:
+                p.cancel()
+                cancelled_by_scope.add(p)
+            self._cancel_scope.cancel()
+            cur = asyncio.current_task()
+            if cur is not None and cur.cancelling() > 0:
+                cur.uncancel()
+            scope_cancelled = True
+
+        def collect_one(task: asyncio.Task[Any]) -> None:
+            # WHY: a start() child whose exception was already raised to the
+            # caller must not be collected again — it would surface twice
+            # (R5 FIX-C).
+            with self._children_lock:
+                if task in self._consumed:
+                    return
+            if task.cancelled():
+                # task.exception() raises CancelledError on cancelled tasks
+                # in Python 3.14.  Synthesise it ourselves so we can
+                # distinguish sibling-cancel from external cancel.
+                exc: BaseException = asyncio.CancelledError()
+            else:
+                task_exc = task.exception()
+                if task_exc is None:
+                    return
+                exc = task_exc
+            # A cancelled child is not an error (trio/anyio/stdlib
+            # asyncio.TaskGroup parity; probes R8-A/D): the soft-exit branch
+            # must only see children that RAISED CancelledError themselves.
+            # Discriminator: injected cancel leaves cancelling() > 0, a
+            # self-raised CancelledError never touched it.
+            if isinstance(exc, asyncio.CancelledError) and (
+                task in cancelled_by_scope or task.cancelling() > 0
+            ):
+                return
+            exceptions.append(exc)
+            if not scope_cancelled:
+                cancel_siblings()
+
+        def absorb() -> None:
+            # WHY (R9): re-read the LIVE child set every iteration (anyio's
+            # `while self._tasks` shape) so children spawned by a child
+            # during the exit wait are awaited, not orphaned.  Three
+            # guardrails, each verified by probe: (1) tasks that finished
+            # before we could await them are collected NOW — dropping them
+            # would swallow their exception (probe Q2); (2) spawns absorbed
+            # after the first failure are cancelled immediately (anyio
+            # parity: new children inherit the cancelled scope; probe Q3);
+            # (3) the empty-set decision reads _children under the lock with
+            # no await between the read and the exit, so a spawn cannot slip
+            # past the gate.
+            with self._children_lock:
+                current = [h._task for h in self._children]
+            for task in current:
+                if task in processed or task in pending:
+                    continue
+                if task.done():
+                    collect_one(task)
+                    processed.add(task)
+                elif scope_cancelled:
+                    task.cancel()
+                    cancelled_by_scope.add(task)
+                    pending.add(task)
+                else:
+                    pending.add(task)
 
         async with CancelScope(shield=True):
-            while pending:
+            while True:
+                absorb()
+                if not pending:
+                    break
                 done, pending = await asyncio.wait(
                     pending,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 for task in done:
-                    # WHY: a start() child whose exception was already
-                    # raised to the caller must not be collected again —
-                    # it would surface twice (R5 FIX-C).
-                    with self._children_lock:
-                        if task in self._consumed:
-                            continue
-                    if task.cancelled():
-                        # task.exception() raises CancelledError on cancelled
-                        # tasks in Python 3.14. Synthesise it ourselves so we
-                        # can distinguish sibling-cancel from external cancel.
-                        exc: BaseException = asyncio.CancelledError()
-                    else:
-                        task_exc = task.exception()
-                        if task_exc is None:
-                            continue
-                        exc = task_exc
-
-                    # A cancelled child is not an error (trio/anyio/stdlib
-                    # asyncio.TaskGroup parity; probes R8-A/D): the soft-exit
-                    # branch below must only see children that RAISED
-                    # CancelledError themselves (select_channel's notifier
-                    # readiness signal).  The discriminator is the pending
-                    # cancel count at death: an injected cancel leaves
-                    # cancelling() > 0 (cancel() on a done task is a no-op,
-                    # and nothing decrements the count when the task dies),
-                    # while a self-raised CancelledError never touched it
-                    # (probe-verified on 3.14t: 1 vs 0).
-                    if isinstance(exc, asyncio.CancelledError) and (
-                        task in cancelled_by_scope or task.cancelling() > 0
-                    ):
-                        continue
-
-                    exceptions.append(exc)
-
-                    # On the first real failure, cancel the scope (which also
-                    # cancels the nursery task) and cancel remaining siblings.
-                    if not scope_cancelled:
-                        # Cancel all remaining siblings directly.
-                        for p in pending:
-                            p.cancel()
-                            cancelled_by_scope.add(p)
-
-                        # Mark the scope as cancelled so parent scopes see it.
-                        # CancelScope.cancel() also cancels the hosting (nursery)
-                        # task — un-cancel it immediately so we can continue
-                        # processing the remaining children.
-                        self._cancel_scope.cancel()
-                        cur = asyncio.current_task()
-                        if cur is not None and cur.cancelling() > 0:
-                            cur.uncancel()
-
-                        scope_cancelled = True
-
+                    processed.add(task)
+                    collect_one(task)
         return exceptions
 
     async def _drain_cancelled_children(self, tasks: list[asyncio.Task[Any]]) -> None:

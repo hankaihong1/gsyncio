@@ -414,7 +414,15 @@ class EventLoopThreadPool:
                 pass  # worker loop already closed (shutdown race)
 
         for t in threads:
-            t.join(timeout=2.0)
+            try:
+                t.join(timeout=2.0)
+            except RuntimeError:
+                # WHY: a thread not yet started cannot be joined (start()
+                # launches threads outside _lock; close() may race the
+                # launch window).  The worker exits on its own once started:
+                # the native pool is already closed and the stop callback
+                # is queued on its loop (R9 F-2).
+                pass
 
         # WHY: a task popped by the drain but never stepped is cancelled in
         # the worker's finally at its outermost await — its future would
@@ -470,7 +478,13 @@ class EventLoopThreadPool:
                 pass  # worker loop already closed (shutdown race)
 
         for t in threads:
-            t.join(timeout=2.0)
+            try:
+                t.join(timeout=2.0)
+            except RuntimeError:
+                # WHY: same launch-window race as close() — a worker thread
+                # not yet started cannot be joined; it exits on its own once
+                # started (native pool closed, stop queued) (R9 F-2).
+                pass
 
         # Complete every future that never ran.  Delivery goes through the
         # same safe wrapper as the worker path, so a worker that did finish
