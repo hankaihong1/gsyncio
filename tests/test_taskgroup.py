@@ -565,3 +565,118 @@ async def test_preexisting_children_tracked_through_first_entry() -> None:
         await asyncio.sleep(0.02)
     assert h._task.done()
     assert finished.is_set()
+
+
+# ---------------------------------------------------------------------------
+# R10 P2: start() cancellation semantics (trio parity)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_start_child_self_cancelled_after_started_returns_handle() -> None:
+    """R10 P2: a child that raises CancelledError right after started() must
+    not make start() itself raise — trio parity: start() completes once
+    started() is called; the failure surfaces via the group's soft exit.
+    Pre-fix: task.exception() raised CancelledError from start()'s finally."""
+    started_flag = asyncio.Event()
+
+    async def worker(task_status: TaskStatus) -> None:
+        task_status.started()
+        started_flag.set()
+        raise asyncio.CancelledError()
+
+    handle_result: TaskHandle | None = None
+    with pytest.raises(asyncio.CancelledError):
+        async with TaskGroup() as tg:
+            handle_result = await tg.start(worker)
+            await started_flag.wait()
+    # Pre-fix the start() call raised and handle_result stayed None.
+    assert handle_result is not None
+
+
+@pytest.mark.asyncio
+async def test_start_child_cancelled_before_started_cancels_siblings() -> None:
+    """R10 P2: when the child is cancelled before started(), start()
+    propagates the cancellation AND cancels siblings.  Pre-fix: the
+    finally's task.exception() raised before the consume/sibling-cancel
+    code ran, orphaning the siblings (they were never cancelled)."""
+    child_task: asyncio.Task[Any] | None = None
+    sibling_cancelled = asyncio.Event()
+
+    async def worker(task_status: TaskStatus) -> None:
+        nonlocal child_task
+        child_task = asyncio.current_task()
+        await asyncio.sleep(10)  # never calls started()
+
+    async def sibling() -> None:
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            sibling_cancelled.set()
+            raise
+
+    async with TaskGroup() as tg:
+        # Fire-and-forget: awaiting the returned handle would block until
+        # the 10s sibling finishes (TaskHandle.__await__ delegates to the
+        # underlying task), which would defeat the cancellation check below.
+        tg.start_soon(sibling)
+        start_task = asyncio.create_task(tg.start(worker))
+        while child_task is None:
+            await asyncio.sleep(0)
+        child_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await start_task
+        await asyncio.wait_for(sibling_cancelled.wait(), timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_child_failure_preserves_external_cross_thread_cancel() -> None:
+    """R10 P5: a synchronous cross-thread task.cancel() landing during
+    child-failure handling must still be delivered after the group exits.
+    Pre-fix: cancel_siblings' uncancel plus the __aexit__ compensation
+    consumed the count, and the host never saw its cancellation."""
+    import threading
+    import time
+
+    host_task: asyncio.Task[Any] | None = None
+    child_parked = asyncio.Event()
+    release_child = asyncio.Event()
+    cancel_done = threading.Event()
+
+    async def failing_child() -> None:
+        child_parked.set()
+        await release_child.wait()
+        raise ValueError("boom")
+
+    async def run_group() -> None:
+        nonlocal host_task
+        host_task = asyncio.current_task()
+        try:
+            async with TaskGroup() as tg:
+                await tg.start_soon(failing_child)
+        except BaseExceptionGroup:
+            pass
+        await asyncio.sleep(5)  # the external cancel must fire here
+
+    def _cancel_from_thread() -> None:
+        # Task.cancel() from a foreign thread is synchronous: it can land
+        # in the middle of the failure-handling sync section.
+        while host_task is None:
+            time.sleep(0.001)
+        host_task.cancel()
+        cancel_done.set()
+
+    t = asyncio.create_task(run_group())
+    threading.Thread(target=_cancel_from_thread, daemon=True).start()
+    await child_parked.wait()
+    await asyncio.to_thread(cancel_done.wait)
+    release_child.set()
+    # Either interleaving must end with the host's cancellation delivered:
+    # (a) the cancel landed while the host was waiting on the child — the
+    #     CancelledError path cancels and drains children, then propagates;
+    # (b) the cancel landed during failure handling — the R10 P5 fix keeps
+    #     the count alive so the CE fires at the next await after the
+    #     group exits.  Pre-fix (b) swallowed the count and the task kept
+    #     sleeping past the timeout.
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(asyncio.shield(t), timeout=2.0)

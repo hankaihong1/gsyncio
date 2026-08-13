@@ -748,3 +748,37 @@ async def test_pool_submit_push_failure_discards_future():
         assert not outstanding
     finally:
         await pool.close()
+
+
+# ---------------------------------------------------------------------------
+# R10 P4: wait_closed() semantics
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_wait_closed_never_started_returns_immediately() -> None:
+    """R10 P4: wait_closed() on a pool that was never started must return
+    immediately (docstring promise) — pre-fix it blocked forever on the
+    threading.Event."""
+    pool = EventLoopThreadPool(num_threads=2)
+    await asyncio.wait_for(pool.wait_closed(), timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_wait_closed_cancellation_does_not_leak_thread() -> None:
+    """R10 P4: cancelling wait_closed() must not leave a thread blocked on
+    the threading.Event forever (pre-fix: asyncio.to_thread leaked it and
+    asyncio.run's executor shutdown hung the process)."""
+    pool = EventLoopThreadPool(num_threads=2)
+    await pool.start()
+
+    async def cancel_wait() -> None:
+        task = asyncio.create_task(pool.wait_closed())
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    await cancel_wait()
+    await pool.close()
+    # Reaching this line proves the executor shut down cleanly.

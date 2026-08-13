@@ -142,6 +142,10 @@ class EventLoopThreadPool:
         self._notify_events: list[asyncio.Event] = []
         self._lock = threading.Lock()
         self._running = False
+        # WHY (R10 P4): distinguishes "never started" from "started but
+        # currently closing" for wait_closed(); written under _lock in
+        # start(), read under _lock in wait_closed().
+        self._started = False
         self._index = 0
         # WHY: every live submit future is registered here so abort() can
         # complete the ones that never ran.  All access under _lock: the
@@ -337,6 +341,7 @@ class EventLoopThreadPool:
                 # never run (BUG-7).
                 raise RuntimeError("pool cannot be restarted after close()")
             self._running = True
+            self._started = True
             self._notify_events = [asyncio.Event() for _ in range(self.num_threads)]
 
             for i in range(self.num_threads):
@@ -503,10 +508,24 @@ class EventLoopThreadPool:
     async def wait_closed(self) -> None:
         """Wait until the pool has been fully stopped.
 
-        Returns immediately if the pool is not running or is already closed.
+        Returns immediately if the pool was never started or is already
+        closed.  Note: calling this concurrently with start() is a misuse —
+        the never-started check may observe the pre-start state and return
+        while the pool is actually coming up.
         """
-        # WHY: to_thread — the event is a threading.Event (see __init__).
-        await asyncio.to_thread(self._closed_event.wait)
+        # WHY: a never-started pool has no close to wait for.  Reading both
+        # flags under _lock keeps the check consistent with start()/close().
+        # WHY: polling instead of asyncio.to_thread(threading.Event.wait) —
+        # the to_thread thread cannot be cancelled and would stay blocked on
+        # the event forever, hanging asyncio.run's executor shutdown (R10
+        # P4).  A 10 ms poll is invisible next to a close() that takes
+        # milliseconds anyway.
+        with self._lock:
+            started = self._started
+        if not started or self._closed_event.is_set():
+            return
+        while not self._closed_event.is_set():
+            await asyncio.sleep(0.01)
 
     async def __aenter__(self) -> Self:
         await self.start()

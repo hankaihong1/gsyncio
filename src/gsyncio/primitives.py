@@ -22,7 +22,7 @@ class _FastChannelProtocol(Protocol):
 
     def __init__(self, maxsize: int) -> None: ...
     def try_send(self, item: Any) -> bool: ...
-    def try_recv(self) -> Any: ...
+    def try_recv(self) -> tuple[bool, Any]: ...
     def is_closed(self) -> bool: ...
     def close(self) -> None: ...
     def qsize(self) -> int: ...
@@ -186,7 +186,13 @@ class FastChannel(_BaseChannel):
                 await fut
             except BaseException:
                 with self._lock:
-                    self._discard_waiter(self._getters, fut)
+                    was_present = self._discard_waiter(self._getters, fut)
+                    if not was_present:
+                        # WHY (R10 P1): a sender already popped our entry and
+                        # queued the item — but we were cancelled before
+                        # consuming it.  Forward the wakeup so the buffered
+                        # item reaches the next getter.
+                        self._wakeup_next(self._getters)
                 raise
 
 

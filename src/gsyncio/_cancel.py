@@ -58,7 +58,6 @@ class CancelScope:
         self._task: asyncio.Task[object] | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._deadline_handle: asyncio.TimerHandle | None = None
-        self._reset_token: contextvars.Token[list[CancelScope]] | None = None
         self._saved_cancel_count = 0
         # R7-A accounting refinement (anyio `_pending_uncancellations` parity):
         # cancel() can set cancel_called WITHOUT injecting (task already done /
@@ -108,12 +107,13 @@ class CancelScope:
             # clearing the binding.
             task = self._task
             loop = self._loop
-            # R7-A injection accounting: decided under the lock from the same
-            # snapshot.  When the task is done or the binding was cleared
-            # (cross-thread race) nothing is injected and nothing is recorded —
-            # the __aexit__ compensation only consumes recorded injections and
-            # can never swallow external/ancestor counts.
-            self._injected = task is not None and not task.done()
+            # R7-A injection accounting.  The ledger is decided from the
+            # actual delivery below — task.cancel() is idempotent, so a
+            # cancel() racing an already-cancelling host injects nothing
+            # and must record nothing (R10 P5: recording a phantom
+            # injection let the __aexit__ compensation consume a foreign
+            # cancellation count).
+            self._injected = False
 
         if task is not None and not task.done():
             try:
@@ -122,13 +122,39 @@ class CancelScope:
                 current_loop = None
             if loop is not None and current_loop is not loop:
                 try:
-                    loop.call_soon_threadsafe(task.cancel)
+                    # WHY: the delivery happens later on the host loop; the
+                    # callback records the actual outcome so the ledger is
+                    # never a guess.
+                    def _deliver() -> None:
+                        delivered = task.cancel()
+                        with self._cancel_lock:
+                            self._injected = delivered and not task.done()
+
+                    loop.call_soon_threadsafe(_deliver)
                 except RuntimeError:
                     # WHY: the host loop was closed — the task is gone with
                     # it; nothing to cancel (R5 FIX-E).
                     pass
             else:
-                task.cancel()
+                delivered = task.cancel()
+                with self._cancel_lock:
+                    self._injected = delivered
+
+    def _take_injected(self) -> bool:
+        """Return and clear the injection ledger (TaskGroup failure path).
+
+        WHY (R10 P5): the host task manually consumes the cancellation its
+        own scope injected during sibling-cancel; clearing the ledger here
+        stops the __aexit__ compensation from uncancelling a SECOND count —
+        which would swallow an external cancellation that landed in between.
+        The actual uncancel() must happen outside this lock (the host is
+        never concurrently in __aenter__/__aexit__ at this point, but the
+        lock keeps the ledger consistent with cross-thread cancel()).
+        """
+        with self._cancel_lock:
+            injected = self._injected
+            self._injected = False
+            return injected
 
     def _effectively_cancelled(self) -> bool:
         """Whether *this* scope (or an unshielded ancestor) is cancelled.
@@ -166,8 +192,8 @@ class CancelScope:
         WHY: ``__aexit__`` is never called when ``__aenter__`` raises
         (with-statement semantics), so a bare raise would leak a stale scope
         on the task-local stack, a live deadline timer that later cancels a
-        task which already left the scope, the ``_reset_token``, and the
-        ``_task``/``_loop`` binding (R1 FIX-2).
+        task which already left the scope, and the ``_task``/``_loop``
+        binding (R1 FIX-2).
 
         ``clear_binding=False`` keeps the host binding: the move_on expired-
         deadline path returns normally, so ``__aexit__`` runs and needs the
@@ -182,7 +208,6 @@ class CancelScope:
         if self._deadline_handle is not None:
             self._deadline_handle.cancel()
             self._deadline_handle = None
-        self._reset_token = None
         if clear_binding:
             # The binding is cleared under the lock — cancel() reads
             # _task/_loop from any thread and must never see a torn binding.
@@ -230,7 +255,7 @@ class CancelScope:
 
         stack = _get_scope_stack()
         stack.append(self)
-        self._reset_token = _scope_stack_var.set(stack)
+        _scope_stack_var.set(stack)
 
         # Shield: clear any pending cancellation injected by parent scopes.
         # WHY: If a parent scope was cancelled before we entered, its injection is

@@ -298,14 +298,18 @@ class TaskGroup:
         def cancel_siblings() -> None:
             # Cancel every pending sibling (absorbed spawns included); mark
             # the scope cancelled so parent scopes see the failure, and
-            # un-cancel the host so it can keep collecting.
+            # consume the host injection so the host can keep collecting.
             nonlocal scope_cancelled
             for p in pending:
                 p.cancel()
                 cancelled_by_scope.add(p)
             self._cancel_scope.cancel()
             cur = asyncio.current_task()
-            if cur is not None and cur.cancelling() > 0:
+            # WHY (R10 P5): consume ONLY the injection this scope actually
+            # delivered.  _take_injected is False when the host was already
+            # cancelling (task.cancel() is idempotent) or the binding was
+            # cleared — uncancelling then would swallow a foreign count.
+            if cur is not None and self._cancel_scope._take_injected():
                 cur.uncancel()
             scope_cancelled = True
 
@@ -459,29 +463,41 @@ class TaskGroup:
         try:
             await task_status._started.wait()
         finally:
-            if task.done() and task.exception() is not None:
-                exc = task.exception()
-                with self._children_lock:
-                    # WHY: the exception is raised here, to the caller —
-                    # _wait_children must not collect it a second time and
-                    # re-raise it as a group failure (R5 FIX-C).
-                    self._consumed.add(task)
-                    siblings = [
-                        h._task
-                        for h in self._children
-                        if h._task is not task and not h._task.done()
-                    ]
-                for sibling in siblings:
-                    sibling.cancel()
+            # WHY: the child's lifecycle is decided once done() is true
+            # (state is frozen), so the checks below have no TOCTOU.
+            if task.done():
+                exc: BaseException | None = None
+                if task.cancelled():
+                    # WHY (R10 P2): on 3.14 task.exception() RAISES
+                    # CancelledError for cancelled tasks — calling it here
+                    # would escape the finally and skip the consume and
+                    # sibling-cancel below.  trio parity: a child cancelled
+                    # BEFORE started() makes start() propagate the
+                    # cancellation; a child cancelled AFTER started() is a
+                    # completed start protocol — the handle is returned and
+                    # the group's soft-exit path reports the cancellation.
+                    if not task_status._called:
+                        exc = asyncio.CancelledError()
+                else:
+                    task_exc = task.exception()
+                    if task_exc is not None:
+                        exc = task_exc
+                    elif not task_status._called:
+                        raise RuntimeError("Child exited without calling task_status.started()")
                 if exc is not None:
+                    with self._children_lock:
+                        # WHY: the exception is raised here, to the caller —
+                        # _wait_children must not collect it a second time
+                        # and re-raise it as a group failure (R5 FIX-C).
+                        self._consumed.add(task)
+                        siblings = [
+                            h._task
+                            for h in self._children
+                            if h._task is not task and not h._task.done()
+                        ]
+                    for sibling in siblings:
+                        sibling.cancel()
                     raise exc
-            elif task.done() and not task_status._called:
-                # WHY: the child finished without ever calling started() — a
-                # silently returned handle to a dead task hides the protocol
-                # violation (trio/anyio raise RuntimeError here).  No
-                # _consumed entry needed: the task has no exception, so
-                # _wait_children skips it (task_exc is None -> continue).
-                raise RuntimeError("Child exited without calling task_status.started()")
         return handle
 
     def cancel_all(self) -> None:
