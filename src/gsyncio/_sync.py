@@ -379,21 +379,29 @@ class CapacityLimiter:
                 self._semaphore._max_value = new_int
                 diff = new_int - old_int
                 if diff > 0:
-                    # WHY: only tokens NOT currently borrowed may become
-                    # available — with 3 borrowed, growing 1 → 5 must yield
-                    # exactly 2 available tokens, not diff=4 (R5 revision D).
-                    target_value = max(0, new_int - self._borrowed)
-                    while self._semaphore._value < target_value:
-                        if self._semaphore._waiters:
+                    # WHY (R9 F-3): mint exactly `diff` tokens (anyio delta
+                    # semantics, _backends/_asyncio.py:2079-2087), never a
+                    # target value.  A target computed from _borrowed is
+                    # wrong when an acquire on another thread sits between
+                    # its semaphore decrement and its _borrowed increment:
+                    # the stale borrowed count makes the target one too high
+                    # and mints a phantom token (probe P3: value+borrowed
+                    # was 5 against a budget of 4).  Minting by delta is
+                    # exact in both interleavings — the in-flight token
+                    # already took its own slot out of the pool.
+                    for _ in range(diff):
+                        delivered = False
+                        while self._semaphore._waiters:
                             loop, event = self._semaphore._waiters.popleft()
                             try:
                                 loop.call_soon_threadsafe(event.set)
+                                delivered = True
+                                break
                             except RuntimeError:
-                                # WHY: dead loop — the waiter can never take
-                                # the token; the loop retries with the next
-                                # one (R5 FIX-E).
+                                # WHY: dead loop — retry the SAME token with
+                                # the next waiter (R5 FIX-E).
                                 continue
-                        else:
+                        if not delivered:
                             self._semaphore._value += 1
                 elif diff < 0:
                     # Shrink only reclaims AVAILABLE tokens (value); borrowed ones
