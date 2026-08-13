@@ -102,10 +102,44 @@ graph TD
   `gsyncio.select_channel(...)` and `gsyncio.EventLoopThreadPool`, with pool
   lifecycle managed via `async with`.
 - 🦫 **Golang-Style Concurrency Primitives**:
-  - `FastChannel` & `AsyncChannel` (elegant iteration via `async for item in ch:`)
+  - `FastChannel` (elegant iteration via `async for item in ch:`)
   - `gsyncio.select_channel(*channels)` (multi-channel select/multiplex)
   - `AsyncContext` (cross-thread cascading task cancellation and timeout broadcast)
   - `AsyncWaitGroup` & `AsyncOnce` & `AsyncRWMutex` (read-write lock separation)
+
+---
+
+## Current Status & Known Limits
+
+**gsyncio is an experimental project for free-threaded CPython (3.14t).** Its
+concurrency core has been through ten systematic audit rounds (R6–R10), each
+ending with deterministic reproduction tests and stress verification
+(`pytest --count=50`) — [docs/CONCURRENCY.md](docs/CONCURRENCY.md) is the
+operating manual. The API is 0.x: expect behavioural refinements between
+releases. If you build on it, pin the version.
+
+### Verified performance (M1 8GB, Python 3.14t)
+
+| Workload | Single loop | gsyncio 4-worker | Speedup |
+|---|---|---|---|
+| CPU-bound dispatch (40 × 2M ops) | 2.96 s | 0.84 s | **3.5x** |
+| Mixed I/O + CPU (400 tasks, 2 ms sleep + 40k ops) | 511 QPS | 1259 QPS | **2.5x** |
+| Pure-I/O ASGI HTTP (500 req, 50 conn) | 59.6 QPS | 74.7 QPS | 1.25x |
+
+The engine's value is **parallel CPU-bound work across event loops**. For
+pure-I/O HTTP serving, a single asyncio loop (or uvicorn) is the better tool.
+
+### Known limits (read before adopting)
+
+| Limit | Detail | Escape hatch |
+|---|---|---|
+| Requires Python 3.14t | free-threaded CPython is still experimental (PEP 703) | — |
+| `Barrier` + cancelled party | a party cancelled before the round completes leaves the rest parked forever | `abort()` |
+| `select_channel` arbitration | readiness is reported without consuming; heavy contention can delay a specific channel | built-in re-register loop |
+| Waiter removal is O(n) | cancelling N parked waiters is O(n²) — ~560 ms at 5000 waiters | keep party counts realistic |
+| `AsyncContext.cancel()` | cancels the *awaiters*, not the running pool task (no injection) | design tasks to observe their future |
+| `CancelScope` shield | absorbs cancellations already injected before entry; does **not** defer new ones (unlike trio/anyio) | retry-loop pattern (CONCURRENCY.md §2 Pattern 3) |
+| Windows | Proactor: exactly one acceptor (shared-listener multi-acceptor hangs) | documented behaviour |
 
 ---
 

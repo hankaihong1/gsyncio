@@ -101,10 +101,43 @@ graph TD
   `gsyncio.select_channel(...)`、`gsyncio.EventLoopThreadPool` 等极简 API，
   可通过 `async with` 上下文管理池生命周期。
 - 🦫 **Golang-Style Concurrency Primitives**：
-  - `FastChannel` & `AsyncChannel`（支持 `async for item in ch:` 优雅迭代）
+  - `FastChannel`（支持 `async for item in ch:` 优雅迭代）
   - `gsyncio.select_channel(*channels)`（多通道选优复用）
   - `AsyncContext`（跨线程级联 Task 取消与超时广播）
   - `AsyncWaitGroup` & `AsyncOnce` & `AsyncRWMutex`（读写分离锁）
+
+---
+
+## 当前状态与已知限制（Current Status & Known Limits）
+
+**gsyncio 是面向自由线程 CPython（3.14t）的实验性项目。** 其并发核心经过
+十轮系统性审计（R6–R10），每轮都以确定性复现测试与压力验证
+（`pytest --count=50`）收尾——[docs/CONCURRENCY.md](docs/CONCURRENCY.md)
+是操作手册。API 处于 0.x 阶段：版本之间可能发生行为调整。若在其上构建，
+请锁定版本。
+
+### 已验证性能（M1 8GB，Python 3.14t）
+
+| 工作负载 | 单 loop | gsyncio 4-worker | 加速比 |
+|---|---|---|---|
+| CPU 密集任务调度（40 × 200 万次运算） | 2.96 s | 0.84 s | **3.5x** |
+| I/O + CPU 混合（400 任务，2 ms sleep + 4 万次运算） | 511 QPS | 1259 QPS | **2.5x** |
+| 纯 I/O ASGI HTTP（500 请求，50 并发） | 59.6 QPS | 74.7 QPS | 1.25x |
+
+引擎的价值在于**跨事件循环并行执行 CPU 密集任务**。纯 I/O HTTP 服务场景
+下，单个 asyncio loop（或 uvicorn）是更合适的工具。
+
+### 已知限制（采用前请阅读）
+
+| 限制 | 详情 | 逃生门 |
+|---|---|---|
+| 依赖 Python 3.14t | 自由线程 CPython 仍属实验性（PEP 703） | — |
+| `Barrier` + 被取消的 party | 某 party 在轮次完成前被取消，其余 party 将永久等待 | `abort()` |
+| `select_channel` 仲裁 | 就绪状态上报不消费数据；高竞争下特定通道可能被延迟 | 内置重新注册循环 |
+| waiter 移除为 O(n) | 取消 N 个等待者代价为 O(n²)——5000 等待者约 560 ms | 保持合理的等待者数量 |
+| `AsyncContext.cancel()` | 取消的是*等待方*，而非池中正在运行的任务（无注入） | 设计任务时让其观察自己的 future |
+| `CancelScope` shield | 只吸收进入前已注入的取消；**不**延迟屏蔽期间的新取消（与 trio/anyio 不同） | 重试循环模式（CONCURRENCY.md §2 Pattern 3） |
+| Windows | Proactor：仅单 acceptor（共享监听 socket 的多 acceptor 会挂起） | 文档化行为 |
 
 ---
 

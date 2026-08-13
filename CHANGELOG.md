@@ -5,6 +5,49 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.4] - 2026-08-13
+
+### Fixed
+- **`FastChannel`** (R10 P1): a cancelled `send()`/`recv()` whose waiter
+  entry was already popped by the other side now **forwards the wakeup** to
+  the next putter/getter — previously the freed slot (or buffered item)
+  idled while later waiters slept forever (lost-wakeup; same chain
+  forwarding as `Lock`/`Semaphore`/`Condition`).
+- **`TaskGroup.start()`** (R10 P2): on 3.14 `task.exception()` raises
+  `CancelledError` for cancelled tasks — the `start()` cleanup no longer
+  calls it on a cancelled child. A child cancelled **before** `started()`
+  makes `start()` propagate the cancellation **and** cancel siblings
+  (previously the siblings were never cancelled); a child cancelled
+  **after** `started()` is a completed start protocol and the handle is
+  returned (trio parity).
+- **`EventLoopThreadPool.wait_closed()`** (R10 P4): returns immediately on a
+  never-started pool (docstring promise) and now polls instead of
+  `asyncio.to_thread(threading.Event.wait)` — the blocked thread was not
+  cancellable and hung `asyncio.run`'s executor shutdown.
+- **`CancelScope`** (R10 P5): the injection ledger (`_injected`) is now
+  recorded from the actual `task.cancel()` outcome, and the `TaskGroup`
+  failure path consumes its own injection via `_take_injected()` — a
+  cross-thread cancellation landing during child-failure handling is no
+  longer swallowed by the `__aexit__` compensation.
+- **`NativeWorkerPool.push_local`**: a closed pool now reports
+  `ThreadPoolClosedError` instead of "Worker index out of range" (the
+  sender list was cleared before the advisory flag was set).
+
+### Changed
+- **`ConnectionPinningServer`**: the acceptor list is now guarded by
+  `_running_lock` (start's reset/append and close's snapshot/clear are one
+  critical section) — a race on free-threaded builds could leave an
+  acceptor uncancelled at shutdown.
+- Removed the dead `_reset_token` field from `CancelScope`; corrected the
+  `AtomicMetrics`/`FastChannel` protocol stubs to match the real Rust
+  signatures.
+
+### Docs
+- `README.md` (+ ZH mirror): new "Current Status & Known Limits" section —
+  verified performance numbers (3.5x CPU-bound / 2.5x mixed / 1.25x
+  pure-I/O on 4 workers), the known-limits table with escape hatches, and
+  the experimental (3.14t, 0.x API) positioning.
+
 ## [Unreleased]
 
 ### Fixed

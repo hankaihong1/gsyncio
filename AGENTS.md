@@ -167,7 +167,6 @@ searches, never modify.
 ```
 __init__.py  ──┬── pool.py ────────── _rust.py ── _gsyncio_core (lib.rs)
                 ├── primitives.py ──── _channel_base.py
-                ├── channel.py ─────── _channel_wrappers.py
                 ├── _cancel.py
                 ├── _sync.py
                 ├── _taskgroup.py
