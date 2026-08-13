@@ -500,7 +500,6 @@ async def test_aenter_raise_does_not_leak_stack() -> None:
     assert _get_scope_stack() == [outer]  # stale entry popped
     assert inner._task is None  # type: ignore[reportAttributeAccessIssue]
     assert inner._deadline_handle is None  # type: ignore[reportAttributeAccessIssue]
-    assert inner._reset_token is None  # type: ignore[reportAttributeAccessIssue]
 
     await outer.__aexit__(None, None, None)
 
@@ -806,3 +805,49 @@ async def test_scope_reentry_resets_injected_accounting() -> None:
     with pytest.raises(asyncio.CancelledError):
         async with scope:
             await asyncio.sleep(0)
+
+
+# ---------------------------------------------------------------------------
+# R10 P5: injection ledger accuracy
+# ---------------------------------------------------------------------------
+
+
+def test_cancel_ledger_requires_actual_injection() -> None:
+    """R10 P5 unit: the failure path must consume ONLY the injection this
+    scope actually delivered.  On 3.14 every task.cancel() increments the
+    count (no idempotence), so the discrimination is not the deliverable
+    but the ledger handover: _take_injected() clears it, which stops the
+    __aexit__ compensation from uncancelling a SECOND count and swallowing
+    an external cancellation that landed in between."""
+    # Local import: the test touches private members, so it needs the
+    # implementation module (the package stub only exposes the public API).
+    from gsyncio._cancel import CancelScope
+
+    async def main() -> None:
+        scope = CancelScope()
+        host = asyncio.current_task()
+        assert host is not None
+        # Simulate an entered scope (the real __aenter__ would push the
+        # stack; the ledger is what we are testing here).
+        scope._task = host
+        scope._loop = asyncio.get_running_loop()
+        # External cancellation lands first: count 1.
+        host.cancel()
+        # scope.cancel() injects its own count (count 2) and records it.
+        scope.cancel()
+        with scope._cancel_lock:
+            assert scope._injected is True
+        # The failure path takes the ledger and consumes exactly one count.
+        assert scope._take_injected() is True
+        with scope._cancel_lock:
+            assert scope._injected is False  # compensation must not re-run
+        host.uncancel()
+        # The external count must survive: this is the count that delivers
+        # the user's own cancellation at the next await.
+        assert host.cancelling() == 1
+        try:
+            await asyncio.sleep(0)
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(main())

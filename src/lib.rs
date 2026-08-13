@@ -259,6 +259,13 @@ impl NativeWorkerPool {
             return Err(ThreadPoolClosedError::new_err("Pool is closed"));
         }
         let guard = self.local_senders.lock();
+        // WHY (R10): close() clears the senders before setting the flag, so
+        // a lock-side is_closed() check can still see False mid-close; an
+        // empty sender list IS the closed state — report it as such instead
+        // of the misleading "Worker index out of range".
+        if guard.is_empty() {
+            return Err(ThreadPoolClosedError::new_err("Pool is closed"));
+        }
         if index >= guard.len() {
             return Err(PyRuntimeError::new_err("Worker index out of range"));
         }

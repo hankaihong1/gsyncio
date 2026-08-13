@@ -76,11 +76,20 @@ def _wake_all(
             _set_soon(loop, fut, exc)
 
 
-def _discard_waiter(waiters: collections.deque[_Waiter], fut: asyncio.Future[Any]) -> None:
-    """Remove the waiter entry for ``fut`` from ``waiters`` (if still present)."""
+def _discard_waiter(waiters: collections.deque[_Waiter], fut: asyncio.Future[Any]) -> bool:
+    """Remove the waiter entry for ``fut`` from ``waiters`` (if still present).
+
+    Returns ``True`` when the entry was still queued, ``False`` when it had
+    already been popped by a wakeup — the discrimination the cancellation
+    path needs to decide whether the wakeup must be forwarded (R10 P1: a
+    popped entry means the data/slot side already changed, and the
+    notification would otherwise die with the cancelled waiter).
+    """
     remaining = collections.deque(w for w in waiters if w[1] is not fut)
+    was_present = len(remaining) != len(waiters)
     waiters.clear()
     waiters.extend(remaining)
+    return was_present
 
 
 class _BaseChannel:  # pyright: ignore[reportUnusedClass]
@@ -203,9 +212,9 @@ class _BaseChannel:  # pyright: ignore[reportUnusedClass]
 
     def _discard_waiter(
         self, waiters: collections.deque[_Waiter], fut: asyncio.Future[Any]
-    ) -> None:
+    ) -> bool:
         """Remove the waiter entry for ``fut`` from ``waiters`` (if still present)."""
-        _discard_waiter(waiters, fut)
+        return _discard_waiter(waiters, fut)
 
     async def _wait_and_send(self, item: Any, try_fn: Callable[[Any], bool]) -> None:
         """Send ``item``, suspending until a slot frees, using ``try_fn``.
@@ -249,7 +258,16 @@ class _BaseChannel:  # pyright: ignore[reportUnusedClass]
                 await fut
             except BaseException:
                 with self._lock:
-                    self._discard_waiter(self._putters, fut)
+                    was_present = self._discard_waiter(self._putters, fut)
+                    if not was_present:
+                        # WHY (R10 P1): a receiver already popped our entry
+                        # and handed us the freed slot — but we were
+                        # cancelled before retrying the send.  The slot must
+                        # not idle: forward the wakeup to the next putter,
+                        # which retries its send.  A cancelled successor
+                        # forwards again via its own handler (chain
+                        # forwarding, same as Lock/Semaphore/Condition).
+                        self._wakeup_next(self._putters)
                 raise
 
     def __aiter__(self) -> AsyncIterator[Any]:

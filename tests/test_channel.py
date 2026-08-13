@@ -612,3 +612,85 @@ async def test_select_close_race() -> None:
             assert val == "x"
         except ChannelClosedError:
             pass
+
+
+@pytest.mark.asyncio
+async def test_putter_cancel_forwards_wakeup_to_next_putter() -> None:
+    """R10 P1: a cancelled putter whose entry was already popped must forward
+    the wakeup — the freed slot would otherwise idle while later putters
+    sleep forever (pre-fix: the second putter hangs)."""
+    ch = FastChannel(1)
+    await ch.send("a")  # fill the buffer
+
+    puts_done: list[str] = []
+    a_cancelled = asyncio.Event()
+
+    async def put_b() -> None:
+        try:
+            await ch.send("b")
+            puts_done.append("b")
+        except asyncio.CancelledError:
+            a_cancelled.set()
+            raise
+
+    async def put_c() -> None:
+        await ch.send("c")
+        puts_done.append("c")
+
+    a = asyncio.create_task(put_b())
+    await asyncio.sleep(0)  # A registers in _putters
+    c = asyncio.create_task(put_c())
+    await asyncio.sleep(0)  # C registers in _putters
+    assert len(ch._putters) == 2
+
+    # Consumer takes the buffered item; this pops putter A's entry and
+    # queues fut.set_result for A.
+    assert ch.try_recv() == "a"
+
+    # Cancel A synchronously, before the set_result callback runs — the
+    # wakeup is then consumed by a cancelled putter (lost-wakeup window).
+    a.cancel()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert a_cancelled.is_set()
+
+    # The freed slot must reach C: it eventually sends "c".
+    await asyncio.wait_for(c, timeout=1.0)
+    assert puts_done == ["c"]
+
+
+@pytest.mark.asyncio
+async def test_getter_cancel_forwards_wakeup_to_next_getter() -> None:
+    """R10 P1: a cancelled getter whose entry was already popped must forward
+    the wakeup — the buffered item would otherwise sit unconsumed while
+    later getters sleep forever (pre-fix: the second getter hangs)."""
+    ch = FastChannel(0)  # unbounded
+    recv_done: list[str] = []
+
+    async def recv_a() -> None:
+        try:
+            recv_done.append(await ch.recv())
+        except asyncio.CancelledError:
+            raise
+
+    async def recv_b() -> None:
+        recv_done.append(await ch.recv())
+
+    a = asyncio.create_task(recv_a())
+    await asyncio.sleep(0)  # A registers in _getters
+    b = asyncio.create_task(recv_b())
+    await asyncio.sleep(0)  # B registers in _getters
+    assert len(ch._getters) == 2
+
+    # Sender puts an item; this pops getter A's entry and queues
+    # set_result for A.
+    assert ch.try_send("x") is True
+
+    # Cancel A synchronously — the wakeup is consumed by a cancelled getter.
+    a.cancel()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    # The buffered item must still reach B.
+    await asyncio.wait_for(b, timeout=1.0)
+    assert recv_done == ["x"]

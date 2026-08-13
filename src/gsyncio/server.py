@@ -127,7 +127,11 @@ class ConnectionPinningServer:
             self.port = sock.getsockname()[1]
             self._server_socket = sock
             self._running = True
-        self._accept_tasks = []
+            # WHY (R10): the acceptor list is read by close() from another
+            # thread — resetting it under the same lock that start()/close()
+            # use keeps every access serialised (a bare assignment raced the
+            # close() iteration on free-threaded builds).
+            self._accept_tasks = []
 
         # Multiple acceptors share one listener socket (thundering herd):
         # macOS/Linux selectors let several loops read-listen on the same fd,
@@ -141,10 +145,15 @@ class ConnectionPinningServer:
         # Windows).  Hence exactly one acceptor on Windows.
         acceptor_count = 1 if sys.platform == "win32" else self.pool.num_threads
         for i in range(acceptor_count):
-            fut = asyncio.run_coroutine_threadsafe(
-                self._worker_accept_loop(sock, active_handler), self.pool._get_loop(i)
-            )
-            self._accept_tasks.append(fut)
+            # WHY (R10): the run + append pair is one critical section — a
+            # close() landing between them would miss this acceptor and
+            # never cancel it.  run_coroutine_threadsafe only schedules
+            # (call_soon_threadsafe), so holding the lock is momentary.
+            with self._running_lock:
+                fut = asyncio.run_coroutine_threadsafe(
+                    self._worker_accept_loop(sock, active_handler), self.pool._get_loop(i)
+                )
+                self._accept_tasks.append(fut)
 
     async def _worker_accept_loop(
         self,
@@ -247,10 +256,15 @@ class ConnectionPinningServer:
         with self._running_lock:
             self._running = False
 
-        if getattr(self, "_accept_tasks", None):
-            for fut in self._accept_tasks:
-                fut.cancel()
+        # WHY (R10): snapshot under the same lock start() uses, then cancel
+        # outside it — a concurrent start() appending a new acceptor between
+        # the snapshot and the clear would otherwise leave it tracked while
+        # the socket is being closed below.
+        with self._running_lock:
+            accept_tasks = list(self._accept_tasks)
             self._accept_tasks.clear()
+        for fut in accept_tasks:
+            fut.cancel()
 
         # Cancel connection handlers before the pool stops its loops. Two
         # passes with a per-loop round-trip between them: pass 1 cancels
