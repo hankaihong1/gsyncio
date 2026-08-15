@@ -359,3 +359,186 @@ async def test_condition_wait_reacquires_lock_through_cancellation():
     with pytest.raises(asyncio.CancelledError):
         await w
     assert not lock.locked  # the waiter's finally released the lock properly
+
+
+@pytest.mark.asyncio
+async def test_condition_wait_for_sync_and_async_predicate() -> None:
+    """Condition.wait_for should support both sync and async predicates."""
+    cond = Condition()
+    val = 0
+
+    async def producer() -> None:
+        nonlocal val
+        await asyncio.sleep(0.02)
+        async with cond:
+            val = 42
+            cond.notify_all()
+
+    async def consumer_sync() -> int:
+        async with cond:
+            res = await cond.wait_for(lambda: val == 42)
+            assert res is True
+            return val
+
+    async def consumer_async() -> int:
+        async def check() -> bool:
+            await asyncio.sleep(0.001)
+            return val == 42
+
+        async with cond:
+            res = await cond.wait_for(check)
+            assert res is True
+            return val
+
+    p = asyncio.create_task(producer())
+    c1 = asyncio.create_task(consumer_sync())
+    c2 = asyncio.create_task(consumer_async())
+
+    r1, r2, _ = await asyncio.gather(c1, c2, p)
+    assert r1 == 42
+    assert r2 == 42
+
+
+@pytest.mark.asyncio
+async def test_barrier_index_leader_election_and_unique_indices() -> None:
+    """Barrier.wait() returns BarrierWaitResult with unique indices and leader."""
+    barrier = Barrier(parties=4)
+    results: list[tuple[int, bool]] = []
+
+    async def party(idx: int) -> None:
+        await asyncio.sleep(idx * 0.01)
+        res = await barrier.wait()
+        results.append((res.index, res.is_leader))
+
+    tasks = [asyncio.create_task(party(i)) for i in range(4)]
+    await asyncio.gather(*tasks)
+
+    assert len(results) == 4
+    indices = [r[0] for r in results]
+    assert sorted(indices) == [0, 1, 2, 3]
+    leaders = [r[1] for r in results if r[1] is True]
+    assert len(leaders) == 1
+
+
+@pytest.mark.asyncio
+async def test_barrier_reset_wakes_waiters_and_resets_aborted_state() -> None:
+    """Barrier.reset() wakes current waiters and allows the barrier to be reused."""
+    barrier = Barrier(parties=3)
+    barrier_errors: list[str] = []
+
+    async def waiter() -> None:
+        try:
+            await barrier.wait()
+        except RuntimeError as e:
+            barrier_errors.append(str(e))
+
+    w1 = asyncio.create_task(waiter())
+    w2 = asyncio.create_task(waiter())
+    await asyncio.sleep(0.02)
+    assert barrier.n_waiting == 2
+
+    # Reset while waiting
+    barrier.reset()
+    await asyncio.gather(w1, w2)
+    assert len(barrier_errors) == 2
+    assert all("reset" in err for err in barrier_errors)
+
+    # Test abort then reset
+    barrier.abort()
+    with pytest.raises(RuntimeError, match="aborted"):
+        await barrier.wait()
+
+    # Reset clears aborted state
+    barrier.reset()
+    completed = []
+
+    async def worker(i: int) -> None:
+        res = await barrier.wait()
+        completed.append((i, res.parties, res.index))
+
+    tasks = [asyncio.create_task(worker(i)) for i in range(3)]
+    await asyncio.gather(*tasks)
+    assert len(completed) == 3
+
+
+# ---------------------------------------------------------------------------
+# Concurrency audit & semantic refactoring tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_condition_wait_unacquired_lock_no_ghost_waiter() -> None:
+    """Condition.wait without holding lock raises and leaves no ghost waiter."""
+    lock = Lock()
+    cond = Condition(lock)
+
+    # Calling wait() without acquiring lock must fail
+    with pytest.raises(RuntimeError):
+        await cond.wait()
+
+    # Now verify that a real waiter receives notify(1) properly
+    woken = False
+
+    async def real_waiter() -> None:
+        nonlocal woken
+        async with cond:
+            await cond.wait()
+            woken = True
+
+    t = asyncio.create_task(real_waiter())
+    await asyncio.sleep(0.02)
+
+    async with cond:
+        cond.notify(1)
+
+    await asyncio.wait_for(t, timeout=1.0)
+    assert woken, "Real waiter must be woken by notify(1) — not swallowed by ghost waiter"
+
+
+@pytest.mark.asyncio
+async def test_barrier_abort_after_round_graduates_preserved() -> None:
+    """Barrier.abort called after a round completes must not fail already-graduated waiters."""
+    barrier = Barrier(2)
+    results: list[object] = []
+
+    async def party() -> None:
+        res = await barrier.wait()
+        results.append(res)
+
+    t1 = asyncio.create_task(party())
+    t2 = asyncio.create_task(party())
+
+    await asyncio.gather(t1, t2)
+    assert len(results) == 2
+
+    # Now abort barrier for subsequent rounds
+    barrier.abort()
+
+    # Verify future waits fail
+    with pytest.raises(RuntimeError, match="barrier has been aborted"):
+        await barrier.wait()
+
+
+@pytest.mark.asyncio
+async def test_barrier_base_exception_cleanup() -> None:
+    """Barrier.wait must clean up waiter on non-CancelledError BaseException."""
+    barrier = Barrier(3)
+    assert barrier.n_waiting == 0
+
+    async def waiter_1() -> None:
+        try:
+            await barrier.wait()
+        except BaseException:
+            pass
+
+    t1 = asyncio.create_task(waiter_1())
+    await asyncio.sleep(0.01)
+    assert barrier.n_waiting == 1
+
+    t1.cancel()
+    try:
+        await t1
+    except BaseException:
+        pass
+
+    assert barrier.n_waiting == 0, "Cancelled/interrupted waiter must be removed from barrier"

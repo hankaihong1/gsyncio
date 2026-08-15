@@ -538,3 +538,94 @@ async def test_lock_release_tolerates_closed_loop_waiter() -> None:
     await asyncio.sleep(0)
     lock.release()  # must not raise; ownership must reach t2
     await asyncio.wait_for(t2, timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_lock_base_exception_forwards_ownership() -> None:
+    """Lock.acquire must forward ownership when a waiter is interrupted by BaseException."""
+    lock = Lock()
+    await lock.acquire()
+
+    class CustomBaseException(BaseException):
+        pass
+
+    interrupted_task_started = asyncio.Event()
+
+    async def interrupted_waiter() -> None:
+        interrupted_task_started.set()
+        await lock.acquire()
+
+    t2 = asyncio.create_task(interrupted_waiter())
+
+    t3_held = asyncio.Event()
+
+    async def waiter3() -> None:
+        await lock.acquire()
+        t3_held.set()
+        await asyncio.sleep(0.01)
+        lock.release()
+
+    t3 = asyncio.create_task(waiter3())
+    await interrupted_task_started.wait()
+    await wait_all_tasks_blocked()
+
+    # Release lock: ownership is handed to t2 (popped from _waiters)
+    lock.release()
+
+    # Cancel t2 before it can finish acquiring
+    t2.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await t2
+
+    # Ownership must have been forwarded to t3
+    await asyncio.wait_for(t3_held.wait(), timeout=1.0)
+    await t3
+    assert not lock.locked
+
+
+@pytest.mark.asyncio
+async def test_condition_wait_unacquired_owner_check() -> None:
+    """Condition.wait called without acquiring the lock must raise RuntimeError immediately."""
+    cond = Condition()
+    with pytest.raises(RuntimeError, match="cannot wait on un-acquired lock"):
+        await cond.wait()
+
+
+# ---------------------------------------------------------------------------
+# Concurrency audit & semantic refactoring tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_lock_dead_owner_fifo_recovery() -> None:
+    """Lock dead-owner recovery wakes FIFO waiters in order instead of barging."""
+    lock = Lock()
+    order: list[str] = []
+
+    # 1. Owner acquires lock then dies without release
+    async def doomed_owner() -> None:
+        await lock.acquire()
+
+    asyncio.create_task(doomed_owner())
+    await asyncio.sleep(0.01)
+    assert lock.locked
+
+    # 2. Waiter 1 queues while owner is still alive
+    async def waiter_1() -> None:
+        await lock.acquire()
+        order.append("waiter_1")
+        lock.release()
+
+    t_waiter = asyncio.create_task(waiter_1())
+    await asyncio.sleep(0.01)
+
+    # 3. New caller tries to acquire lock after owner dies
+    async def new_caller() -> None:
+        await lock.acquire()
+        order.append("new_caller")
+        lock.release()
+
+    t_caller = asyncio.create_task(new_caller())
+    await asyncio.gather(t_waiter, t_caller)
+
+    assert order == ["waiter_1", "new_caller"], f"Expected FIFO order, got {order}"

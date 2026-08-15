@@ -15,7 +15,7 @@ from gsyncio import (
     run_in_pool,
 )
 from gsyncio.exceptions import ThreadPoolClosedError
-from gsyncio.pool import EventLoopThreadPool, PoolOptions
+from gsyncio.pool import EventLoopThreadPool, PoolOptions, _safe_complete
 from gsyncio.testing import wait_all_tasks_blocked
 
 
@@ -782,3 +782,82 @@ async def test_wait_closed_cancellation_does_not_leak_thread() -> None:
     await cancel_wait()
     await pool.close()
     # Reaching this line proves the executor shut down cleanly.
+
+
+@pytest.mark.asyncio
+async def test_pool_submit_coroutine_with_args_rejected() -> None:
+    """Submitting a coroutine object with positional or keyword args raises TypeError."""
+    async with EventLoopThreadPool(num_threads=2) as pool:
+
+        async def my_coro(val: int) -> int:
+            return val * 2
+
+        # Valid: passing coroutine object without extra args
+        fut1 = pool.submit(my_coro(10))
+        res1 = await fut1
+        assert res1 == 20
+
+        # Valid: passing function with args
+        fut2 = pool.submit(my_coro, 10)
+        res2 = await fut2
+        assert res2 == 20
+
+        # Invalid: passing coroutine object WITH extra args
+        c1 = my_coro(10)
+        try:
+            with pytest.raises(TypeError, match="Cannot pass positional or keyword arguments"):
+                pool.submit(c1, "extra_arg")
+        finally:
+            c1.close()
+
+        c2 = my_coro(10)
+        try:
+            with pytest.raises(TypeError, match="Cannot pass positional or keyword arguments"):
+                pool.submit(c2, extra_kw="invalid")
+        finally:
+            c2.close()
+
+
+# ---------------------------------------------------------------------------
+# Concurrency audit & semantic refactoring tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_pop_work_shutdown_drain() -> None:
+    """pop_work in draining phase must drain all tasks without dropping work."""
+    async with EventLoopThreadPool(num_threads=4) as pool:
+        completed = 0
+        lock = threading.Lock()
+        total_tasks = 40
+
+        async def worker_task(idx: int) -> None:
+            nonlocal completed
+            await asyncio.sleep(0.01)
+            with lock:
+                completed += 1
+
+        # Submit tasks rapidly
+        futures = [pool.submit(worker_task, i) for i in range(total_tasks)]
+
+        # Close pool gracefully — all queued tasks must drain and execute
+        await pool.close()
+
+        # Wait for all submitted futures
+        for fut in futures:
+            await fut
+
+        assert completed == total_tasks, f"Expected {total_tasks} completed, got {completed}"
+
+
+@pytest.mark.asyncio
+async def test_safe_complete_closed_loop_containment() -> None:
+    """_safe_complete must silently contain RuntimeError on closed loops."""
+    closed_loop = asyncio.new_event_loop()
+    fut = closed_loop.create_future()
+    # Close the loop
+    closed_loop.close()
+
+    # Must not raise RuntimeError
+    _safe_complete(closed_loop, fut, result="test")
+    _safe_complete(closed_loop, fut, exc=RuntimeError("test error"))

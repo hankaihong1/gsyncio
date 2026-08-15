@@ -219,9 +219,15 @@ class ConnectionPinningServer:
         reader = asyncio.StreamReader(loop=target_loop)
         protocol = asyncio.StreamReaderProtocol(reader, loop=target_loop)
         transport: asyncio.BaseTransport | None = None
+        # WHY: client_sock is passed across threads from the acceptor loop to
+        # target_loop. If connect_accepted_socket fails (handshake error or closed loop),
+        # transport is never created and client_sock would leak an open file descriptor.
+        # sock_guard holds ownership until transport succeeds, closing on error in finally.
+        sock_guard: socket.socket | None = client_sock
 
         try:
             transport, _ = await target_loop.connect_accepted_socket(lambda: protocol, client_sock)
+            sock_guard = None
             writer = asyncio.StreamWriter(transport, protocol, reader, target_loop)
 
             # WHY: handlers may opt into the client address via a third
@@ -245,7 +251,12 @@ class ConnectionPinningServer:
         ):
             pass
         finally:
-            if transport and not transport.is_closing():
+            if sock_guard is not None:
+                try:
+                    sock_guard.close()
+                except OSError:
+                    pass
+            elif transport and not transport.is_closing():
                 try:
                     transport.close()
                 except OSError:

@@ -85,7 +85,11 @@ class GsyncioASGIWorker:
 
             parts = req_line.decode("latin1").split()
             method = parts[0] if len(parts) > 0 else "GET"
-            path = parts[1] if len(parts) > 1 else "/"
+            raw_target = parts[1] if len(parts) > 1 else "/"
+            if "?" in raw_target:
+                path, query_string = raw_target.split("?", 1)
+            else:
+                path, query_string = raw_target, ""
 
             headers: list[tuple[bytes, bytes]] = []
             content_length = 0
@@ -126,7 +130,7 @@ class GsyncioASGIWorker:
                 "method": method,
                 "path": path,
                 "raw_path": path.encode("latin1"),
-                "query_string": b"",
+                "query_string": query_string.encode("latin1"),
                 "headers": headers,
                 "client": client_addr or (self.host, 0),
                 # WHY: read the bound port from the server, not self.port —
@@ -135,57 +139,73 @@ class GsyncioASGIWorker:
                 "server": (self.host, self._server.port),
             }
 
-            async def receive() -> dict[str, Any]:
-                return {"type": "http.request", "body": body, "more_body": False}
+            body_delivered = False
+            disconnect_event = asyncio.Event()
 
-            # ASGI's start message carries no body length, and a response
-            # without Content-Length must be close-delimited — that forbids
-            # keep-alive and forces clients to read-to-EOF. So buffer the
-            # body per connection and emit Content-Length with the final
-            # body message (FastAPI/Starlette always send one, possibly empty).
-            resp_state: dict[str, Any] = {}
+            async def receive() -> dict[str, Any]:
+                nonlocal body_delivered
+                if not body_delivered:
+                    body_delivered = True
+                    return {"type": "http.request", "body": body, "more_body": False}
+                # Once the request body is consumed, subsequent calls block until disconnect
+                await disconnect_event.wait()
+                return {"type": "http.disconnect"}
+
+            headers_sent = False
+            is_chunked = False
+            status_code = 200
+            resp_headers: list[tuple[bytes, bytes]] = []
 
             async def send(message: dict[str, Any]) -> None:
-                if message["type"] == "http.response.start":
-                    resp_state["status"] = message["status"]
-                    resp_state["headers"] = list(message.get("headers", []))
-                    resp_state["body"] = bytearray()
-                elif message["type"] == "http.response.body":
-                    body = message.get("body", b"")
-                    if body:
-                        resp_state["body"] += body
-                    if message.get("more_body", False):
-                        return
+                nonlocal headers_sent, is_chunked, status_code, resp_headers
+                m_type = message["type"]
+                if m_type == "http.response.start":
+                    status_code = message["status"]
+                    resp_headers = list(message.get("headers", []))
+                elif m_type == "http.response.body":
+                    chunk = message.get("body", b"")
+                    more_body = message.get("more_body", False)
 
-                    status = resp_state["status"]
-                    # A real reason phrase instead of a hardcoded "OK":
-                    # "HTTP/1.1 404 OK" is wrong and confuses tools.
-                    try:
-                        reason = HTTPStatus(status).phrase
-                    except ValueError:
-                        reason = "OK"
-                    headers = resp_state["headers"]
-                    if not any(k.lower() == b"content-length" for k, _ in headers):
-                        headers = [
-                            *headers,
-                            (b"content-length", str(len(resp_state["body"])).encode("latin1")),
-                        ]
-                    # WHY: this worker serves one request per connection and
-                    # never reuses it — advertise close so clients (browsers
-                    # in particular) don't serialize requests waiting for a
-                    # keep-alive that never comes (S-3).
-                    headers = [*headers, (b"connection", b"close")]
-                    header_lines = [f"HTTP/1.1 {status} {reason}"]
-                    header_lines.extend(
-                        f"{k.decode('latin1')}: {v.decode('latin1')}" for k, v in headers
-                    )
-                    writer.write(("\r\n".join(header_lines) + "\r\n\r\n").encode("latin1"))
-                    if resp_state["body"]:
-                        writer.write(bytes(resp_state["body"]))
+                    if not headers_sent:
+                        headers_sent = True
+                        try:
+                            reason = HTTPStatus(status_code).phrase
+                        except ValueError:
+                            reason = "OK"
+
+                        has_cl = any(k.lower() == b"content-length" for k, _ in resp_headers)
+                        if not more_body and not has_cl:
+                            resp_headers.append(
+                                (b"content-length", str(len(chunk)).encode("latin1"))
+                            )
+                            is_chunked = False
+                        elif more_body and not has_cl:
+                            resp_headers.append((b"transfer-encoding", b"chunked"))
+                            is_chunked = True
+
+                        resp_headers.append((b"connection", b"close"))
+                        header_lines = [f"HTTP/1.1 {status_code} {reason}"]
+                        header_lines.extend(
+                            f"{k.decode('latin1')}: {v.decode('latin1')}" for k, v in resp_headers
+                        )
+                        writer.write(("\r\n".join(header_lines) + "\r\n\r\n").encode("latin1"))
+
+                    if is_chunked:
+                        if chunk:
+                            writer.write(f"{len(chunk):X}\r\n".encode("latin1") + chunk + b"\r\n")
+                        if not more_body:
+                            writer.write(b"0\r\n\r\n")
+                    else:
+                        if chunk:
+                            writer.write(chunk)
+
                     await writer.drain()
 
             # Call ASGI Application
-            await self.app(scope, receive, send)
+            try:
+                await self.app(scope, receive, send)
+            finally:
+                disconnect_event.set()
 
         # Intentionally catch all to prevent worker crash; the 500 response is the error surface
         except Exception:  # noqa: BLE001

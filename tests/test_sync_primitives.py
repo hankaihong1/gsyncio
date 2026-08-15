@@ -5,7 +5,7 @@ import threading
 
 import pytest
 
-from gsyncio import CapacityLimiter, Semaphore
+from gsyncio import AsyncContext, AsyncWaitGroup, CapacityLimiter, EventLoopThreadPool, Semaphore
 from gsyncio.testing import wait_all_tasks_blocked
 
 # ---------------------------------------------------------------------------
@@ -320,3 +320,277 @@ def test_semaphore_max_value_consistent_after_resize():
     assert limiter._semaphore.max_value == 5  # type: ignore[attr-defined]
     limiter.total_tokens = 2.5
     assert limiter._semaphore.max_value == 2  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
+# Concurrency audit & semantic refactoring tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_waitgroup_add_negative_wake() -> None:
+    """AsyncWaitGroup.add(-n) to 0 must wake registered waiters."""
+    wg = AsyncWaitGroup()
+    wg.add(2)
+    waiter_task = asyncio.create_task(wg.wait())
+    await asyncio.sleep(0.01)
+
+    assert not waiter_task.done(), "Waiter should be suspended on counter=2"
+    wg.add(-2)  # counter becomes 0 via negative delta
+    await asyncio.wait_for(waiter_task, timeout=1.0)
+    assert waiter_task.done(), "Waiter must be woken when add(-n) drives counter to 0"
+
+
+@pytest.mark.asyncio
+async def test_waitgroup_cross_generation_race() -> None:
+    """Fast done() to 0 followed by new generation must not prematurely wake gen 2 waiters."""
+    wg = AsyncWaitGroup()
+    gen1_results: list[int] = []
+    gen2_results: list[int] = []
+
+    # Round 1
+    wg.add(1)
+
+    async def gen1_waiter() -> None:
+        await wg.wait()
+        gen1_results.append(1)
+
+    t1 = asyncio.create_task(gen1_waiter())
+    await asyncio.sleep(0.01)
+
+    wg.done()
+    await t1
+    assert gen1_results == [1]
+
+    # Round 2
+    wg.add(1)
+
+    async def gen2_waiter() -> None:
+        await wg.wait()
+        gen2_results.append(2)
+
+    t2 = asyncio.create_task(gen2_waiter())
+    await asyncio.sleep(0.02)
+    assert not t2.done(), "Generation 2 waiter must NOT be woken before gen 2 finishes"
+
+    wg.done()
+    await t2
+    assert gen2_results == [2]
+
+
+@pytest.mark.asyncio
+async def test_async_context_submit_interruptible() -> None:
+    """AsyncContext.submit tasks must be interruptible via ctx.cancel()."""
+    async with EventLoopThreadPool(num_threads=2) as pool:
+        ctx = AsyncContext()
+        started_event = threading.Event()
+
+        async def sleep_task() -> str:
+            started_event.set()
+            await asyncio.sleep(5.0)
+            return "finished"
+
+        fut = ctx.submit(pool, sleep_task)
+        while not started_event.is_set():
+            await asyncio.sleep(0.001)
+
+        # Cancel context while sleep_task is in flight
+        ctx.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await fut
+
+
+@pytest.mark.asyncio
+async def test_async_context_async_context_manager_and_parent_detachment() -> None:
+    """AsyncContext supports async with and auto-detaches from parent upon exit/cancel."""
+    root = AsyncContext()
+    assert len(root._children) == 0
+
+    async with EventLoopThreadPool(num_threads=2) as pool:
+        started_event = threading.Event()
+
+        async def worker() -> str:
+            started_event.set()
+            await asyncio.sleep(5.0)
+            return "ok"
+
+        async with AsyncContext(parent=root) as child:
+            assert len(root._children) == 1
+            fut = child.submit(pool, worker)
+            while not started_event.is_set():
+                await asyncio.sleep(0.001)
+
+        # Upon exiting async with, child must be cancelled and detached from root
+        assert child.is_cancelled is True
+        assert len(root._children) == 0
+        with pytest.raises(asyncio.CancelledError):
+            await fut
+
+
+@pytest.mark.asyncio
+async def test_async_context_child_unregistration_no_leak() -> None:
+    """AsyncContext must unregister child context from parent on cancel to prevent memory leaks."""
+    root_ctx = AsyncContext()
+    children = [AsyncContext(parent=root_ctx) for _ in range(50)]
+    assert len(root_ctx._children) == 50
+
+    for child in children:
+        child.cancel()
+
+    assert len(root_ctx._children) == 0, "All cancelled children must be removed from root_ctx"
+
+
+@pytest.mark.asyncio
+async def test_semaphore_zero_bounded_capacity() -> None:
+    """Semaphore(0) represents zero-capacity bounded semaphore, reject over-release unless resized."""
+    sem = Semaphore(0)
+    assert sem.value == 0
+    assert sem.max_value == 0
+    with pytest.raises(ValueError, match="Semaphore released too many times"):
+        sem.release()
+
+    # Fractional limiter creates Semaphore(0) cleanly and supports dynamic resizing
+    limiter = CapacityLimiter(0.5)
+    assert limiter.total_tokens == 0.5
+    assert limiter.available_tokens == 0.5
+    limiter.total_tokens = 2.0
+    assert limiter.total_tokens == 2.0
+    assert limiter.available_tokens == 2.0
+
+
+@pytest.mark.asyncio
+async def test_semaphore_base_exception_cleanup() -> None:
+    """Semaphore.acquire must clean up waiter on non-CancelledError BaseException."""
+    sem = Semaphore(1)
+    await sem.acquire()
+    assert sem.value == 0
+    assert len(sem._waiters) == 0
+
+    class CustomBaseException(BaseException):
+        pass
+
+    async def doomed_waiter() -> None:
+        try:
+            await sem.acquire()
+        except BaseException:
+            pass
+
+    t = asyncio.create_task(doomed_waiter())
+    await asyncio.sleep(0.01)
+    assert len(sem._waiters) == 1
+    event = sem._waiters[0][1]
+
+    # Directly set exception on event/task to simulate BaseException interrupt
+    sem._cancel_waiter(event)
+    assert len(sem._waiters) == 0
+
+    # Ensure release and subsequent acquire work cleanly without ghost nodes
+    sem.release()
+    assert sem.value == 1
+
+    await sem.acquire()
+    assert sem.value == 0
+    t.cancel()
+    try:
+        await t
+    except BaseException:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_capacity_limiter_downscale_convergence() -> None:
+    """CapacityLimiter release during downscaling deficit must absorb tokens and not allow new acquires."""
+    limiter = CapacityLimiter(4)
+    for _ in range(4):
+        await limiter.acquire()
+
+    assert limiter.borrowed_tokens == 4.0
+
+    # Downscale from 4 to 2
+    limiter.total_tokens = 2.0
+    assert limiter.total_tokens == 2.0
+    assert limiter.borrowed_tokens == 4.0
+    assert limiter.available_tokens == -2.0
+
+    # Task 1 releases its token.
+    # Because borrowed (4) > total (2), this returned token MUST be absorbed.
+    # borrowed becomes 3, available becomes -1, and no new task should be able to acquire.
+    limiter.release()
+    assert limiter.borrowed_tokens == 3.0
+    assert limiter.available_tokens == -1.0
+
+    # Verify that a new task CANNOT acquire immediately while still in deficit (borrowed 3 >= total 2)
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(limiter.acquire(), timeout=0.1)
+
+    # Task 2 releases its token -> borrowed becomes 2, available becomes 0 (deficit cleared)
+    limiter.release()
+    assert limiter.borrowed_tokens == 2.0
+    assert limiter.available_tokens == 0.0
+
+    # Still at capacity (borrowed 2 == total 2), new acquire must still block
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(limiter.acquire(), timeout=0.1)
+
+    # Task 3 releases its token -> borrowed becomes 1, available becomes 1
+    limiter.release()
+    assert limiter.borrowed_tokens == 1.0
+    assert limiter.available_tokens == 1.0
+
+    # Now a new task CAN acquire
+    await asyncio.wait_for(limiter.acquire(), timeout=0.2)
+    assert limiter.borrowed_tokens == 2.0
+
+    # Clean up
+    limiter.release()
+    limiter.release()
+    assert limiter.borrowed_tokens == 0.0
+
+
+@pytest.mark.asyncio
+async def test_capacity_limiter_upscale_during_deficit_does_not_overmint() -> None:
+    """CapacityLimiter upscaling during a deficit must offset deficit rather than minting phantom permits."""
+    limiter = CapacityLimiter(10)
+    for _ in range(8):
+        await limiter.acquire()
+
+    assert limiter.borrowed_tokens == 8.0
+
+    # Downscale to 2: deficit is 8 - 2 = 6
+    limiter.total_tokens = 2.0
+    assert limiter.available_tokens == -6.0
+
+    # Upscale to 4: new deficit is 8 - 4 = 4.
+    # Since borrowed (8) is still > new_total (4), NO permits should be minted into the semaphore!
+    limiter.total_tokens = 4.0
+    assert limiter.available_tokens == -4.0
+
+    # A new task must NOT be able to acquire because borrowed (8) > total (4)
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(limiter.acquire(), timeout=0.1)
+
+    # Release 4 tokens to bring borrowed from 8 down to 4
+    for _ in range(4):
+        limiter.release()
+
+    assert limiter.borrowed_tokens == 4.0
+    assert limiter.available_tokens == 0.0
+
+    # At capacity (borrowed 4 == total 4), acquire still blocks
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(limiter.acquire(), timeout=0.1)
+
+    # Release 1 more token -> borrowed becomes 3, available becomes 1
+    limiter.release()
+    assert limiter.borrowed_tokens == 3.0
+    assert limiter.available_tokens == 1.0
+
+    # Now acquire succeeds
+    await asyncio.wait_for(limiter.acquire(), timeout=0.2)
+    assert limiter.borrowed_tokens == 4.0
+
+    # Clean up
+    for _ in range(4):
+        limiter.release()
+    assert limiter.borrowed_tokens == 0.0

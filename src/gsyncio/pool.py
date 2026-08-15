@@ -48,9 +48,9 @@ def _safe_complete(
                 fut.set_exception(exc)
             else:
                 fut.set_result(result)
-        except asyncio.InvalidStateError:
+        except (asyncio.InvalidStateError, RuntimeError):
             # A concurrent completion (abort vs worker delivery) won the
-            # race — nothing to deliver.
+            # race or loop was closed — nothing to deliver.
             pass
 
     try:
@@ -61,7 +61,7 @@ def _safe_complete(
                 fut.set_exception(exc)
             else:
                 fut.set_result(result)
-        except asyncio.InvalidStateError:
+        except (asyncio.InvalidStateError, RuntimeError):
             pass
 
 
@@ -71,6 +71,7 @@ class _WorkerPoolProtocol(Protocol):
     def __init__(self, num_threads: int) -> None: ...
     def pop_work(self, index: int) -> Any: ...
     def is_closed(self) -> bool: ...
+    def is_drained(self) -> bool: ...
     def close(self) -> None: ...
     def push_global(self, task: Any) -> None: ...
     def push_local(self, index: int, task: Any) -> None: ...
@@ -256,19 +257,18 @@ class EventLoopThreadPool:
                         await asyncio.sleep(0)
                     else:
                         break
-                except Exception:  # noqa: BLE001
+                except Exception as exc:  # noqa: BLE001
+                    if (
+                        _RustPoolClosedError is not None and isinstance(exc, _RustPoolClosedError)
+                    ) or (isinstance(exc, ThreadPoolClosedError)):
+                        return
                     if self._native_pool.is_closed():
                         return
                     break
 
-            # Phase 2 — Shutdown gate: if the pool is closed and the queue is
-            # drained (we reached here after Phase 1 finished), exit.
-            if self._native_pool.is_closed():
-                return
-
-            # Phase 3 — Shutting down but not yet closed: brief yield to avoid
-            # busy-waiting, then retry drain (close() may arrive soon).
-            if not self.is_running:
+            # Phase 2 — Shutdown gate: if the pool is stopping/closed and pop_work returned None,
+            # yield briefly to allow active tasks or concurrent drain to make progress.
+            if not self.is_running or self._native_pool.is_closed():
                 await asyncio.sleep(0.01)
                 continue
 
@@ -401,16 +401,24 @@ class EventLoopThreadPool:
         # Wait for workers to drain remaining buffered tasks and complete
         # them.  Workers pull items from the queue, execute them, then exit
         # their dispatch loop when pop_work() signals the pool is closed.
-        # Poll active-task counters so we only stop loops after tasks finish.
-        # Include an initial grace period so workers have time to wake up
-        # and start draining before the first active==0 check.
-        if self._metrics_collector.is_enabled:
-            await asyncio.sleep(_DRAIN_GRACE_PERIOD)
-            for _ in range(_MAX_DRAIN_ITERATIONS):  # Max ~5 seconds
+        # Poll active-task counters, native pool drained state, and outstanding tasks
+        # so we only stop loops after all tasks finish.
+        await asyncio.sleep(_DRAIN_GRACE_PERIOD)
+        for _ in range(_MAX_DRAIN_ITERATIONS):  # Max ~5 seconds
+            with self._lock:
+                outstanding_count = len(self._outstanding)
+            if self._metrics_collector.is_enabled:
                 active = sum(self._metrics_collector.get_active(i) for i in range(self.num_threads))
-                if active == 0:
-                    break
-                await asyncio.sleep(0.1)
+            else:
+                active = 0
+            is_drained = (
+                self._native_pool.is_drained()
+                if self._native_pool and hasattr(self._native_pool, "is_drained")
+                else True
+            )
+            if active == 0 and is_drained and outstanding_count == 0:
+                break
+            await asyncio.sleep(0.05)
 
         for loop in loops:
             try:
@@ -598,6 +606,11 @@ class EventLoopThreadPool:
             If `pin_to` is an invalid worker index or unmanaged event loop.
 
         """
+        if (asyncio.iscoroutine(target) or asyncio.isfuture(target)) and (args or kwargs):
+            raise TypeError(
+                "Cannot pass positional or keyword arguments when target is already a coroutine object or Future"
+            )
+
         pinned_info = self._resolve_target_worker(pin_to)
 
         try:
@@ -620,14 +633,25 @@ class EventLoopThreadPool:
 
         async def _execute_task() -> None:
             try:
-                if asyncio.iscoroutine(target) or asyncio.isfuture(target):
-                    res = await target
-                elif callable(target):
-                    res = target(*args, **kwargs)
-                    if asyncio.iscoroutine(res) or asyncio.isfuture(res):
-                        res = await res
+                if cancel_scope is not None:
+                    async with cancel_scope:
+                        if asyncio.iscoroutine(target) or asyncio.isfuture(target):
+                            res = await target
+                        elif callable(target):
+                            res = target(*args, **kwargs)
+                            if asyncio.iscoroutine(res) or asyncio.isfuture(res):
+                                res = await res
+                        else:
+                            res = target
                 else:
-                    res = target
+                    if asyncio.iscoroutine(target) or asyncio.isfuture(target):
+                        res = await target
+                    elif callable(target):
+                        res = target(*args, **kwargs)
+                        if asyncio.iscoroutine(res) or asyncio.isfuture(res):
+                            res = await res
+                    else:
+                        res = target
 
                 if cancel_scope is not None and cancel_scope.cancel_called:
                     # WHY: the scope was cancelled — the caller must not be

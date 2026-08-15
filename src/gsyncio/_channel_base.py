@@ -103,58 +103,69 @@ class _BaseChannel:  # pyright: ignore[reportUnusedClass]
         # NOT consume the item (only the select winner may consume).  Notifier
         # events are one-shot: _wakeup_notifiers pops them, so a woken notifier
         # must re-register (its caller holds the new event).
-        self._notifiers: collections.deque[tuple[asyncio.AbstractEventLoop, asyncio.Event]] = (
-            collections.deque()
-        )
+        self._notifiers: collections.deque[
+            tuple[asyncio.AbstractEventLoop, asyncio.Event | asyncio.Future[Any]]
+        ] = collections.deque()
 
     def _wakeup_next(self, waiters: collections.deque[_Waiter]) -> None:
         """Wake the first non-done future in the waiter deque."""
         _wake_all(waiters, count=1)
 
     def _wakeup_notifiers(self) -> None:
-        """Wake every registered notifier event (caller must hold ``_lock``)."""
+        """Wake every registered notifier event or select watcher (caller must hold ``_lock``)."""
         while self._notifiers:
-            loop, event = self._notifiers.popleft()
-            try:
-                loop.call_soon_threadsafe(event.set)
-            except RuntimeError:
-                # WHY: dead loop — the notifier can never wake; drop it and
-                # keep waking the rest (R5 FIX-E).
-                pass
+            entry = self._notifiers.popleft()
+            loop, target = entry[0], entry[1]
+            if isinstance(target, asyncio.Event):
+                try:
+                    loop.call_soon_threadsafe(target.set)
+                except RuntimeError:
+                    pass
+            else:
+                if target.done():
+                    continue
 
-    def _register_notifier(self, loop: asyncio.AbstractEventLoop) -> asyncio.Event | None:
-        """Register a non-consuming readiness notifier.
+                def _wake(f: asyncio.Future[Any] = target, ch: Any = self) -> None:
+                    if not f.done():
+                        f.set_result(ch)
 
-        Returns ``None`` when the channel already holds an item (the caller
-        should try_recv immediately) — checking under ``_lock`` closes the
-        lost-wakeup window: a send that lands between the qsize check and the
-        registration would otherwise wake nobody.
+                try:
+                    loop.call_soon_threadsafe(_wake)
+                except RuntimeError:
+                    pass
 
-        Raises :class:`ChannelClosedError` when the channel is closed AND
-        empty: such a channel can never become ready, so a select waiting on
-        it alone would hang forever (R3 FIX-19).  The check runs under
-        ``_lock``, so the close-vs-register race is resolved either way: a
-        close that lands after registration wakes the notifier (see
-        ``_close_waiters``), and a close that lands before it is observed
-        here.
+    def _wakeup_select_watchers(self) -> None:
+        """Wake every registered select watcher (caller must hold ``_lock``)."""
+        self._wakeup_notifiers()
+
+    def _register_select_watcher(
+        self, loop: asyncio.AbstractEventLoop, arbiter_fut: asyncio.Future[Any]
+    ) -> Any | None:
+        """Register a single-arbiter select watcher.
+
+        Returns a token if successfully registered and empty, or None if the channel
+        already has an item (caller should try_recv immediately).
         """
         with self._lock:
             if self.is_closed and self.qsize() == 0:
-                raise ChannelClosedError(_CHANNEL_CLOSED_MSG)
+                return None
             if self.qsize() > 0:
                 return None
-            event = asyncio.Event()
-            self._notifiers.append((loop, event))
-            return event
+            token = (loop, arbiter_fut)
+            self._notifiers.append(token)
+            return token
 
-    def _discard_notifier(self, loop: asyncio.AbstractEventLoop, event: asyncio.Event) -> None:
-        """Remove a notifier registration (cancelled select reader)."""
+    def _unregister_select_watcher(self, token: Any) -> None:
+        """Unregister a select watcher token."""
+        if token is None:
+            return
         with self._lock:
             remaining = collections.deque(
-                entry for entry in self._notifiers if entry[1] is not event
+                entry
+                for entry in self._notifiers
+                if entry is not token and (len(entry) < 2 or entry[1] is not token[1])
             )
-            self._notifiers.clear()
-            self._notifiers.extend(remaining)
+            self._notifiers = remaining
 
     async def recv(self, timeout: float | None = None) -> Any:
         """Receive an item from the channel.
@@ -206,8 +217,7 @@ class _BaseChannel:  # pyright: ignore[reportUnusedClass]
         exc = ChannelClosedError(_CHANNEL_CLOSED_MSG)
         _wake_all(self._getters, exc=exc)
         _wake_all(self._putters, exc=exc)
-        # Notifiers wake too: a select reader then re-checks the channel and
-        # observes the closed state via try_recv.
+        # Notifiers and select watchers wake too
         self._wakeup_notifiers()
 
     def _discard_waiter(
@@ -232,11 +242,11 @@ class _BaseChannel:  # pyright: ignore[reportUnusedClass]
         loop = asyncio.get_running_loop()
         while True:
             try:
-                with self._lock:
-                    if try_fn(item):
+                if try_fn(item):
+                    with self._lock:
                         self._wakeup_next(self._getters)
                         self._wakeup_notifiers()
-                        return
+                    return
             except RuntimeError as e:
                 raise ChannelClosedError(_CHANNEL_CLOSED_MSG) from e
 

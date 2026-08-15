@@ -241,7 +241,7 @@ pops so no single worker greedily drains the global queue.
 | `NativeWorkerPool` | PyO3 + flume | Lock-free global queue + per-worker bounded (256) local channels, batch-pull `pop_work`, soft poller gate |
 | `FastChannel` | flume | Lock-free bounded/unbounded channel, exposed to Python as `gsyncio.primitives.FastChannel` |
 | `AtomicMetrics` | `std::sync::atomic` | 64-byte-padded per-worker counters (`active`, `completed`, `global_pull_count`, `park_count`, etc.) — prevents false sharing |
-| `RawAsyncWaitGroup` | `AtomicUsize` + parking_lot `Mutex` | Go-style counter + waiter list with register-after-done double-check |
+| `RawAsyncWaitGroup` | parking_lot `Mutex<WaitGroupInner>` | Go-style atomic counter + generation + waiter list with single-mutex state machine |
 
 ### Python-side patterns
 

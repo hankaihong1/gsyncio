@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.5] - 2026-08-15
+
+### Fixed
+- **`AsyncWaitGroup`**: unified atomic state machine `(counter, generation, waiters)` under a single mutex, ensuring `add(-n)` waking zero correctly transitions generation and hands over waiters without cross-generation premature wakeup races.
+- **`select_channel`**: re-architected into a 2-phase deterministic single-future multi-registration arbiter with immediate non-blocking fast-probe (`timeout=0` no longer falsely times out with ready data), eliminating speculative cancellation overhead and recursion.
+- **`CancelScope`**: symmetric single-ledger `_injected` tracking and immutable `tuple` contextvar stack, ensuring multi-layer nested and cross-task cancellations accurately preserve outer pending cancellation counts.
+- **`EventLoopThreadPool`**: full 3-phase shutdown state machine (`RUNNING` -> `DRAINING` -> `TERMINATED`) with unlimited worker poller capability during drain phase to prevent task dropping.
+- **`ConnectionPinningServer`**: added explicit `sock_guard` RAII ownership protection during cross-thread socket handoffs to prevent file descriptor leaks on connection handshake failures.
+- **`CapacityLimiter`**: token absorption during downscale deficit and offset accounting during upscale to prevent phantom permit minting.
+- **`Condition` & `Barrier`**: robust cleanup on non-`CancelledError` `BaseException` interruptions and cross-round generation guards during `abort()`.
+
 ## [0.1.4] - 2026-08-13
 
 ### Fixed
