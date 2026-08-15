@@ -1,6 +1,7 @@
 """Concurrency primitives and synchronization tools."""
 
 import asyncio
+import builtins
 import collections
 import threading
 from collections.abc import Callable
@@ -13,7 +14,6 @@ from gsyncio._channel_base import (
     _wake_all,
 )
 from gsyncio._rust import _try_import_rust_class
-from gsyncio._taskgroup import TaskGroup
 from gsyncio.exceptions import ChannelClosedError, TimeoutError, WouldBlock
 
 
@@ -32,7 +32,7 @@ class _WaitGroupProtocol(Protocol):
     """Protocol for the Rust RawAsyncWaitGroup class."""
 
     def __init__(self) -> None: ...
-    def add(self, delta: int) -> None: ...
+    def add(self, delta: int) -> Any: ...
     def done(self) -> Any: ...
     def register_waiter(self, waiter: Any) -> bool: ...
     def unregister_waiter(self, fut: Any) -> bool: ...
@@ -62,7 +62,8 @@ class FastChannel(_BaseChannel):
         if _RustFastChannel is None:
             raise RuntimeError("_gsyncio_core Rust extension is not compiled.")
         super().__init__()
-        self._inner = _RustFastChannel(maxsize)
+        self._maxsize = max(0, int(maxsize))
+        self._inner = _RustFastChannel(self._maxsize)
 
     def close(self) -> None:
         """Close the channel.
@@ -141,6 +142,21 @@ class FastChannel(_BaseChannel):
         """
         return int(self._inner.qsize())
 
+    @property
+    def maxsize(self) -> int:
+        """Maximum number of items allowed in the channel (0 means unbounded)."""
+        return self._maxsize
+
+    def empty(self) -> bool:
+        """Return ``True`` if the channel is currently empty, ``False`` otherwise."""
+        return self.qsize() == 0
+
+    def full(self) -> bool:
+        """Return ``True`` if the channel is currently full, ``False`` otherwise."""
+        if self._maxsize <= 0:
+            return False
+        return self.qsize() >= self._maxsize
+
     async def send(self, item: Any) -> None:
         """Send an item into the channel.
 
@@ -200,7 +216,10 @@ _UNSET: Any = object()
 
 
 async def select_channel(
-    *channels: Any, timeout: float | None = None, default: Any = _UNSET
+    *channels: Any,
+    timeout: float | None = None,
+    default: Any = _UNSET,
+    _deadline: float | None = None,
 ) -> Any:
     """Select the first ready channel from multiple channel instances.
 
@@ -233,142 +252,66 @@ async def select_channel(
     if not channels:
         raise ValueError("select_channel requires at least one channel")
 
-    if default is not _UNSET:
+    loop = asyncio.get_running_loop()
+    if timeout is not None and _deadline is None:
+        _deadline = loop.time() + timeout
+
+    while True:
+        # Phase 1: Fast Probe (try_recv)
         for ch in channels:
             try:
-                return ch, ch.try_recv()
+                val = ch.try_recv()
+                return ch, val
             except (ChannelClosedError, WouldBlock):
                 continue
-        return default
 
-    result: list[tuple[Any, Any]] = []
-    _tg: TaskGroup | None = None
+        if default is not _UNSET:
+            return default
 
-    async def _notify_one(ch: Any, ready: list[Any]) -> None:
-        """Report channel readiness WITHOUT consuming — only the winner consumes.
+        if all(ch.is_closed and ch.qsize() == 0 for ch in channels):
+            raise ChannelClosedError(_CHANNEL_CLOSED_MSG)
 
-        Loops on spurious/raced wakeups (a concurrent consumer may steal the
-        item between the send and this task running).
-        """
-        while True:
-            loop = asyncio.get_running_loop()
-            try:
-                event = ch._register_notifier(loop)
-            except ChannelClosedError:
-                # WHY: a closed-and-empty channel can never become ready.
-                # Retire this notifier silently — _select decides, once the
-                # group unwinds, whether an open channel remains to wait on
-                # or every channel is closed and select must raise (R3
-                # FIX-19).  Raising here would abort the whole select even
-                # when another channel is still usable.
-                return
-            if event is None:
-                break  # already non-empty — report ready
-            try:
-                await event.wait()
-            except asyncio.CancelledError:
-                ch._discard_notifier(loop, event)
-                raise
-            break
-        ready.append(ch)
-        # WHY: TaskGroup only exits early when a child fails. Raising CancelledError
-        # is the soft failure that cancels the sibling notifiers and unwinds the
-        # group the moment the first channel reports; a normal return would make
-        # the group wait for every channel to produce data.
-        raise asyncio.CancelledError()
+        remaining_timeout: float | None = None
+        if _deadline is not None:
+            remaining_timeout = max(0.0, _deadline - loop.time())
+            if remaining_timeout <= 0:
+                raise TimeoutError("select_channel timed out")
+        elif timeout is not None and timeout <= 0:
+            raise TimeoutError("select_channel timed out")
 
-    async def _select() -> None:
-        nonlocal _tg
-        while not result:
-            ready: list[Any] = []
-            try:
-                async with TaskGroup() as tg:
-                    _tg = tg
-                    for ch in channels:
-                        tg.start_soon(_notify_one, ch, ready)
-            except BaseExceptionGroup as eg:
-                for exc in eg.exceptions:
-                    if not isinstance(exc, asyncio.CancelledError):
-                        raise
-            except asyncio.CancelledError:
-                cur = asyncio.current_task()
-                if cur is not None and cur.cancelling() > 0:
-                    raise  # the select task itself was cancelled — exit
-                # Soft-failure signal from the first reporting notifier —
-                # unwind and re-arbitrate.
-                pass
-            finally:
-                _tg = None
+        # Phase 2: Single-Future Multi-Registration Arbiter
+        arbiter_fut: asyncio.Future[Any] = loop.create_future()
+        registered_channels: list[tuple[Any, Any]] = []
 
-            # Arbitration: only the winner consumes.  The notifiers never
-            # consumed, so items on non-winner channels stay buffered and can
-            # be received later (BUG-4).
-            for ch in ready:
-                try:
-                    val = ch.try_recv()
-                    result.append((ch, val))
-                    return
-                except (ChannelClosedError, WouldBlock):
-                    # A concurrent consumer stole the item after readiness was
-                    # reported — try the next ready channel.
-                    continue
-            # Every reported channel was stolen — re-register and wait again.
-            # A *normal* group exit (no exception) means every notifier
-            # retired because its channel was closed-and-empty at
-            # registration time.  If ANY channel is still open, its notifier
-            # is still parked and the loop keeps waiting for it — so reaching
-            # this point with nothing ready and every channel closed means
-            # select would spin forever: surface it (R3 FIX-19).
+        try:
+            for ch in channels:
+                token = ch._register_select_watcher(loop, arbiter_fut)
+                if token is not None:
+                    registered_channels.append((ch, token))
+                elif not arbiter_fut.done():
+                    try:
+                        return ch, ch.try_recv()
+                    except (ChannelClosedError, WouldBlock):
+                        pass
+
             if all(ch.is_closed and ch.qsize() == 0 for ch in channels):
                 raise ChannelClosedError(_CHANNEL_CLOSED_MSG)
-            await asyncio.sleep(0)
 
-    select_task = asyncio.create_task(_select())
+            if remaining_timeout is not None:
+                ready_ch = await asyncio.wait_for(arbiter_fut, timeout=remaining_timeout)
+            else:
+                ready_ch = await arbiter_fut
 
-    try:
-        if timeout is None:
-            await select_task
-            return result[0]
-
-        done, _pending = await asyncio.wait(
-            [select_task],
-            timeout=timeout,
-        )
-
-        if done:
-            await select_task
-            return result[0]
-
-        if _tg is not None:
-            _tg.cancel_all()
-
-        select_task.cancel()
-        try:
-            await select_task
-        except (BaseExceptionGroup, asyncio.CancelledError):
-            pass
-
-        if result:
-            # WHY: the winner was decided in the same instant the timeout fired —
-            # the item was already consumed by the arbitration, so surface it
-            # instead of losing it (W4).
-            return result[0]
-
-        raise TimeoutError("select_channel timed out")
-    finally:
-        # WHY: EVERY exit path (normal, timeout, caller cancellation) must
-        # tear the select machinery down — a caller cancelled while awaiting
-        # would otherwise leave the notifier tasks parked on the channels
-        # and their registrations in place until the next send (R5 FIX-F).
-        # The notifiers' cancellation handlers discard their registrations.
-        if _tg is not None:
-            _tg.cancel_all()
-        if not select_task.done():
-            select_task.cancel()
             try:
-                await select_task
-            except (BaseExceptionGroup, asyncio.CancelledError):
-                pass
+                return ready_ch, ready_ch.try_recv()
+            except (WouldBlock, ChannelClosedError):
+                # Item consumed by concurrent reader or closed, retry arbitration iteratively
+                continue
+        except (builtins.TimeoutError, TimeoutError):
+            raise TimeoutError("select_channel timed out") from None
+        finally:
+            for ch, token in registered_channels:
+                ch._unregister_select_watcher(token)
 
 
 class AsyncWaitGroup:
@@ -400,13 +343,39 @@ class AsyncWaitGroup:
             If the counter would go negative.
 
         """
-        self._inner.add(delta)
+        waiters = self._inner.add(delta)
+        if waiters:
+            _wake_all(waiters)
 
     def done(self) -> None:
         """Decrement the counter by 1. Wakes waiters if counter reaches 0."""
         waiters = self._inner.done()
         if waiters:
             _wake_all(waiters)
+
+    def track(self, coro: Any) -> Any:
+        """Wrap a coroutine or callable, incrementing the counter immediately
+        (happens-before) and decrementing it when execution finishes (in ``finally``).
+
+        :param coro: A coroutine object, Future, or callable to wrap and track.
+        :returns: An awaitable that decrements the counter upon completion.
+        """
+        self.add(1)
+
+        async def _wrapped() -> Any:
+            try:
+                if asyncio.iscoroutine(coro) or asyncio.isfuture(coro):
+                    return await coro
+                elif callable(coro):
+                    res = coro()
+                    if asyncio.iscoroutine(res) or asyncio.isfuture(res):
+                        return await res
+                    return res
+                return coro
+            finally:
+                self.done()
+
+        return _wrapped()
 
     async def wait(self) -> None:
         """Suspend execution until the WaitGroup counter becomes 0.

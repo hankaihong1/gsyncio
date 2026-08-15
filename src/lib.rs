@@ -225,6 +225,23 @@ impl NativeWorkerPool {
             .is_none_or(|s| s.is_disconnected())
     }
 
+    fn is_drained(&self) -> bool {
+        if !self.global_receiver.is_empty() {
+            return false;
+        }
+        for buf in &self.buffers {
+            if !buf.lock().is_empty() {
+                return false;
+            }
+        }
+        for rx in &self.local_receivers {
+            if !rx.is_empty() {
+                return false;
+            }
+        }
+        true
+    }
+
     fn push_global(&self, py: Python<'_>, task: Py<PyAny>) -> PyResult<()> {
         // WHY: pop_work() signals "no work" with Ok(None).  A None task pushed
         // here would therefore be silently swallowed by every worker — reject
@@ -301,14 +318,26 @@ impl NativeWorkerPool {
                 return Ok(Some(task));
             }
             // Buffer empty – try batch pull from global (lock still held).
+            let is_draining = self.is_closed.load(Ordering::Acquire);
             let num_workers = self.local_receivers.len();
             let max_pollers = std::cmp::max(1, num_workers / 2);
-            let is_poller = self.num_polling.fetch_add(1, Ordering::Relaxed) < max_pollers;
-            let _guard = PollerGuard(&self.num_polling);
+            let is_poller =
+                is_draining || (self.num_polling.fetch_add(1, Ordering::Relaxed) < max_pollers);
+            let _guard = if !is_draining {
+                Some(PollerGuard(&self.num_polling))
+            } else {
+                None
+            };
             if is_poller {
                 let global_len = self.global_receiver.len();
-                if num_workers > 0 && global_len > 0 {
-                    let batch_size = std::cmp::min(global_len / num_workers + 1, 128);
+                if global_len > 0 {
+                    let batch_size = if is_draining {
+                        std::cmp::min(global_len, 128)
+                    } else {
+                        global_len
+                            .checked_div(num_workers)
+                            .map_or(1, |d| std::cmp::min(d + 1, 128))
+                    };
                     let mut pulled = 0usize;
                     for _ in 0..batch_size {
                         match self.global_receiver.try_recv() {
@@ -342,18 +371,24 @@ impl NativeWorkerPool {
             }
         }
 
-        // 3. Nothing available.
-        if self.is_closed() {
-            Err(ThreadPoolClosedError::new_err("Pool is closed"))
-        } else {
-            // Worker idle — increment park count.
-            if let Some(ref metrics) = *self.metrics.lock() {
-                metrics.borrow(py).inc_park(index);
-                let depth = self.global_receiver.len();
-                sample_depth(metrics, index, depth);
+        // 3. Exit condition: only when in Draining state and global queue + buffer are completely empty!
+        let is_draining = self.is_closed.load(Ordering::Acquire);
+        if is_draining {
+            let buffer_empty = index >= self.buffers.len() || self.buffers[index].lock().is_empty();
+            if self.global_receiver.is_empty() && buffer_empty {
+                return Err(ThreadPoolClosedError::new_err("Pool is closed and drained"));
+            } else {
+                return Ok(None); // Still draining, yield to let other workers/events run
             }
-            Ok(None)
         }
+
+        // Worker idle — increment park count.
+        if let Some(ref metrics) = *self.metrics.lock() {
+            metrics.borrow(py).inc_park(index);
+            let depth = self.global_receiver.len();
+            sample_depth(metrics, index, depth);
+        }
+        Ok(None)
     }
 }
 
@@ -431,10 +466,15 @@ impl FastChannel {
 /// `wait()` coroutine from whichever thread calls `done()`.
 type Waiter = (Py<PyAny>, Py<PyAny>);
 
+struct WaitGroupInner {
+    counter: usize,
+    generation: u64,
+    waiters: Vec<Waiter>,
+}
+
 #[pyclass(module = "gsyncio._gsyncio_core")]
 pub struct RawAsyncWaitGroup {
-    counter: Arc<AtomicUsize>,
-    waiters: Arc<Mutex<Vec<Waiter>>>,
+    state: Arc<Mutex<WaitGroupInner>>,
 }
 
 #[pymethods]
@@ -442,64 +482,59 @@ impl RawAsyncWaitGroup {
     #[new]
     fn new() -> Self {
         RawAsyncWaitGroup {
-            counter: Arc::new(AtomicUsize::new(0)),
-            waiters: Arc::new(Mutex::new(Vec::new())),
+            state: Arc::new(Mutex::new(WaitGroupInner {
+                counter: 0,
+                generation: 0,
+                waiters: Vec::new(),
+            })),
         }
     }
 
     /// Add `delta` to the counter (Go `sync.WaitGroup.Add` semantics).
     ///
     /// Negative deltas are legal, but the counter must never go below zero:
-    /// an `add()` that would underflow raises `RuntimeError` (mirroring Go's
-    /// panic on a negative counter). The update is a CAS loop so concurrent
-    /// `add()`/`done()` calls are never lost and the underflow check is
-    /// race-free.
-    fn add(&self, delta: isize) -> PyResult<()> {
-        let mut prev = self.counter.load(Ordering::Acquire); // add(): Acquire pairs with done()'s AcqRel
-        loop {
-            let new_val = if delta < 0 {
-                let magnitude = delta.unsigned_abs();
-                if prev < magnitude {
+    /// an `add()` that would underflow raises `RuntimeError`.
+    /// Returns `Some(waiters)` when counter reaches 0 to wake registered waiters.
+    fn add(&self, delta: isize) -> PyResult<Option<Vec<Waiter>>> {
+        let mut guard = self.state.lock();
+        if delta < 0 {
+            let magnitude = delta.unsigned_abs();
+            if guard.counter < magnitude {
+                return Err(PyRuntimeError::new_err(
+                    "WaitGroup counter went negative: add() with negative delta",
+                ));
+            }
+            guard.counter -= magnitude;
+            if guard.counter == 0 {
+                guard.generation = guard.generation.wrapping_add(1);
+                let waiters = std::mem::take(&mut guard.waiters);
+                return Ok(Some(waiters));
+            }
+        } else {
+            match guard.counter.checked_add(delta as usize) {
+                Some(v) => guard.counter = v,
+                None => {
                     return Err(PyRuntimeError::new_err(
-                        "WaitGroup counter went negative: add() with negative delta",
+                        "WaitGroup counter overflowed: add() with positive delta",
                     ));
                 }
-                prev - magnitude
-            } else {
-                match prev.checked_add(delta as usize) {
-                    Some(v) => v,
-                    None => {
-                        return Err(PyRuntimeError::new_err(
-                            "WaitGroup counter overflowed: add() with positive delta",
-                        ));
-                    }
-                }
-            };
-            match self.counter.compare_exchange_weak(
-                prev,
-                new_val,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                // AcqRel: Release makes the increment visible to done()/register_waiter,
-                // Acquire observes done()'s decrements racing with this add().
-                Ok(_) => return Ok(()),
-                Err(actual) => prev = actual,
             }
         }
+        Ok(None)
     }
 
     fn done(&self) -> PyResult<Option<Vec<Waiter>>> {
-        let prev = self.counter.fetch_sub(1, Ordering::AcqRel); // done(): AcqRel — Acquire observes add()s, Release so register_waiter sees decrement
-        if prev == 0 {
+        let mut guard = self.state.lock();
+        if guard.counter == 0 {
             return Err(PyRuntimeError::new_err(
                 "WaitGroup counter went negative: too many done() calls",
             ));
         }
-        if prev == 1 {
-            let mut guard = self.waiters.lock();
-            let res = std::mem::take(&mut *guard);
-            Ok(Some(res))
+        guard.counter -= 1;
+        if guard.counter == 0 {
+            guard.generation = guard.generation.wrapping_add(1);
+            let waiters = std::mem::take(&mut guard.waiters);
+            Ok(Some(waiters))
         } else {
             Ok(None)
         }
@@ -510,47 +545,25 @@ impl RawAsyncWaitGroup {
     /// Returns `true` if the counter is already zero (waiter is not registered
     /// and the caller should proceed immediately). Returns `false` if the waiter
     /// was registered and will be notified by a future `done()` call.
-    ///
-    /// # Ordering constraint (matches Go `sync.WaitGroup.Wait`)
-    ///
-    /// The unlocked fast-path in this method (checking `counter == 0` without
-    /// holding the waiters lock) can lose against a concurrent `add()`:
-    /// if `add()` increments from 0→1 *after* the counter check but *before*
-    /// the waiter is pushed, the waiter will never be woken. Callers must
-    /// ensure all `add()` calls with a positive delta happen-before
-    /// `register_waiter()`.
     fn register_waiter(&self, waiter: Waiter) -> bool {
-        if self.counter.load(Ordering::Acquire) == 0 {
-            // register_waiter: Acquire sees done()'s decrement
+        let mut guard = self.state.lock();
+        if guard.counter == 0 {
             true
         } else {
-            let mut guard = self.waiters.lock();
-            if self.counter.load(Ordering::Relaxed) == 0 {
-                // Inside Mutex lock — ordering from lock acquire
-                true
-            } else {
-                guard.push(waiter);
-                false
-            }
+            guard.waiters.push(waiter);
+            false
         }
     }
 
     /// Removes a previously registered waiter by future identity.
     ///
     /// Returns `true` if the waiter was still queued and is now removed,
-    /// `false` if it had already been handed over by a `done()`-to-zero
-    /// (in which case the waker's done-check simply skips it).
-    ///
-    /// WHY: a cancelled `wait()` that never unregisters would leave its
-    /// entry in the list until the counter next reaches zero — repeated
-    /// cancelled waits grow the list without bound on long-lived groups
-    /// (R5 FIX-D).  The identity check is a plain pointer comparison, so
-    /// no Python code runs under the mutex.
+    /// `false` if it had already been handed over by a `done()`-to-zero.
     fn unregister_waiter(&self, fut: Py<PyAny>) -> bool {
-        let mut guard = self.waiters.lock();
-        let before = guard.len();
-        guard.retain(|(_, f)| !f.is(&fut));
-        guard.len() != before
+        let mut guard = self.state.lock();
+        let before = guard.waiters.len();
+        guard.waiters.retain(|(_, f)| !f.is(&fut));
+        guard.waiters.len() != before
     }
 }
 
@@ -709,5 +722,49 @@ mod tests {
         // AtomicUsize wraps around on underflow (well-defined behavior).
         metrics.dec_active(0);
         // If we got here without panicking, the test passes.
+    }
+
+    #[test]
+    fn test_waitgroup_add_negative_returns_waiters() {
+        Python::attach(|py| {
+            let wg = RawAsyncWaitGroup::new();
+            wg.add(2).unwrap();
+            let fut = py.None();
+            let waiter: Waiter = (py.None(), fut.clone_ref(py));
+            assert!(!wg.register_waiter(waiter));
+            let res = wg.add(-2).unwrap();
+            assert!(res.is_some());
+            let waiters = res.unwrap();
+            assert_eq!(waiters.len(), 1);
+        });
+    }
+
+    #[test]
+    fn test_nativeworkerpool_shutdown_drain_is_drained() {
+        Python::attach(|py| {
+            let pool = NativeWorkerPool::new(2);
+            let task1: Py<PyAny> = pyo3::types::PyInt::new(py, 1).into_any().unbind();
+            let task2: Py<PyAny> = pyo3::types::PyInt::new(py, 2).into_any().unbind();
+            pool.push_global(py, task1).unwrap();
+            pool.push_local(0, task2, py).unwrap();
+
+            assert!(!pool.is_drained());
+            pool.close();
+            assert!(pool.is_closed());
+            assert!(!pool.is_drained());
+
+            // Pop first task (from global queue batch pull)
+            let popped1 = pool.pop_work(0, py).unwrap();
+            assert!(popped1.is_some());
+
+            // Pop second task (from worker 0's local queue)
+            let popped2 = pool.pop_work(0, py).unwrap();
+            assert!(popped2.is_some());
+
+            assert!(pool.is_drained());
+            // Once drained, pop_work must return ThreadPoolClosedError
+            let result = pool.pop_work(0, py);
+            assert!(result.is_err());
+        });
     }
 }

@@ -1,5 +1,8 @@
 import asyncio
+import socket
 import threading
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
@@ -300,3 +303,81 @@ async def test_server_handler_exception_no_noise(capsys):
             await server.close()
     err = capsys.readouterr().err
     assert "never retrieved" not in err
+
+
+# ---------------------------------------------------------------------------
+# Concurrency audit & semantic refactoring tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_server_handshake_failure_no_fd_leak() -> None:
+    """ConnectionPinningServer closes socket if transport creation fails."""
+    pool = MagicMock()
+    server = ConnectionPinningServer(pool)
+
+    mock_sock = MagicMock(spec=socket.socket)
+    target_loop = MagicMock(spec=asyncio.AbstractEventLoop)
+    target_loop.connect_accepted_socket = AsyncMock(
+        side_effect=OSError("connection handshake failed")
+    )
+
+    async def handler(r: Any, w: Any) -> None:
+        pass
+
+    await server._run_pinned_connection(mock_sock, target_loop, handler)
+
+    # Socket must be closed via sock_guard
+    mock_sock.close.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_asgi_path_query_string_separation() -> None:
+    """GsyncioASGIWorker must separate path and query_string according to ASGI 3.0."""
+    received_scope: dict[str, Any] = {}
+
+    async def app(scope: Any, receive: Any, send: Any) -> None:
+        received_scope.update(scope)
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok", "more_body": False})
+
+    async with EventLoopThreadPool(num_threads=2) as pool:
+        worker = GsyncioASGIWorker(app=app, pool=pool, host="127.0.0.1", port=0)
+        await worker.start()
+        reader, writer = await asyncio.open_connection("127.0.0.1", worker.port)
+        writer.write(b"GET /api/v1/items?search=rust&limit=20 HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        await writer.drain()
+        await reader.read(1024)
+        writer.close()
+        await writer.wait_closed()
+        await worker.close()
+
+    assert received_scope["path"] == "/api/v1/items"
+    assert received_scope["raw_path"] == b"/api/v1/items"
+    assert received_scope["query_string"] == b"search=rust&limit=20"
+
+
+@pytest.mark.asyncio
+async def test_asgi_streaming_chunked_response() -> None:
+    """GsyncioASGIWorker supports chunked streaming responses."""
+
+    async def streaming_app(scope: Any, receive: Any, send: Any) -> None:
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"chunk1", "more_body": True})
+        await send({"type": "http.response.body", "body": b"chunk2", "more_body": False})
+
+    async with EventLoopThreadPool(num_threads=2) as pool:
+        worker = GsyncioASGIWorker(app=streaming_app, pool=pool, host="127.0.0.1", port=0)
+        await worker.start()
+        reader, writer = await asyncio.open_connection("127.0.0.1", worker.port)
+        writer.write(b"GET /stream HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        await writer.drain()
+
+        raw_data = await reader.read()
+        writer.close()
+        await writer.wait_closed()
+        await worker.close()
+
+    assert b"transfer-encoding: chunked" in raw_data.lower()
+    assert b"chunk1" in raw_data
+    assert b"chunk2" in raw_data

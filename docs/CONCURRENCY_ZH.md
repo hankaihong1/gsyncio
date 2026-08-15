@@ -46,15 +46,15 @@ waiter 结构，Rust 侧用原子操作 + flume 承载数据面**。跨线程唤
 | 原语 | 保护锁 | waiter 结构 | 关键不变量 |
 |---|---|---|---|
 | `Barrier` | `threading.Mutex` | `list[(loop, asyncio.Event)]` | `_generation` 计数器绑定轮次；取消处理先查 generation 再删条目（`_sync.py:628-643`）。**取消注意（FIX-12）**：轮次凑齐前有 party 被取消，其余 party 将永久阻塞——barrier 没有自动 broken 状态；`abort()` 是文档化的逃生通道 |
-| `AsyncWaitGroup` | Rust：`AtomicUsize` counter + parking_lot `Mutex` | `Vec[(loop, future)]` | `done()` 到 0 时 `mem::take` 整体移交 waiter 列表（`lib.rs:443-457`）；`register_waiter` 双检：无锁快路径 + 锁内复检（`lib.rs:473-487`） |
+| `AsyncWaitGroup` | Rust：`parking_lot::Mutex<WaitGroupInner>` | `Vec[(loop, future)]` | 单互斥锁统一管理 `counter`、`generation` 和 `waiters`；`add(-n)` 与 `done()` 归零时原子递增 `generation` 并通过 `mem::take` 移交全部 waiter 列表（`lib.rs:465-540`）；`register_waiter` 快路径对已归零状态立即返回已就绪 |
 | `AsyncOnce` | `threading.Lock` | `deque[(loop, future)]` | leader/follower：锁内决定谁执行、follower 锁内注册，leader 在 finally 中**持锁** `_wake_all`——注册与唤醒在同一把锁下，无 lost-wakeup 窗口（`primitives.py:377-416`） |
 
 ### 1.5 取消与结构化并发
 
 | 组件 | 机制 | 关键点 |
 |---|---|---|
-| `CancelScope` | 每任务 contextvars 栈 + `task.cancelling()`/`uncancel()` | shield 进入时 snapshot 取消计数并清零，退出时恢复（`_cancel.py:141-146, 184-189`） |
-| `select_channel` | `TaskGroup` + 每个 channel 一个 reader | reader 成功读到后**主动抛 `CancelledError`** 触发组提前退出——正常 return 会让组等所有通道（`primitives.py:248-255`）。**仲裁非原子（FIX-16）**：就绪报告不消费；并发消费者可能在报告与赢家 `try_recv` 之间抢走数据，select 因此循环重注册——高竞争下特定通道可能被延迟/饿着（文档化行为，非 bug） |
+| `CancelScope` | 每任务 contextvars 栈 + 单账本 `_injected` | shield 进入时 snapshot 取消计数并清零，退出时恢复；单账本精确跟踪实际注入并对称冲销（`_cancel.py`） |
+| `select_channel` | 两阶段确定性仲裁器（Phase 1 快速 `try_recv`，Phase 2 共享单 Future 多通道注册） | 废除 TaskGroup 投机取消，赢家通过 `try_recv()` 消费并在 `finally` 中切除所有通道 watcher 注册（`primitives.py:230-290`） |
 
 ---
 
@@ -161,6 +161,70 @@ O(n²)——实测 5000 waiter ≈ 560 ms（R2 探针 E2）。真实 party 数�
 - 调用可能再取锁的函数前先 `drop(guard)` 释放已持锁。
 **例证**：`push_local` 满队列回退时先 `drop(guard)` 再 `push_global`
 （`lib.rs:276-280`）。
+
+### 模式 9：组件特定反模式与误用陷阱
+
+**症状**：由于违反各组件特定的 API 契约或并发边界，导致运行时报错、死锁、饿死或限流失效。
+
+**1. `AsyncWaitGroup.track` 协程对象误传给 Callable 接收方**：
+- **陷阱**：`wg.track(coro)` 在调用瞬间即执行 `self.add(1)`，并返回包裹了 `finally: self.done()` 的协程对象（Coroutine Object）。若误传给期望 Callable 的 `TaskGroup.start_soon`，会引发 `TypeError` 并导致计数器永久泄漏与死锁。
+- **错误示例**：
+```python
+async def worker():
+    pass
+
+
+async with TaskGroup() as tg:
+    wg = AsyncWaitGroup()
+    tg.start_soon(wg.track(worker()))  # TypeError! 计数器永久泄漏!
+```
+- **正确姿势**：
+```python
+async with TaskGroup() as tg:
+    wg = AsyncWaitGroup()
+
+    async def tracked_worker():
+        await wg.track(worker())
+
+    tg.start_soon(tracked_worker)
+```
+
+**2. `select_channel` 高吞吐饱和社会下的顺序饿死**：
+- **陷阱**：`select_channel` 在 Phase 1 中按照参数由左至右顺序确定性探测。若多个通道持续有数据堆积，右侧通道会被 100% 饿死。
+- **错误示例**：
+```python
+while True:
+    ch, val = await select_channel(ch1, ch2)
+    process(val)
+```
+- **正确姿势**：若需要就绪通道间的统计学公平调度，在循环轮询前打乱（shuffle）通道列表。
+
+**3. `Barrier` 单方超时取消未调用 `abort()`**：
+- **陷阱**：`Barrier` 在单方取消时不自动进入 broken 破损状态（FIX-12）。若某一参与方超时离开，其余 `parties - 1` 个参与方将永久阻塞。
+- **错误示例**：
+```python
+try:
+    await asyncio.wait_for(barrier.wait(), timeout=1.0)
+except TimeoutError:
+    pass  # 其余参与方永久挂死!
+```
+- **正确姿势**：
+```python
+try:
+    await asyncio.wait_for(barrier.wait(), timeout=1.0)
+except TimeoutError:
+    barrier.abort()
+    raise
+```
+
+**4. `CapacityLimiter` 匿名归还与浮点容量感知断层**：
+- **陷阱**：`CapacityLimiter` 是匿名令牌模型（不校验借用者 Task 身份），且浮点容量（如 `2.5`）底层信号量仅有整型容量（`2`）。
+- **错误示例**：
+```python
+if limiter.available_tokens > 0:  # 例如 0.5 > 0
+    await limiter.acquire()  # 若整型容量已借满则必然阻塞!
+```
+- **正确姿势**：统一推荐 `async with limiter:` 上下文管理器；仅在 `available_tokens >= 1.0` 时期望无阻借出。
 
 ---
 

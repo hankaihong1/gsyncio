@@ -1,5 +1,6 @@
 import asyncio
 import threading
+import time
 
 import pytest
 
@@ -694,3 +695,111 @@ async def test_getter_cancel_forwards_wakeup_to_next_getter() -> None:
     # The buffered item must still reach B.
     await asyncio.wait_for(b, timeout=1.0)
     assert recv_done == ["x"]
+
+
+def test_fastchannel_empty_full_maxsize() -> None:
+    """FastChannel should correctly report empty(), full(), and maxsize."""
+    ch_unbounded = FastChannel(0)
+    assert ch_unbounded.maxsize == 0
+    assert ch_unbounded.empty() is True
+    assert ch_unbounded.full() is False
+
+    ch_unbounded.try_send(1)
+    assert ch_unbounded.empty() is False
+    assert ch_unbounded.full() is False
+
+    ch_bounded = FastChannel(2)
+    assert ch_bounded.maxsize == 2
+    assert ch_bounded.empty() is True
+    assert ch_bounded.full() is False
+
+    ch_bounded.try_send("a")
+    assert ch_bounded.empty() is False
+    assert ch_bounded.full() is False
+
+    ch_bounded.try_send("b")
+    assert ch_bounded.empty() is False
+    assert ch_bounded.full() is True
+
+
+# ---------------------------------------------------------------------------
+# Concurrency audit & semantic refactoring tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_select_channel_timeout_zero_no_false_timeout() -> None:
+    """select_channel with ready data and timeout=0 must return ready channel immediately."""
+    ch1 = FastChannel()
+    ch2 = FastChannel()
+
+    ch1.try_send("hello")
+
+    # timeout=0 must immediately probe ch1 without false TimeoutError
+    ch, val = await select_channel(ch1, ch2, timeout=0)
+    assert ch is ch1
+    assert val == "hello"
+
+
+@pytest.mark.asyncio
+async def test_select_channel_empty_timeout_zero() -> None:
+    """select_channel on empty channels with timeout=0 raises TimeoutError."""
+    ch1 = FastChannel()
+    ch2 = FastChannel()
+
+    with pytest.raises(TimeoutError):
+        await select_channel(ch1, ch2, timeout=0)
+
+
+@pytest.mark.asyncio
+async def test_select_channel_deadline_contention_retry() -> None:
+    """select_channel contention retry must deduct elapsed time against deadline."""
+    ch1 = FastChannel()
+    ch2 = FastChannel()
+
+    start = time.monotonic()
+    with pytest.raises(TimeoutError):
+        await select_channel(ch1, ch2, timeout=0.1)
+    elapsed = time.monotonic() - start
+    assert 0.08 <= elapsed < 0.5, f"Timeout took {elapsed}s, expected ~0.1s"
+
+
+@pytest.mark.asyncio
+async def test_select_channel_contention_iterative() -> None:
+    """select_channel with contended consumers must not raise RecursionError."""
+    ch1 = FastChannel()
+    ch2 = FastChannel()
+
+    async def producer() -> None:
+        for i in range(50):
+            await ch1.send(i)
+            await ch2.send(i)
+
+    async def consumer() -> list[int]:
+        consumed: list[int] = []
+        for _ in range(50):
+            try:
+                _, val = await select_channel(ch1, ch2, timeout=0.5)
+                consumed.append(val)
+            except TimeoutError:
+                break
+        return consumed
+
+    prod_task = asyncio.create_task(producer())
+    c1 = asyncio.create_task(consumer())
+    c2 = asyncio.create_task(consumer())
+
+    await prod_task
+    r1, r2 = await asyncio.gather(c1, c2)
+    assert len(r1) + len(r2) == 100
+
+
+@pytest.mark.asyncio
+async def test_select_channel_timeout_error_tuple_catch() -> None:
+    """select_channel properly converts asyncio.TimeoutError and passes through custom exceptions."""
+    ch1 = FastChannel()
+    ch2 = FastChannel()
+
+    # Normal timeout raises gsyncio.exceptions.TimeoutError
+    with pytest.raises(TimeoutError, match="select_channel timed out"):
+        await select_channel(ch1, ch2, timeout=0.05)

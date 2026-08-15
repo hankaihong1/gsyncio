@@ -251,3 +251,24 @@ async def test_once_cancelled_leader_follower_gets_runtime_error() -> None:
     with pytest.raises(RuntimeError, match="cancelled"):
         await ft
     assert not ft.cancelled()  # pre-fix: True (CE poisoning)
+
+
+@pytest.mark.asyncio
+async def test_waitgroup_track_happens_before() -> None:
+    """AsyncWaitGroup.track wraps tasks with automatic add(1) and done()."""
+    wg = AsyncWaitGroup()
+    completed: list[int] = []
+
+    async def worker(idx: int) -> int:
+        await asyncio.sleep(0.01)
+        completed.append(idx)
+        return idx * 2
+
+    # Spawn 5 workers using wg.track
+    tasks = [asyncio.create_task(wg.track(worker(i))) for i in range(5)]
+
+    # wg.wait() should block until all 5 tasks finish
+    await wg.wait()
+    assert len(completed) == 5
+    results = await asyncio.gather(*tasks)
+    assert results == [0, 2, 4, 6, 8]

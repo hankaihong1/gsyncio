@@ -492,12 +492,12 @@ async def test_aenter_raise_does_not_leak_stack() -> None:
     # Mark the ancestor cancelled WITHOUT task.cancel(): the point here is the
     # aenter-time _effectively_cancelled() check, not loop-injected cancels.
     outer._cancel_called = True  # type: ignore[reportAttributeAccessIssue]
-    assert _get_scope_stack() == [outer]
+    assert _get_scope_stack() == (outer,)
 
     inner = CancelScope(deadline=asyncio.get_running_loop().time() + 60)
     with pytest.raises(asyncio.CancelledError):
         await inner.__aenter__()
-    assert _get_scope_stack() == [outer]  # stale entry popped
+    assert _get_scope_stack() == (outer,)  # stale entry popped
     assert inner._task is None  # type: ignore[reportAttributeAccessIssue]
     assert inner._deadline_handle is None  # type: ignore[reportAttributeAccessIssue]
 
@@ -851,3 +851,142 @@ def test_cancel_ledger_requires_actual_injection() -> None:
             pass
 
     asyncio.run(main())
+
+
+@pytest.mark.asyncio
+async def test_cancel_scope_dynamic_deadline_extension() -> None:
+    """Dynamically updating scope.deadline extends or shortens the timeout."""
+    loop = asyncio.get_running_loop()
+    task = asyncio.current_task()
+    assert task is not None
+
+    async with CancelScope(deadline=loop.time() + 0.05) as scope:
+        # Extend deadline before it fires
+        scope.deadline = loop.time() + 0.5
+        await asyncio.sleep(0.1)
+        assert not scope.cancel_called
+
+    # Shorten deadline to past triggers immediate cancellation
+    with pytest.raises(TimeoutError):
+        async with fail_after(10.0) as scope:
+            scope.deadline = loop.time() - 1.0
+            await asyncio.sleep(0.5)
+
+
+@pytest.mark.asyncio
+async def test_cancel_scope_dynamic_shield_toggle() -> None:
+    """Dynamically enabling and disabling shield protects critical section."""
+    task = asyncio.current_task()
+    assert task is not None
+
+    async with CancelScope() as scope:
+        task.cancel()
+        assert task.cancelling() == 1
+
+        # Turn on shield: absorbs pending cancellation
+        scope.shield = True
+        assert task.cancelling() == 0
+        await asyncio.sleep(0.01)  # must not raise CancelledError
+
+        # Turn off shield: restores cancellation
+        scope.shield = False
+        assert task.cancelling() == 1
+
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.sleep(0.01)
+
+
+# ---------------------------------------------------------------------------
+# Concurrency audit & semantic refactoring tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cancel_scope_double_uncancel_outer_preserved() -> None:
+    """CancelScope.__aexit__ single ledger must preserve outer cancellation."""
+    task = asyncio.current_task()
+    assert task is not None
+    task.cancel()
+    assert task.cancelling() == 1
+
+    async with move_on_after(0):
+        # Await-free sync block
+        pass
+
+    # Outer cancellation must not be swallowed
+    assert task.cancelling() == 1, (
+        f"Expected outer cancelling count to remain 1, got {task.cancelling()}"
+    )
+    # Clean up outer cancellation so the test ends cleanly
+    task.uncancel()
+
+
+@pytest.mark.asyncio
+async def test_cancel_scope_contextvar_tuple_isolation() -> None:
+    """CancelScope must use immutable tuple stack to prevent cross-task pollution."""
+    async with CancelScope() as parent_scope:
+        started = asyncio.Event()
+
+        async def worker() -> None:
+            async with CancelScope() as child_scope:
+                child_scope.cancel()
+                started.set()
+                try:
+                    await asyncio.sleep(1)
+                except asyncio.CancelledError:
+                    await asyncio.sleep(1)
+
+        t = asyncio.create_task(worker())
+        await started.wait()
+
+        # Parent task must NOT be cancelled by child scope
+        await checkpoint()
+        assert not parent_scope.cancel_called
+
+        t.cancel()
+        try:
+            await t
+        except BaseException:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_cancel_scope_cross_thread_post_scope_delivery_guard() -> None:
+    """Cross-thread cancel delivered after scope exit must not cancel subsequent task work."""
+    scope_ref: list[CancelScope] = []
+    scope_exited = asyncio.Event()
+
+    async def worker() -> str:
+        async with CancelScope() as scope:
+            scope_ref.append(scope)
+        # Exited scope
+        scope_exited.set()
+        await asyncio.sleep(0.05)
+        return "completed"
+
+    task = asyncio.create_task(worker())
+    await scope_exited.wait()
+
+    # Now cancel the scope from another logical thread/loop perspective
+    scope_ref[0].cancel()
+
+    # Worker must complete successfully without being cancelled post-scope
+    result = await asyncio.wait_for(task, timeout=1.0)
+    assert result == "completed"
+
+
+@pytest.mark.asyncio
+async def test_shield_restores_outer_cancellation_on_exit() -> None:
+    """CancelScope(shield=True) preserves and restores outer cancellation count on exit."""
+    task = asyncio.current_task()
+    assert task is not None
+
+    task.cancel()
+    assert task.cancelling() == 1, "Pre-condition: task should have 1 pending cancel"
+
+    async with CancelScope(shield=True):
+        assert task.cancelling() == 0, "Inside shield: pending cancel must be suppressed"
+        await asyncio.sleep(0.01)
+
+    assert task.cancelling() == 1, "Post-condition: outer cancel count must be restored to 1"
+    task.uncancel()

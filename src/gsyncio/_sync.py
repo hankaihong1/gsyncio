@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import threading
+from collections.abc import Callable
 from typing import Any, Self
 
 # ============================================================================
@@ -74,11 +75,10 @@ class Lock:
             if self._owner is task:
                 raise RuntimeError("Lock is not reentrant: already held by the current task")
             # WHY: The owner task can die without releasing (CancelledError racing
-            # release). Without this break every future acquirer waits forever on
-            # a lock whose owner will never call release(); the check recycles the
-            # lock to the next caller instead of leaking it.
+            # release). We delegate recovery to _release_locked() to pass ownership
+            # to the first queued waiter (preserving FIFO) rather than barging in.
             if self._owner is not None and self._owner.done():
-                self._owner = None
+                self._release_locked()
 
             if self._owner is None:
                 self._owner = task
@@ -89,7 +89,7 @@ class Lock:
 
         try:
             await event.wait()
-        except asyncio.CancelledError:
+        except BaseException:
             with self._lock:
                 # WHY: release() may already have popped this waiter and handed
                 # it ownership (BUG-8).  The lock would then belong to a dead
@@ -248,7 +248,7 @@ class Semaphore:
 
         try:
             await event.wait()
-        except asyncio.CancelledError:
+        except BaseException:
             self._cancel_waiter(event)
             raise
 
@@ -379,17 +379,9 @@ class CapacityLimiter:
                 self._semaphore._max_value = new_int
                 diff = new_int - old_int
                 if diff > 0:
-                    # WHY (R9 F-3): mint exactly `diff` tokens (anyio delta
-                    # semantics, _backends/_asyncio.py:2079-2087), never a
-                    # target value.  A target computed from _borrowed is
-                    # wrong when an acquire on another thread sits between
-                    # its semaphore decrement and its _borrowed increment:
-                    # the stale borrowed count makes the target one too high
-                    # and mints a phantom token (probe P3: value+borrowed
-                    # was 5 against a budget of 4).  Minting by delta is
-                    # exact in both interleavings — the in-flight token
-                    # already took its own slot out of the pool.
-                    for _ in range(diff):
+                    # Tokens should only be minted if the new capacity exceeds currently allocated tokens (borrowed + available)
+                    tokens_to_add = max(0, new_int - (self._borrowed + self._semaphore._value))
+                    for _ in range(tokens_to_add):
                         delivered = False
                         while self._semaphore._waiters:
                             loop, event = self._semaphore._waiters.popleft()
@@ -470,22 +462,24 @@ class CapacityLimiter:
         with self._total_lock:
             if self._borrowed <= 0:
                 raise ValueError("CapacityLimiter released too many times")
-            with self._semaphore._lock:
-                token_delivered = False
-                while self._semaphore._waiters:
-                    loop, event = self._semaphore._waiters.popleft()
-                    try:
-                        loop.call_soon_threadsafe(event.set)
-                        token_delivered = True
-                        break
-                    except RuntimeError:
-                        # WHY: dead loop — keep looking for a live waiter;
-                        # if none remain the token is absorbed below (R5
-                        # FIX-E).
-                        continue
-                if not token_delivered and self._semaphore._value < self._semaphore._max_value:
-                    self._semaphore._value += 1
-                # else: over-budget return — absorbed; value stays at max
+            can_restore = (self._borrowed - 1) < int(self._total_tokens)
+            if can_restore:
+                with self._semaphore._lock:
+                    token_delivered = False
+                    while self._semaphore._waiters:
+                        loop, event = self._semaphore._waiters.popleft()
+                        try:
+                            loop.call_soon_threadsafe(event.set)
+                            token_delivered = True
+                            break
+                        except RuntimeError:
+                            # WHY: dead loop — keep looking for a live waiter;
+                            # if none remain the token is absorbed below (R5
+                            # FIX-E).
+                            continue
+                    if not token_delivered and self._semaphore._value < self._semaphore._max_value:
+                        self._semaphore._value += 1
+            # else: over-budget return — absorbed; token is neither delivered nor added to value
             self._borrowed -= 1
 
     async def __aenter__(self) -> Self:
@@ -633,11 +627,23 @@ class Condition:
                     await cond.wait()
                 # predicate is true and lock is still held here
         """
+        try:
+            task = asyncio.current_task()
+        except RuntimeError:
+            task = None
+        if task is None or not self._lock.locked or self._lock.owner is not task:
+            raise RuntimeError("cannot wait on un-acquired lock")
+
         loop = asyncio.get_running_loop()
         event = asyncio.Event()
         with self._waiters_lock:
             self._waiters.append((loop, event))
-        self._lock.release()
+        try:
+            self._lock.release()
+        except BaseException:
+            self._discard_waiter(event)
+            raise
+
         try:
             await event.wait()
         except BaseException:
@@ -652,6 +658,25 @@ class Condition:
             raise
         else:
             await self._reacquire_lock()
+
+    async def wait_for(self, predicate: Callable[[], Any]) -> Any:
+        """Wait until a predicate becomes true.
+
+        The **underlying lock must be held** when calling this method.
+        The predicate is evaluated repeatedly until it returns a truthy value.
+        Supports both synchronous callables and async coroutine functions.
+
+        :param predicate: A callable or coroutine function returning a boolean/truthy value.
+        :returns: The truthy result returned by the predicate.
+        :raises RuntimeError: If called without holding the underlying lock.
+        """
+        while True:
+            result = predicate()
+            if asyncio.iscoroutine(result) or asyncio.isfuture(result):
+                result = await result
+            if result:
+                return result
+            await self.wait()
 
     def notify(self, n: int = 1) -> None:
         """Wake up to *n* waiters (default: 1).
@@ -751,19 +776,26 @@ class Condition:
 
 
 class BarrierWaitResult:
-    """Simple result object returned by :meth:`Barrier.wait`.
+    """Result object returned by :meth:`Barrier.wait`.
 
     Attributes:
         parties: Total number of parties in this barrier round.
+        index: Zero-based arrival index (0 to parties - 1) of the calling task.
     """
 
-    __slots__ = ("parties",)
+    __slots__ = ("index", "parties")
 
-    def __init__(self, parties: int) -> None:
+    def __init__(self, parties: int, index: int = 0) -> None:
         self.parties = parties
+        self.index = index
+
+    @property
+    def is_leader(self) -> bool:
+        """Return ``True`` if this task was selected as leader (index == 0)."""
+        return self.index == 0
 
     def __repr__(self) -> str:
-        return f"<BarrierWaitResult parties={self.parties}>"
+        return f"<BarrierWaitResult parties={self.parties} index={self.index}>"
 
 
 class Barrier:
@@ -776,6 +808,7 @@ class Barrier:
 
     Calling :meth:`abort` breaks the current round: all waiting tasks
     raise a :exc:`RuntimeError`.
+    Calling :meth:`reset` resets the barrier to its initial un-aborted state.
     """
 
     def __init__(self, parties: int) -> None:
@@ -784,7 +817,7 @@ class Barrier:
         self._parties = parties
         self._mutex = threading.Lock()
         self._generation = 0
-        self._waiters: list[tuple[asyncio.AbstractEventLoop, asyncio.Event]] = []
+        self._waiters: list[tuple[asyncio.AbstractEventLoop, asyncio.Event, list[int | None]]] = []
         self._aborted = False
 
     @property
@@ -802,20 +835,21 @@ class Barrier:
         """Wait at the barrier until *parties* tasks have arrived.
 
         Returns a :class:`BarrierWaitResult` with ``parties`` set to the
-        barrier's party count.  A normal return always means the round was
-        completed; :meth:`abort` raises instead.
+        barrier's party count and ``index`` set to the task's arrival index.
 
-        :raises RuntimeError: if :meth:`abort` is called.
+        :raises RuntimeError: if :meth:`abort` or :meth:`reset` is called.
         """
         loop = asyncio.get_running_loop()
         event = asyncio.Event()
+        box: list[int | None] = [None]
 
         with self._mutex:
             if self._aborted:
                 raise RuntimeError("barrier has been aborted")
             n = len(self._waiters) + 1
             if n == self._parties:
-                for l, e in self._waiters:
+                for idx, (l, e, b) in enumerate(self._waiters, start=1):
+                    b[0] = idx
                     try:
                         l.call_soon_threadsafe(e.set)
                     except RuntimeError:
@@ -824,13 +858,14 @@ class Barrier:
                         pass
                 self._waiters.clear()
                 self._generation += 1
-                return BarrierWaitResult(parties=self._parties)
-            self._waiters.append((loop, event))
+                return BarrierWaitResult(parties=self._parties, index=0)
+            entry = (loop, event, box)
+            self._waiters.append(entry)
             generation = self._generation
 
         try:
             await event.wait()
-        except asyncio.CancelledError:
+        except BaseException:
             with self._mutex:
                 # WHY: The generation guard stops a cancelled waiter from deleting
                 # an entry that already advanced to the next round. If a full party
@@ -838,30 +873,50 @@ class Barrier:
                 # skipping the removal protects the next round's waiters.
                 if generation == self._generation:
                     try:
-                        self._waiters.remove((loop, event))
+                        self._waiters.remove(entry)
                     except ValueError:
                         pass
             raise
 
         with self._mutex:
-            if self._aborted:
+            if self._aborted and generation == self._generation:
                 raise RuntimeError("barrier has been aborted")
-            return BarrierWaitResult(parties=self._parties)
+            if box[0] is None:
+                raise RuntimeError("barrier was reset while waiting")
+            return BarrierWaitResult(parties=self._parties, index=box[0])
 
     def abort(self) -> None:
         """Abort the barrier, raising :exc:`RuntimeError` in all waiting tasks.
 
-        The barrier is permanently broken after an abort.  Subsequent
-        calls to :meth:`wait` will raise immediately.
+        The barrier is permanently broken after an abort until :meth:`reset` is called.
+        Subsequent calls to :meth:`wait` will raise immediately.
         """
         with self._mutex:
             self._aborted = True
             waiters = self._waiters
             self._waiters = []
 
-        for loop, event in waiters:
+        for loop, event, _box in waiters:
             try:
                 loop.call_soon_threadsafe(event.set)
             except RuntimeError:
                 # WHY: dead loop — skip rather than abort the abort (R5 FIX-E).
+                pass
+
+    def reset(self) -> None:
+        """Reset the barrier to its initial un-aborted empty state.
+
+        Any tasks currently waiting at the barrier are woken and will raise
+        :exc:`RuntimeError`.
+        """
+        with self._mutex:
+            waiters = self._waiters
+            self._waiters = []
+            self._generation += 1
+            self._aborted = False
+
+        for loop, event, _box in waiters:
+            try:
+                loop.call_soon_threadsafe(event.set)
+            except RuntimeError:
                 pass

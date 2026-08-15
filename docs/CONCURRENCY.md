@@ -52,15 +52,15 @@ lock → await → unregister under the lock on cancellation」
 | Primitive | Guarding lock | Waiter structure | Key invariant |
 |---|---|---|---|
 | `Barrier` | `threading.Mutex` | `list[(loop, asyncio.Event)]` | `_generation` counter binds each waiter to its round; cancellation handlers check the generation before removing an entry (`_sync.py:628-643`). **Cancellation caveat (FIX-12)**: a party cancelled *before* the round completes leaves the remaining parties blocked forever — the barrier has no automatic broken state; `abort()` is the documented escape hatch |
-| `AsyncWaitGroup` | Rust: `AtomicUsize` counter + parking_lot `Mutex` | `Vec[(loop, future)]` | `done()` to zero hands over the whole waiter list via `mem::take` (`lib.rs:443-457`); `register_waiter` double-checks: lock-free fast path + re-check under the lock (`lib.rs:473-487`) |
+| `AsyncWaitGroup` | Rust: `parking_lot::Mutex<WaitGroupInner>` | `Vec[(loop, future)]` | Single mutex guards `counter`, `generation`, and `waiters`; `add(-n)` and `done()` to zero atomically bump `generation` and hand over the whole waiter list via `mem::take` (`lib.rs:465-540`); `register_waiter` fast path wakes immediately if already done |
 | `AsyncOnce` | `threading.Lock` | `deque[(loop, future)]` | leader/follower: the lock decides who executes; followers register under the lock; the leader `_wake_all`s **while holding the lock** in `finally` — registration and wakeup share one lock, so there is no lost-wakeup window (`primitives.py:377-416`) |
 
 ### 1.5 Cancellation & Structured Concurrency
 
 | Component | Mechanism | Key point |
 |---|---|---|
-| `CancelScope` | per-task contextvars stack + `task.cancelling()`/`uncancel()` | shield snapshots and clears the cancellation count on entry, restores it on exit (`_cancel.py:141-146, 184-189`) |
-| `select_channel` | `TaskGroup` + one reader per channel | a successful reader **deliberately raises `CancelledError`** to make the group exit early — a normal return would make the group wait for every channel (`primitives.py:248-255`). **Arbitration is non-atomic (FIX-16)**: readiness is reported without consuming; a concurrent consumer may steal the item between the report and the winner's `try_recv`, so select loops and re-registers — under heavy contention this can delay/stall a specific channel (documented behaviour, not a bug) |
+| `CancelScope` | per-task contextvars stack + single-ledger `_injected` | shield snapshots and clears the cancellation count on entry, restores it on exit; single ledger tracks exact injections and symmetrically uncancels only what was injected (`_cancel.py`) |
+| `select_channel` | 2-phase deterministic arbiter (Phase 1 fast `try_recv`, Phase 2 multi-channel registration on shared future) | readiness is reported without TaskGroup speculative cancellation; winner consumes via `try_recv()` and unregisters all watcher tokens in `finally` (`primitives.py:230-290`) |
 
 ---
 
@@ -195,6 +195,70 @@ held across `await`; or the same thread re-acquires a non-reentrant lock.
 - `drop(guard)` before calling a function that may take locks again.
 **Examples**: `push_local` drops the guard before falling back to
 `push_global` (`lib.rs:276-280`).
+
+### Pattern 9: component anti-patterns and misuse traps
+
+**Symptom**: Runtime errors, unexpected deadlocks, starvation, or livelocks caused by breaking primitive-specific contracts.
+
+**1. `AsyncWaitGroup.track` coroutine object passed to callable acceptor**:
+- **Trap**: `wg.track(coro)` immediately increments the counter and returns a coroutine object wrapping `finally: self.done()`. Passing it to `TaskGroup.start_soon` (which expects a callable) raises `TypeError`, or creating it without awaiting leaves the counter incremented forever.
+- **Negative example**:
+```python
+async def worker():
+    pass
+
+
+async with TaskGroup() as tg:
+    wg = AsyncWaitGroup()
+    tg.start_soon(wg.track(worker()))  # TypeError! Counter leaked!
+```
+- **Correct approach**:
+```python
+async with TaskGroup() as tg:
+    wg = AsyncWaitGroup()
+
+    async def tracked_worker():
+        await wg.track(worker())
+
+    tg.start_soon(tracked_worker)
+```
+
+**2. `select_channel` starvation under multi-channel saturation**:
+- **Trap**: `select_channel` probes arguments deterministically from left to right in Phase 1. In saturated loops, earlier arguments starve later arguments.
+- **Negative example**:
+```python
+while True:
+    ch, val = await select_channel(ch1, ch2)
+    process(val)
+```
+- **Correct approach**: Shuffle or alternate channel argument order if statistical fairness is required across ready channels.
+
+**3. `Barrier` party timeout without `abort()`**:
+- **Trap**: `Barrier` does not have an automatic broken state on single-party cancellation (FIX-12). If one party times out and leaves, the remaining `parties - 1` parties block forever.
+- **Negative example**:
+```python
+try:
+    await asyncio.wait_for(barrier.wait(), timeout=1.0)
+except TimeoutError:
+    pass  # Leaves other parties hung forever!
+```
+- **Correct approach**:
+```python
+try:
+    await asyncio.wait_for(barrier.wait(), timeout=1.0)
+except TimeoutError:
+    barrier.abort()
+    raise
+```
+
+**4. `CapacityLimiter` anonymous release and fractional capacity checks**:
+- **Trap**: `CapacityLimiter` uses anonymous token counters (no borrower task validation), and fractional `total_tokens` (e.g. `2.5`) leaves integer semaphore capacity at `int(total_tokens) = 2`.
+- **Negative example**:
+```python
+if limiter.available_tokens > 0:  # e.g. 0.5 > 0
+    await limiter.acquire()  # Blocks if integer capacity (2) is already borrowed!
+```
+- **Correct approach**: Always use `async with limiter:`; require `available_tokens >= 1.0` for non-blocking expectations.
 
 ---
 
