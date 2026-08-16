@@ -93,6 +93,7 @@ class GsyncioASGIWorker:
 
             headers: list[tuple[bytes, bytes]] = []
             content_length = 0
+            is_chunked_req = False
             while True:
                 line = await asyncio.wait_for(reader.readline(), timeout=_HEADER_TIMEOUT)
                 if not line or line == b"\r\n":
@@ -106,9 +107,11 @@ class GsyncioASGIWorker:
                             content_length = int(v_str)
                         except ValueError:
                             content_length = 0
+                    elif k_str == "transfer-encoding" and "chunked" in v_str.lower():
+                        is_chunked_req = True
                     headers.append((k_str.encode("latin1"), v_str.encode("latin1")))
 
-            if content_length > _MAX_REQUEST_BODY:
+            if not is_chunked_req and content_length > _MAX_REQUEST_BODY:
                 writer.write(
                     b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\n"
                     b"Connection: close\r\n\r\n"
@@ -117,7 +120,7 @@ class GsyncioASGIWorker:
                 return
 
             body = b""
-            if content_length > 0:
+            if not is_chunked_req and content_length > 0:
                 body = await asyncio.wait_for(
                     reader.readexactly(content_length), timeout=_HEADER_TIMEOUT
                 )
@@ -140,14 +143,45 @@ class GsyncioASGIWorker:
             }
 
             body_delivered = False
+            chunk_finished = False
             disconnect_event = asyncio.Event()
 
+            async def _read_next_chunk() -> tuple[bytes, bool]:
+                size_line = await asyncio.wait_for(reader.readline(), timeout=_HEADER_TIMEOUT)
+                if not size_line:
+                    return b"", False
+                size_str = size_line.decode("latin1").strip().split(";")[0]
+                try:
+                    chunk_size = int(size_str, 16)
+                except ValueError:
+                    return b"", False
+                if chunk_size == 0:
+                    # Trailer / empty line
+                    await asyncio.wait_for(reader.readline(), timeout=_HEADER_TIMEOUT)
+                    return b"", False
+                chunk_data = await asyncio.wait_for(
+                    reader.readexactly(chunk_size), timeout=_HEADER_TIMEOUT
+                )
+                await asyncio.wait_for(reader.readexactly(2), timeout=_HEADER_TIMEOUT)  # \r\n
+                return chunk_data, True
+
             async def receive() -> dict[str, Any]:
-                nonlocal body_delivered
-                if not body_delivered:
-                    body_delivered = True
-                    return {"type": "http.request", "body": body, "more_body": False}
-                # Once the request body is consumed, subsequent calls block until disconnect
+                nonlocal body_delivered, chunk_finished
+                if not is_chunked_req:
+                    if not body_delivered:
+                        body_delivered = True
+                        return {"type": "http.request", "body": body, "more_body": False}
+                    # Once the request body is consumed, subsequent calls block until disconnect
+                    await disconnect_event.wait()
+                    return {"type": "http.disconnect"}
+
+                if not chunk_finished:
+                    chunk_data, has_more = await _read_next_chunk()
+                    if not has_more:
+                        chunk_finished = True
+                        return {"type": "http.request", "body": chunk_data, "more_body": False}
+                    return {"type": "http.request", "body": chunk_data, "more_body": True}
+
                 await disconnect_event.wait()
                 return {"type": "http.disconnect"}
 

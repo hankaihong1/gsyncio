@@ -381,3 +381,64 @@ async def test_asgi_streaming_chunked_response() -> None:
     assert b"transfer-encoding: chunked" in raw_data.lower()
     assert b"chunk1" in raw_data
     assert b"chunk2" in raw_data
+
+
+@pytest.mark.asyncio
+async def test_asgi_streaming_chunked_request_body() -> None:
+    """GsyncioASGIWorker supports chunked streaming request bodies in receive()."""
+    received_chunks: list[bytes] = []
+
+    async def echo_chunked_app(scope: Any, receive: Any, send: Any) -> None:
+        while True:
+            msg = await receive()
+            if msg["type"] == "http.request":
+                received_chunks.append(msg.get("body", b""))
+                if not msg.get("more_body", False):
+                    break
+        total = b"".join(received_chunks)
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"content-length", str(len(total)).encode())],
+            }
+        )
+        await send({"type": "http.response.body", "body": total})
+
+    async with EventLoopThreadPool(num_threads=2) as pool:
+        worker = GsyncioASGIWorker(app=echo_chunked_app, pool=pool, host="127.0.0.1", port=0)
+        await worker.start()
+        reader, writer = await asyncio.open_connection("127.0.0.1", worker.port)
+
+        # Send chunked request
+        req_headers = (
+            b"POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n"
+        )
+        writer.write(req_headers)
+        await writer.drain()
+
+        # Send chunk 1 ("hello ")
+        writer.write(b"6\r\nhello \r\n")
+        await writer.drain()
+
+        # Send chunk 2 ("world")
+        writer.write(b"5\r\nworld\r\n")
+        await writer.drain()
+
+        # Send terminal chunk
+        writer.write(b"0\r\n\r\n")
+        await writer.drain()
+
+        resp = b""
+        while b"hello world" not in resp:
+            chunk = await asyncio.wait_for(reader.read(2048), timeout=2.0)
+            if not chunk:
+                break
+            resp += chunk
+
+        writer.close()
+        await writer.wait_closed()
+        await worker.close()
+
+    assert b"hello world" in resp
+    assert received_chunks == [b"hello ", b"world", b""]

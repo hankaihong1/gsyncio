@@ -148,6 +148,7 @@ class EventLoopThreadPool:
         # start(), read under _lock in wait_closed().
         self._started = False
         self._index = 0
+        self._idle_workers: set[int] = set()
         # WHY: every live submit future is registered here so abort() can
         # complete the ones that never ran.  All access under _lock: the
         # caller thread registers, worker threads discard on completion.
@@ -285,12 +286,17 @@ class EventLoopThreadPool:
                 except Exception:  # noqa: BLE001, S110
                     pass
 
+                with self._lock:
+                    self._idle_workers.add(index)
                 try:
                     await asyncio.wait_for(notify_event.wait(), timeout=_WORKER_POLL_INTERVAL)
                 except TimeoutError:
                     pass
                 except asyncio.CancelledError:
                     break
+                finally:
+                    with self._lock:
+                        self._idle_workers.discard(index)
 
     def _worker(self, index: int, loop: asyncio.AbstractEventLoop) -> None:
         asyncio.set_event_loop(loop)
@@ -447,6 +453,9 @@ class EventLoopThreadPool:
             self._outstanding.clear()
         close_exc = ThreadPoolClosedError("Pool closed before task ran")
         for fut in leftover:
+            target_obj = getattr(fut, "_gsyncio_target", None)
+            if target_obj is not None and asyncio.iscoroutine(target_obj):
+                target_obj.close()
             if not fut.done():
                 _safe_complete(fut.get_loop(), fut, exc=close_exc)
 
@@ -504,6 +513,9 @@ class EventLoopThreadPool:
         # just before the abort wins the race cleanly (revision B).
         abort_exc = ThreadPoolClosedError("Pool aborted")
         for fut in outstanding:
+            target_obj = getattr(fut, "_gsyncio_target", None)
+            if target_obj is not None and asyncio.iscoroutine(target_obj):
+                target_obj.close()
             if not fut.done():
                 _safe_complete(fut.get_loop(), fut, exc=abort_exc)
 
@@ -606,9 +618,14 @@ class EventLoopThreadPool:
             If `pin_to` is an invalid worker index or unmanaged event loop.
 
         """
-        if (asyncio.iscoroutine(target) or asyncio.isfuture(target)) and (args or kwargs):
+        if asyncio.isfuture(target):
             raise TypeError(
-                "Cannot pass positional or keyword arguments when target is already a coroutine object or Future"
+                "submit() target cannot be an asyncio.Future (futures are thread-bound). "
+                "Pass a coroutine function, callable, or coroutine instead."
+            )
+        if asyncio.iscoroutine(target) and (args or kwargs):
+            raise TypeError(
+                "Cannot pass positional or keyword arguments when target is already a coroutine object"
             )
 
         pinned_info = self._resolve_target_worker(pin_to)
@@ -623,6 +640,8 @@ class EventLoopThreadPool:
                 "submit() must be called from a thread with a running asyncio event loop"
             )
         fut: asyncio.Future[Any] = caller_loop.create_future()
+        if asyncio.iscoroutine(target):
+            setattr(fut, "_gsyncio_target", target)  # noqa: B010
         with self._lock:
             self._outstanding.add(fut)
 
@@ -635,7 +654,7 @@ class EventLoopThreadPool:
             try:
                 if cancel_scope is not None:
                     async with cancel_scope:
-                        if asyncio.iscoroutine(target) or asyncio.isfuture(target):
+                        if asyncio.iscoroutine(target):
                             res = await target
                         elif callable(target):
                             res = target(*args, **kwargs)
@@ -644,7 +663,7 @@ class EventLoopThreadPool:
                         else:
                             res = target
                 else:
-                    if asyncio.iscoroutine(target) or asyncio.isfuture(target):
+                    if asyncio.iscoroutine(target):
                         res = await target
                     elif callable(target):
                         res = target(*args, **kwargs)
@@ -716,16 +735,18 @@ class EventLoopThreadPool:
                         raise ThreadPoolClosedError("ThreadPool is closed") from exc
                     raise
 
-            # Pure Pull-Model Wakeup: Blind Round-Robin Notify
+            # Directed Pull-Model Wakeup: preferentially notify an idle worker
             event: asyncio.Event | None = None
+            loop: asyncio.AbstractEventLoop | None = None
             with self._lock:
                 if self._loops and self._running:
-                    idx = self._index
-                    self._index = (idx + 1) % len(self._loops)
+                    if self._idle_workers:
+                        idx = next(iter(self._idle_workers))
+                    else:
+                        idx = self._index
+                        self._index = (idx + 1) % len(self._loops)
                     loop = self._loops[idx]
                     event = self._notify_events[idx]
-                else:
-                    loop = None
 
             if loop is not None and event is not None:
                 try:

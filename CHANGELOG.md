@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.6] - 2026-08-16
+
+### Added
+- **`RawAsyncChannel` (Rust Core)**: high-performance cross-thread channel state machine implemented natively in Rust (`_gsyncio_core`), managing buffer queues, waiter queues (`getters`, `putters`, `select_watchers`), double-checked locking, and cross-event-loop signal forwarding via `loop.call_soon_threadsafe`.
+- **Rust Unit Tests**: 7 new native unit tests in `src/lib.rs` covering lifecycle, backpressure, atomic getter/putter registrations, select arbitration forwarding, channel close wakeups, and concurrent multi-threaded contention.
+
+### Changed
+- **`FastChannel`**: delegates buffer queueing, double-checked locks, and waiter wakeups directly to `RawAsyncChannel`, eliminating Python-level `threading.Lock` and `OrderedDict` heap allocation overhead during `send()` and `recv()`.
+- **`select_channel`**: native multi-channel registration acceleration via `RawAsyncChannel` select watcher state machine for $O(1)$ single-signal wakeup arbitration.
+
 ## [0.1.5] - 2026-08-15
 
 ### Fixed

@@ -680,3 +680,36 @@ async def test_child_failure_preserves_external_cross_thread_cancel() -> None:
     #     sleeping past the timeout.
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(asyncio.shield(t), timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_taskgroup_cross_loop_rejection() -> None:
+    """TaskGroup must reject start_soon and start when called from a foreign loop or thread."""
+    async with TaskGroup() as tg:
+        # Create a separate thread with a new event loop
+        def foreign_worker(errs: list[Exception]) -> None:
+            new_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(new_loop)
+
+            async def attempt():
+                async def dummy():
+                    pass
+
+                # start_soon from foreign loop must raise RuntimeError
+                try:
+                    tg.start_soon(dummy)
+                except RuntimeError as exc:
+                    errs.append(exc)
+
+            try:
+                new_loop.run_until_complete(attempt())
+            finally:
+                new_loop.close()
+
+        errors: list[Exception] = []
+        t = threading.Thread(target=foreign_worker, args=(errors,))
+        t.start()
+        t.join(timeout=2.0)
+
+        assert len(errors) == 1
+        assert "physically scoped to a single event loop" in str(errors[0])

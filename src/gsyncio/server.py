@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import inspect
 import socket
 import sys
@@ -65,6 +66,7 @@ class ConnectionPinningServer:
         self._conn_tasks_lock = threading.Lock()
         self._running_lock = threading.Lock()
         self._running = False
+        self._handler_accepts_addr = False
 
     @property
     def is_running(self) -> bool:
@@ -107,6 +109,11 @@ class ConnectionPinningServer:
             pass
 
         active_handler = self.handler or dummy_h
+        try:
+            sig = inspect.signature(active_handler)
+            self._handler_accepts_addr = len(sig.parameters) >= 3
+        except (TypeError, ValueError):
+            self._handler_accepts_addr = False
 
         # Using Shared Acceptor (Thundering Herd) architecture
         # Bind one socket, and pass it to all worker loops to accept concurrently.
@@ -180,12 +187,21 @@ class ConnectionPinningServer:
                 backoff = 0.001  # success resets the error backoff
             except asyncio.CancelledError:
                 break
-            except (OSError, RuntimeError):
-                # EWOULDBLOCK / EAGAIN are handled internally by asyncio,
-                # so if we hit OSError here it's likely a real error or
-                # thundering herd race condition.  Exponential backoff
-                # (1ms → … → 100ms cap) keeps a persistently failing accept
-                # from spinning the worker loop (C3).
+            except (BlockingIOError, InterruptedError):
+                # Non-fatal thundering herd / interrupt: retry immediately without backoff delay
+                continue
+            except OSError as err:
+                if err.errno in (
+                    errno.EAGAIN,
+                    errno.EWOULDBLOCK,
+                    errno.ECONNABORTED,
+                    errno.EINTR,
+                ):
+                    continue
+                # For real OS socket errors (e.g. EMFILE/ENFILE), apply exponential backoff (1ms -> 100ms)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 0.1)
+            except RuntimeError:
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 0.1)
 
@@ -233,16 +249,10 @@ class ConnectionPinningServer:
             # WHY: handlers may opt into the client address via a third
             # parameter (e.g. the ASGI worker for scope["client"]); legacy
             # two-parameter handlers keep working unchanged (S-2).
-            if addr is not None:
-                try:
-                    sig = inspect.signature(handler)
-                    handler_arity = len(sig.parameters)
-                except (TypeError, ValueError):
-                    handler_arity = 2
-                if handler_arity >= 3:
-                    await handler(reader, writer, addr)
-                    return
-            await handler(reader, writer)
+            if self._handler_accepts_addr and addr is not None:
+                await handler(reader, writer, addr)
+            else:
+                await handler(reader, writer)
         except (
             ConnectionResetError,
             BrokenPipeError,

@@ -48,7 +48,13 @@ def test_all_public_symbols_documented() -> None:
 
 def test_doc_code_blocks_parse() -> None:
     """All python code blocks in README / docs must be syntactically valid."""
-    for name in ("README.md", "docs/API.md", "docs/CHOOSING.md", "docs/CONCURRENCY.md"):
+    for name in (
+        "README.md",
+        "ROADMAP.md",
+        "docs/API.md",
+        "docs/CHOOSING.md",
+        "docs/CONCURRENCY.md",
+    ):
         path = ROOT / name
         for i, block in enumerate(_extract_python_blocks(path)):
             try:
@@ -78,6 +84,7 @@ def test_examples_parse() -> None:
 # changes only the language, never the structure)
 _MIRROR_PAIRS = [
     ("README.md", "README_ZH.md"),
+    ("ROADMAP.md", "ROADMAP_ZH.md"),
     ("docs/API.md", "docs/API_ZH.md"),
     ("docs/CHOOSING.md", "docs/CHOOSING_ZH.md"),
     ("docs/CONCURRENCY.md", "docs/CONCURRENCY_ZH.md"),

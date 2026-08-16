@@ -358,7 +358,7 @@ Submits a coroutine function, coroutine object, or callable to the shared work q
 
 - **`pin_to`**: Optionally pins the task to a specific worker loop (an `int` worker index or an `AbstractEventLoop` managed by the pool). When `None`, the task goes to the global shared queue.
 - **`cancel_scope`**: Optionally binds the task to a `CancelScope`; cancelled scopes suppress the task result.
-- **Raises**: `ThreadPoolClosedError` if the pool is closed, `ValueError` for an invalid `pin_to` index.
+- **Raises**: `ThreadPoolClosedError` if the pool is closed, `ValueError` for an invalid `pin_to` index, `TypeError` if `target` is an `asyncio.Future` (raw futures are loop-bound) or if arguments are passed to a coroutine object.
 
 ##### `get_metrics()` -> `dict[str, Any]`
 Returns a JSON-serializable dictionary containing health metrics:
@@ -620,9 +620,9 @@ async with TaskGroup(name=None) as tg:
 ```
 
 - **`start_soon(coro_fn, *args)` -> `TaskHandle`**: Spawns a child task and returns its handle immediately without blocking. Children spawned before the group is entered are tracked by the first entry.
-  - **Raises**: `RuntimeError` if called after the group has exited (a task spawned then would be an orphan nobody waits for); the orphan is cancelled and its exception consumed.
+  - **Raises**: `RuntimeError` if called after the group has exited or called from a foreign event loop/thread (TaskGroup is physically scoped to a single loop); the orphan is cancelled and its exception consumed.
 - **`start(coro_fn, *args)` -> `TaskHandle`**: Spawns a child task, blocking until it calls `task_status.started()`.
-  - **Raises**: `RuntimeError` if called after the group has exited (same orphan guard as `start_soon`), or if the child exits without calling `task_status.started()` (trio/anyio parity — a silent handle to a dead task would hide the protocol violation).
+  - **Raises**: `RuntimeError` if called after the group has exited or called from a foreign event loop/thread, or if the child exits without calling `task_status.started()` (trio/anyio parity — a silent handle to a dead task would hide the protocol violation).
 - **Raises**: Child exceptions are re-raised on exit; multiple failures surface as an `ExceptionGroup`. Cancelled children are not reported as errors (trio/anyio parity), and when the host is cancelled while the group waits, all children are guaranteed finished before the block exits.
 
 ### `TaskHandle`
@@ -730,7 +730,9 @@ CapacityLimiter(total_tokens: float)
 ```
 
 - **`total_tokens`** -> `float`: Total capacity (readable and writable).
-- **`available_tokens`** -> `float`: Tokens currently available.
+- **`total_capacity`** -> `int`: Integer floor capacity (`int(total_tokens)`).
+- **`available_tokens`** -> `float`: Tokens currently available (`total_tokens - borrowed_tokens`).
+- **`available_capacity`** -> `int`: Discrete integer token capacity currently available (`max(0, int(total_tokens) - borrowed)`).
 - **`borrowed_tokens`** -> `float`: Tokens currently borrowed.
 - **`snapshot()`** -> `(total, available, borrowed)`: Atomically consistent
   read of all three counters under one lock acquisition. Use this instead of
@@ -811,6 +813,8 @@ await wg.wait()
 ```
 
 All `add()` calls with a positive delta must happen-before the first `wait()` on the counter (matches Go `sync.WaitGroup`): a concurrent `add()` racing with `wait()` can lose its wakeup and hang forever. Negative deltas are allowed (Go semantics) but must never drive the counter below zero — doing so raises `RuntimeError`.
+
+Structured RAII tracking is supported via `async with wg.holding():` and `tg.start_soon(wg.wrap(fn))` to guarantee counter balance under exceptions and cancellations.
 
 ---
 

@@ -46,7 +46,11 @@ def _set_soon(
 
 
 def _wake_all(
-    waiters: collections.deque[_Waiter] | list[_Waiter],
+    waiters: (
+        collections.OrderedDict[asyncio.Future[Any], asyncio.AbstractEventLoop]
+        | collections.deque[_Waiter]
+        | list[_Waiter]
+    ),
     exc: BaseException | None = None,
     count: int | None = None,
 ) -> None:
@@ -54,16 +58,21 @@ def _wake_all(
 
     Each non-done waiter is completed with ``set_result(None)``, or with
     ``set_exception(exc)`` when ``exc`` is given. Waking stops after ``count``
-    non-done futures when ``count`` is not ``None``. When ``waiters`` is a
-    deque, entries are consumed from it (done entries are discarded) so stale
-    futures don't accumulate; a plain list is left intact.
+    non-done futures when ``count`` is not ``None``. When ``waiters`` is an
+    OrderedDict or deque, entries are consumed from it (done entries are discarded)
+    so stale futures don't accumulate; a plain list is left intact.
     """
+    if isinstance(waiters, collections.OrderedDict):
+        woken = 0
+        while waiters and (count is None or woken < count):
+            fut, loop = waiters.popitem(last=False)
+            if fut.done():
+                continue
+            _set_soon(loop, fut, exc)
+            woken += 1
+        return
     if isinstance(waiters, collections.deque):
         woken = 0
-        # WHY: Consuming from the left as we go means woken entries leave the deque,
-        # so stale done futures are dropped and count=1 reliably wakes the oldest
-        # live waiter even when cancelled ones sit at the head. Iterating in place
-        # would re-process entries already removed by a concurrent discard.
         while waiters and (count is None or woken < count):
             loop, fut = waiters.popleft()
             if fut.done():
@@ -76,7 +85,13 @@ def _wake_all(
             _set_soon(loop, fut, exc)
 
 
-def _discard_waiter(waiters: collections.deque[_Waiter], fut: asyncio.Future[Any]) -> bool:
+def _discard_waiter(
+    waiters: (
+        collections.OrderedDict[asyncio.Future[Any], asyncio.AbstractEventLoop]
+        | collections.deque[_Waiter]
+    ),
+    fut: asyncio.Future[Any],
+) -> bool:
     """Remove the waiter entry for ``fut`` from ``waiters`` (if still present).
 
     Returns ``True`` when the entry was still queued, ``False`` when it had
@@ -85,6 +100,8 @@ def _discard_waiter(waiters: collections.deque[_Waiter], fut: asyncio.Future[Any
     popped entry means the data/slot side already changed, and the
     notification would otherwise die with the cancelled waiter).
     """
+    if isinstance(waiters, collections.OrderedDict):
+        return waiters.pop(fut, None) is not None
     remaining = collections.deque(w for w in waiters if w[1] is not fut)
     was_present = len(remaining) != len(waiters)
     waiters.clear()
@@ -97,28 +114,64 @@ class _BaseChannel:  # pyright: ignore[reportUnusedClass]
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._getters: collections.deque[_Waiter] = collections.deque()
-        self._putters: collections.deque[_Waiter] = collections.deque()
+        self._getters_dict: collections.OrderedDict[
+            asyncio.Future[Any], asyncio.AbstractEventLoop
+        ] = collections.OrderedDict()
+        self._putters_dict: collections.OrderedDict[
+            asyncio.Future[Any], asyncio.AbstractEventLoop
+        ] = collections.OrderedDict()
         # WHY: select_channel needs "channel became non-empty" signals that do
         # NOT consume the item (only the select winner may consume).  Notifier
         # events are one-shot: _wakeup_notifiers pops them, so a woken notifier
         # must re-register (its caller holds the new event).
-        self._notifiers: collections.deque[
-            tuple[asyncio.AbstractEventLoop, asyncio.Event | asyncio.Future[Any]]
-        ] = collections.deque()
+        self._notifiers_dict: collections.OrderedDict[
+            tuple[asyncio.AbstractEventLoop, asyncio.Event | asyncio.Future[Any]], None
+        ] = collections.OrderedDict()
 
-    def _wakeup_next(self, waiters: collections.deque[_Waiter]) -> None:
-        """Wake the first non-done future in the waiter deque."""
+    @property
+    def _getters(
+        self,
+    ) -> collections.OrderedDict[asyncio.Future[Any], asyncio.AbstractEventLoop]:
+        return self._getters_dict
+
+    @property
+    def _putters(
+        self,
+    ) -> collections.OrderedDict[asyncio.Future[Any], asyncio.AbstractEventLoop]:
+        return self._putters_dict
+
+    @property
+    def _notifiers(
+        self,
+    ) -> collections.OrderedDict[
+        tuple[asyncio.AbstractEventLoop, asyncio.Event | asyncio.Future[Any]], None
+    ]:
+        return self._notifiers_dict
+
+    def _wakeup_next(
+        self,
+        waiters: (
+            collections.OrderedDict[asyncio.Future[Any], asyncio.AbstractEventLoop]
+            | collections.deque[_Waiter]
+        ),
+    ) -> None:
+        """Wake the first non-done future in the waiter deque/dict."""
         _wake_all(waiters, count=1)
 
-    def _wakeup_notifiers(self) -> None:
-        """Wake every registered notifier event or select watcher (caller must hold ``_lock``)."""
+    def _wakeup_notifiers(self, all_notifiers: bool = False) -> None:
+        """Wake registered notifiers or select watchers (caller must hold ``_lock``).
+
+        When all_notifiers is False (single item enqueued), wakes at most one valid
+        notifier to prevent thundering herd. When True (channel close), wakes all.
+        """
         while self._notifiers:
-            entry = self._notifiers.popleft()
+            entry, _ = self._notifiers.popitem(last=False)
             loop, target = entry[0], entry[1]
             if isinstance(target, asyncio.Event):
                 try:
                     loop.call_soon_threadsafe(target.set)
+                    if not all_notifiers:
+                        return
                 except RuntimeError:
                     pass
             else:
@@ -128,15 +181,24 @@ class _BaseChannel:  # pyright: ignore[reportUnusedClass]
                 def _wake(f: asyncio.Future[Any] = target, ch: Any = self) -> None:
                     if not f.done():
                         f.set_result(ch)
+                    else:
+                        # WHY: in multi-event-loop execution, target.done() was False when
+                        # popped under _lock, but another channel in select_channel won the
+                        # race before this callback ran on its loop. Forward the wakeup signal
+                        # to the next pending notifier so the buffered item is not starved (R10).
+                        with ch._lock:
+                            ch._wakeup_notifiers(all_notifiers=False)
 
                 try:
                     loop.call_soon_threadsafe(_wake)
+                    if not all_notifiers:
+                        return
                 except RuntimeError:
                     pass
 
     def _wakeup_select_watchers(self) -> None:
         """Wake every registered select watcher (caller must hold ``_lock``)."""
-        self._wakeup_notifiers()
+        self._wakeup_notifiers(all_notifiers=True)
 
     def _register_select_watcher(
         self, loop: asyncio.AbstractEventLoop, arbiter_fut: asyncio.Future[Any]
@@ -152,7 +214,7 @@ class _BaseChannel:  # pyright: ignore[reportUnusedClass]
             if self.qsize() > 0:
                 return None
             token = (loop, arbiter_fut)
-            self._notifiers.append(token)
+            self._notifiers[token] = None
             return token
 
     def _unregister_select_watcher(self, token: Any) -> None:
@@ -160,12 +222,7 @@ class _BaseChannel:  # pyright: ignore[reportUnusedClass]
         if token is None:
             return
         with self._lock:
-            remaining = collections.deque(
-                entry
-                for entry in self._notifiers
-                if entry is not token and (len(entry) < 2 or entry[1] is not token[1])
-            )
-            self._notifiers = remaining
+            self._notifiers.pop(token, None)
 
     async def recv(self, timeout: float | None = None) -> Any:
         """Receive an item from the channel.
@@ -217,11 +274,16 @@ class _BaseChannel:  # pyright: ignore[reportUnusedClass]
         exc = ChannelClosedError(_CHANNEL_CLOSED_MSG)
         _wake_all(self._getters, exc=exc)
         _wake_all(self._putters, exc=exc)
-        # Notifiers and select watchers wake too
-        self._wakeup_notifiers()
+        # Notifiers and select watchers wake too (all of them on close)
+        self._wakeup_notifiers(all_notifiers=True)
 
     def _discard_waiter(
-        self, waiters: collections.deque[_Waiter], fut: asyncio.Future[Any]
+        self,
+        waiters: (
+            collections.OrderedDict[asyncio.Future[Any], asyncio.AbstractEventLoop]
+            | collections.deque[_Waiter]
+        ),
+        fut: asyncio.Future[Any],
     ) -> bool:
         """Remove the waiter entry for ``fut`` from ``waiters`` (if still present)."""
         return _discard_waiter(waiters, fut)
@@ -244,8 +306,10 @@ class _BaseChannel:  # pyright: ignore[reportUnusedClass]
             try:
                 if try_fn(item):
                     with self._lock:
-                        self._wakeup_next(self._getters)
-                        self._wakeup_notifiers()
+                        if self._getters:
+                            self._wakeup_next(self._getters)
+                        else:
+                            self._wakeup_notifiers(all_notifiers=False)
                     return
             except RuntimeError as e:
                 raise ChannelClosedError(_CHANNEL_CLOSED_MSG) from e
@@ -255,14 +319,16 @@ class _BaseChannel:  # pyright: ignore[reportUnusedClass]
             with self._lock:
                 try:
                     if try_fn(item):
-                        self._wakeup_next(self._getters)
-                        self._wakeup_notifiers()
+                        if self._getters:
+                            self._wakeup_next(self._getters)
+                        else:
+                            self._wakeup_notifiers(all_notifiers=False)
                         return
                 except RuntimeError as e:
                     raise ChannelClosedError(_CHANNEL_CLOSED_MSG) from e
 
                 fut: asyncio.Future[Any] = loop.create_future()
-                self._putters.append((loop, fut))
+                self._putters[fut] = loop
 
             try:
                 await fut

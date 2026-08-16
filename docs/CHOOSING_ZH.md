@@ -4,6 +4,8 @@
 
 > 30 秒找到正确的 API。按场景查下表；每个原语的核心思想见后文速览。
 > 完整签名与参数见 [API_ZH.md](API_ZH.md)；并发语义见 [CONCURRENCY_ZH.md](CONCURRENCY_ZH.md)。
+>
+> **架构提示**：gsyncio 虽借用了 AnyIO/Trio 的顶层 API 命名与人体工程学设计（如 `TaskGroup`、`CancelScope`、`CapacityLimiter` 等），但所有原语均运行在 **Python 3.14t 多线程多事件循环物理真并行** 之下，由 OS 互斥锁与形式化代币守恒律严密保护，绝非单线程协作式运行时的无锁假定。详见 [CONCURRENCY_ZH.md](CONCURRENCY_ZH.md)。
 
 ---
 

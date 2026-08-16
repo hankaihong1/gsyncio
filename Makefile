@@ -1,4 +1,4 @@
-.PHONY: develop build test test-slow bench lint format docs clean all
+.PHONY: develop build test test-rust test-slow bench lint format docs clean all
 
 develop:
 	uv run maturin develop --release
@@ -6,7 +6,10 @@ develop:
 build:
 	uv run maturin build --release
 
-test:
+test-rust:
+	cargo test --no-default-features --features test-init
+
+test: test-rust
 	uv run pytest
 
 test-slow:
