@@ -487,6 +487,12 @@ pub struct RawAsyncChannel {
     select_wake_fn: Option<Py<PyAny>>,
 }
 
+/// Target to wake outside of the Mutex lock to eliminate GIL-Mutex deadlocks.
+enum WakeTarget {
+    Waiter(ChannelWaiter, Option<Py<PyAny>>),
+    SelectWatcher(ChannelWaiter, Py<PyAny>),
+}
+
 impl RawAsyncChannel {
     fn wake_waiter(&self, py: Python<'_>, waiter: &ChannelWaiter, exc: Option<&Bound<'_, PyAny>>) {
         if let Some(ref w_fn) = self.wake_fn {
@@ -513,6 +519,17 @@ impl RawAsyncChannel {
                 loop_obj.call_method1("call_soon_threadsafe", (sw_fn.bind(py), fut, channel_obj));
         }
     }
+
+    fn dispatch_wake(&self, py: Python<'_>, target: WakeTarget) {
+        match target {
+            WakeTarget::Waiter(w, exc) => {
+                self.wake_waiter(py, &w, exc.as_ref().map(|e| e.bind(py)));
+            }
+            WakeTarget::SelectWatcher(w, token) => {
+                self.wake_select_watcher(py, &w, token.bind(py));
+            }
+        }
+    }
 }
 
 #[pymethods]
@@ -535,31 +552,37 @@ impl RawAsyncChannel {
     }
 
     fn close(&self, py: Python<'_>) {
-        let mut guard = self.state.lock();
-        if guard.is_closed {
-            return;
-        }
-        guard.is_closed = true;
-        let closed_exc = pyo3::exceptions::PyRuntimeError::new_err("Channel is closed");
-        let exc_val = closed_exc.into_value(py);
-        let bound_exc = exc_val.bind(py).as_any();
+        let mut to_wake = Vec::new();
+        {
+            let mut guard = self.state.lock();
+            if guard.is_closed {
+                return;
+            }
+            guard.is_closed = true;
+            let closed_exc: Py<PyAny> = PyRuntimeError::new_err("Channel is closed")
+                .into_value(py)
+                .into_any();
 
-        let getters = std::mem::take(&mut guard.getters);
-        for g in &getters {
-            self.wake_waiter(py, g, Some(bound_exc));
+            let getters = std::mem::take(&mut guard.getters);
+            for g in getters {
+                to_wake.push(WakeTarget::Waiter(g, Some(closed_exc.clone_ref(py))));
+            }
+            let putters = std::mem::take(&mut guard.putters);
+            for p in putters {
+                to_wake.push(WakeTarget::Waiter(p, Some(closed_exc.clone_ref(py))));
+            }
+            let watchers = std::mem::take(&mut guard.select_watchers);
+            for w in watchers {
+                let token = w
+                    .channel_token
+                    .as_ref()
+                    .map(|t| t.clone_ref(py))
+                    .unwrap_or_else(|| py.None());
+                to_wake.push(WakeTarget::SelectWatcher(w, token));
+            }
         }
-        let putters = std::mem::take(&mut guard.putters);
-        for p in &putters {
-            self.wake_waiter(py, p, Some(bound_exc));
-        }
-        let watchers = std::mem::take(&mut guard.select_watchers);
-        for w in &watchers {
-            let token = w
-                .channel_token
-                .as_ref()
-                .map(|t| t.bind(py).clone())
-                .unwrap_or_else(|| py.None().into_bound(py));
-            self.wake_select_watcher(py, w, &token);
+        for target in to_wake {
+            self.dispatch_wake(py, target);
         }
     }
 
@@ -586,42 +609,55 @@ impl RawAsyncChannel {
     }
 
     fn try_send(&self, py: Python<'_>, item: Py<PyAny>) -> PyResult<bool> {
-        let mut guard = self.state.lock();
-        if guard.is_closed {
-            return Err(PyRuntimeError::new_err("Channel is closed"));
-        }
-        if guard.maxsize > 0 && guard.buffer.len() >= guard.maxsize {
-            return Ok(false);
-        }
-        guard.buffer.push_back(item);
+        let mut to_wake = None;
+        {
+            let mut guard = self.state.lock();
+            if guard.is_closed {
+                return Err(PyRuntimeError::new_err("Channel is closed"));
+            }
+            if guard.maxsize > 0 && guard.buffer.len() >= guard.maxsize {
+                return Ok(false);
+            }
+            guard.buffer.push_back(item);
 
-        if let Some(getter) = guard.getters.pop_front() {
-            self.wake_waiter(py, &getter, None);
-        } else if let Some(watcher) = guard.select_watchers.pop_front() {
-            let token = watcher
-                .channel_token
-                .as_ref()
-                .map(|t| t.bind(py).clone())
-                .unwrap_or_else(|| py.None().into_bound(py));
-            self.wake_select_watcher(py, &watcher, &token);
+            if let Some(getter) = guard.getters.pop_front() {
+                to_wake = Some(WakeTarget::Waiter(getter, None));
+            } else if let Some(watcher) = guard.select_watchers.pop_front() {
+                let token = watcher
+                    .channel_token
+                    .as_ref()
+                    .map(|t| t.clone_ref(py))
+                    .unwrap_or_else(|| py.None());
+                to_wake = Some(WakeTarget::SelectWatcher(watcher, token));
+            }
+        }
+        if let Some(target) = to_wake {
+            self.dispatch_wake(py, target);
         }
         Ok(true)
     }
 
     fn try_recv(&self, py: Python<'_>) -> PyResult<(bool, Option<Py<PyAny>>)> {
-        let mut guard = self.state.lock();
-        if let Some(item) = guard.buffer.pop_front() {
-            if guard.maxsize > 0 {
-                if let Some(putter) = guard.putters.pop_front() {
-                    self.wake_waiter(py, &putter, None);
+        let mut to_wake = None;
+        let res = {
+            let mut guard = self.state.lock();
+            if let Some(item) = guard.buffer.pop_front() {
+                if guard.maxsize > 0 {
+                    if let Some(putter) = guard.putters.pop_front() {
+                        to_wake = Some(WakeTarget::Waiter(putter, None));
+                    }
                 }
+                Ok((true, Some(item)))
+            } else if guard.is_closed {
+                Err(PyRuntimeError::new_err("Channel is closed"))
+            } else {
+                Ok((false, None))
             }
-            Ok((true, Some(item)))
-        } else if guard.is_closed {
-            Err(PyRuntimeError::new_err("Channel is closed"))
-        } else {
-            Ok((false, None))
+        };
+        if let Some(target) = to_wake {
+            self.dispatch_wake(py, target);
         }
+        res
     }
 
     fn register_getter(
@@ -630,42 +666,56 @@ impl RawAsyncChannel {
         loop_obj: Py<PyAny>,
         fut: Py<PyAny>,
     ) -> PyResult<(bool, Option<Py<PyAny>>)> {
-        let mut guard = self.state.lock();
-        if let Some(item) = guard.buffer.pop_front() {
-            if guard.maxsize > 0 {
-                if let Some(putter) = guard.putters.pop_front() {
-                    self.wake_waiter(py, &putter, None);
+        let mut to_wake = None;
+        let res = {
+            let mut guard = self.state.lock();
+            if let Some(item) = guard.buffer.pop_front() {
+                if guard.maxsize > 0 {
+                    if let Some(putter) = guard.putters.pop_front() {
+                        to_wake = Some(WakeTarget::Waiter(putter, None));
+                    }
                 }
+                Ok((true, Some(item)))
+            } else if guard.is_closed {
+                Err(PyRuntimeError::new_err("Channel is closed"))
+            } else {
+                guard.getters.push_back(ChannelWaiter {
+                    event_loop: loop_obj,
+                    future: fut,
+                    channel_token: None,
+                });
+                Ok((false, None))
             }
-            return Ok((true, Some(item)));
+        };
+        if let Some(target) = to_wake {
+            self.dispatch_wake(py, target);
         }
-        if guard.is_closed {
-            return Err(PyRuntimeError::new_err("Channel is closed"));
-        }
-        guard.getters.push_back(ChannelWaiter {
-            event_loop: loop_obj,
-            future: fut,
-            channel_token: None,
-        });
-        Ok((false, None))
+        res
     }
 
     fn unregister_getter(&self, py: Python<'_>, fut: &Bound<'_, PyAny>) -> PyResult<bool> {
-        let mut guard = self.state.lock();
-        let before = guard.getters.len();
-        guard.getters.retain(|g| !g.future.bind(py).is(fut));
-        let removed = guard.getters.len() != before;
-        if !removed && !guard.buffer.is_empty() {
-            if let Some(next_getter) = guard.getters.pop_front() {
-                self.wake_waiter(py, &next_getter, None);
-            } else if let Some(watcher) = guard.select_watchers.pop_front() {
-                let token = watcher
-                    .channel_token
-                    .as_ref()
-                    .map(|t| t.bind(py).clone())
-                    .unwrap_or_else(|| py.None().into_bound(py));
-                self.wake_select_watcher(py, &watcher, &token);
+        let mut to_wake = None;
+        let removed = {
+            let mut guard = self.state.lock();
+            let before = guard.getters.len();
+            guard.getters.retain(|g| !g.future.bind(py).is(fut));
+            let removed = guard.getters.len() != before;
+            if !removed && !guard.buffer.is_empty() {
+                if let Some(next_getter) = guard.getters.pop_front() {
+                    to_wake = Some(WakeTarget::Waiter(next_getter, None));
+                } else if let Some(watcher) = guard.select_watchers.pop_front() {
+                    let token = watcher
+                        .channel_token
+                        .as_ref()
+                        .map(|t| t.clone_ref(py))
+                        .unwrap_or_else(|| py.None());
+                    to_wake = Some(WakeTarget::SelectWatcher(watcher, token));
+                }
             }
+            removed
+        };
+        if let Some(target) = to_wake {
+            self.dispatch_wake(py, target);
         }
         Ok(removed)
     }
@@ -692,14 +742,21 @@ impl RawAsyncChannel {
     }
 
     fn unregister_putter(&self, py: Python<'_>, fut: &Bound<'_, PyAny>) -> PyResult<bool> {
-        let mut guard = self.state.lock();
-        let before = guard.putters.len();
-        guard.putters.retain(|p| !p.future.bind(py).is(fut));
-        let removed = guard.putters.len() != before;
-        if !removed && (guard.maxsize == 0 || guard.buffer.len() < guard.maxsize) {
-            if let Some(next_putter) = guard.putters.pop_front() {
-                self.wake_waiter(py, &next_putter, None);
+        let mut to_wake = None;
+        let removed = {
+            let mut guard = self.state.lock();
+            let before = guard.putters.len();
+            guard.putters.retain(|p| !p.future.bind(py).is(fut));
+            let removed = guard.putters.len() != before;
+            if !removed && (guard.maxsize == 0 || guard.buffer.len() < guard.maxsize) {
+                if let Some(next_putter) = guard.putters.pop_front() {
+                    to_wake = Some(WakeTarget::Waiter(next_putter, None));
+                }
             }
+            removed
+        };
+        if let Some(target) = to_wake {
+            self.dispatch_wake(py, target);
         }
         Ok(removed)
     }
@@ -734,16 +791,22 @@ impl RawAsyncChannel {
     }
 
     fn forward_select_wakeup(&self, py: Python<'_>) {
-        let mut guard = self.state.lock();
-        if !guard.buffer.is_empty() && guard.getters.is_empty() {
-            if let Some(watcher) = guard.select_watchers.pop_front() {
-                let token = watcher
-                    .channel_token
-                    .as_ref()
-                    .map(|t| t.bind(py).clone())
-                    .unwrap_or_else(|| py.None().into_bound(py));
-                self.wake_select_watcher(py, &watcher, &token);
+        let mut to_wake = None;
+        {
+            let mut guard = self.state.lock();
+            if !guard.buffer.is_empty() && guard.getters.is_empty() {
+                if let Some(watcher) = guard.select_watchers.pop_front() {
+                    let token = watcher
+                        .channel_token
+                        .as_ref()
+                        .map(|t| t.clone_ref(py))
+                        .unwrap_or_else(|| py.None());
+                    to_wake = Some(WakeTarget::SelectWatcher(watcher, token));
+                }
             }
+        }
+        if let Some(target) = to_wake {
+            self.dispatch_wake(py, target);
         }
     }
 
