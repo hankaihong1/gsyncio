@@ -14,6 +14,20 @@ gsyncio 的同步原语遵循同一个骨架：**Python 侧一把 `threading.Loc
 waiter 结构，Rust 侧用原子操作 + flume 承载数据面**。跨线程唤醒一律走
 `loop.call_soon_threadsafe(...)`，绝不跨线程直接触碰 asyncio 对象。
 
+### 1.0 并发物理假设公理体系（Physical Concurrency Axioms）
+
+gsyncio 借用了 AnyIO 和 Trio 的顶层 API 命名与人体工程学接口，但在底层**彻底脱离其单线程无竞争假设**。在单线程协作式运行时（AnyIO/Trio）中，协程在 `await` 之间的执行是绝对串行非抢占的，容器操作无需 OS 锁，原语仅作为协作式并发量节流阀。
+
+与之相反，gsyncio 运行在 **Python 3.14t（自由线程 / 无 GIL）多核物理真并行**之上的多 OS 线程与独立事件循环中。并发正确性不能依赖单线程直觉，必须建立在以下七项严密的形式化物理假设与公理之上：
+
+0. **与 AnyIO/Trio 的范式分水岭（API 借用 vs 多线程物理公理）**：AnyIO/Trio API（`TaskGroup`、`CancelScope`、`CapacityLimiter`、`Event` 等）仅作为人体工程学调用界面被借用。所有底层语义完全基于多线程/多 Loop 物理模型重新设计，严格依赖状态机代数闭包、代币守恒律与 OS 互斥锁同步。
+1. **Python 3.14t 自由线程（无 GIL）真并行假设**：字节码与对象读写在多核 CPU 上真并行执行，无全局解释器锁保护。任何涉及复合状态的操作（如计数器增减 + 等待者队列出入队）必须收敛在单一 OS 互斥锁（`threading.Lock` / `parking_lot::Mutex`）临界区内，杜绝复合锁竞争撕裂。
+2. **跨线程 EventLoop 物理隔离公理**：`asyncio.Task`、`Future` 与 `Event` 严格物理绑定于单一 OS 线程及其 EventLoop。跨线程通信与唤醒绝对只能通过 `loop.call_soon_threadsafe(...)` 或 Rust `FastChannel` 派发。
+3. **ContextVar 线程/任务局部性公理**：`contextvars.ContextVar` 严格归属于当前 OS 线程与当前 Task。跨线程取消（`scope.cancel()`）严禁跨线程读取 ContextVar 栈，仅依赖线程互斥锁与 `call_soon_threadsafe`。
+4. **asyncio 原生取消与单账本对称记账公理**：完全基于 Python 3.11+/3.14t 原生 `task.cancelling()` 与 `task.uncancel()` 机制。Scope 仅对其显式注入的取消（`_injected == True`）执行对称的 `task.uncancel()` 冲销，绝不误吞外部第三方取消。Shield 严格采用快照-恢复（Snapshot-and-Restore）模型。
+5. **数据面与等待面物理分离公理**：数据流由 Rust 核心无锁承载（`flume` + 64 字节对齐原子计数器），异步等待队列由 Python `threading.Lock` 保护并执行双检锁协议。
+6. **结构化并发物理作用域公理**：`TaskGroup` 物理限定于单个 `asyncio.AbstractEventLoop` 内部。跨 Loop、跨线程并发由 `EventLoopThreadPool`、`FastChannel` 与 `AsyncContext` 协同编排。
+
 ### 1.1 通道类（FastChannel / AsyncChannel）
 
 | 组件 | 锁/原语 | waiter 结构 | 关键不变量 |
@@ -32,7 +46,7 @@ waiter 结构，Rust 侧用原子操作 + flume 承载数据面**。跨线程唤
 |---|---|---|---|
 | `Lock` | `threading.Lock` | `deque[(task, asyncio.Event)]` | FIFO；owner 死亡（`_owner.done()`）自动回收，不泄漏锁（`_sync.py:56-62`）；release 时跳过已 done 的 waiter（`_sync.py:90-97`） |
 | `Semaphore` | `threading.Lock` | `deque[(loop, asyncio.Event)]` | FIFO；取消的 waiter 若已被 release 弹出，令牌**转发**给下一个 waiter 或归还池（`_sync.py:192-213`） |
-| `CapacityLimiter` | `_total_lock` + 内嵌 Semaphore | 同 Semaphore | `available + borrowed == total` 在单次 `_total_lock` 下成立（`snapshot()`，`_sync.py:308-321`） |
+| `CapacityLimiter` | `threading.Lock`（`_lock`） | `deque[(loop, asyncio.Event)]` | 单锁原子模型：`available + borrowed == total` 在 `_lock` 下恒成立；3.14t 下原子借还与动态亏空吸收（`_sync.py:329-497`） |
 
 ### 1.3 事件与条件
 
@@ -45,16 +59,16 @@ waiter 结构，Rust 侧用原子操作 + flume 承载数据面**。跨线程唤
 
 | 原语 | 保护锁 | waiter 结构 | 关键不变量 |
 |---|---|---|---|
-| `Barrier` | `threading.Mutex` | `list[(loop, asyncio.Event)]` | `_generation` 计数器绑定轮次；取消处理先查 generation 再删条目（`_sync.py:628-643`）。**取消注意（FIX-12）**：轮次凑齐前有 party 被取消，其余 party 将永久阻塞——barrier 没有自动 broken 状态；`abort()` 是文档化的逃生通道 |
-| `AsyncWaitGroup` | Rust：`parking_lot::Mutex<WaitGroupInner>` | `Vec[(loop, future)]` | 单互斥锁统一管理 `counter`、`generation` 和 `waiters`；`add(-n)` 与 `done()` 归零时原子递增 `generation` 并通过 `mem::take` 移交全部 waiter 列表（`lib.rs:465-540`）；`register_waiter` 快路径对已归零状态立即返回已就绪 |
+| `Barrier` | `threading.Mutex` | `list[(loop, asyncio.Event, box)]` | `_generation` 计数器绑定轮次；轮次完成前有任意 party 被取消，屏障自动进入 Broken 状态并唤醒其余所有 party 抛出异常，并自增代际（`_sync.py:774-896`） |
+| `AsyncWaitGroup` | Rust：`parking_lot::Mutex<WaitGroupInner>` | `Vec[(loop, future)]` | 单互斥锁统一管理 `counter`、`generation` 和 `waiters`；`add(-n)` 与 `done()` 归零时原子递增 `generation` 并通过 `mem::take` 移交全部 waiter 列表（`lib.rs:465-540`）；`register_waiter` 对已归零状态立即返回已就绪；提供 `holding()` 上下文管理器支持 RAII 追踪 |
 | `AsyncOnce` | `threading.Lock` | `deque[(loop, future)]` | leader/follower：锁内决定谁执行、follower 锁内注册，leader 在 finally 中**持锁** `_wake_all`——注册与唤醒在同一把锁下，无 lost-wakeup 窗口（`primitives.py:377-416`） |
 
 ### 1.5 取消与结构化并发
 
 | 组件 | 机制 | 关键点 |
 |---|---|---|
-| `CancelScope` | 每任务 contextvars 栈 + 单账本 `_injected` | shield 进入时 snapshot 取消计数并清零，退出时恢复；单账本精确跟踪实际注入并对称冲销（`_cancel.py`） |
-| `select_channel` | 两阶段确定性仲裁器（Phase 1 快速 `try_recv`，Phase 2 共享单 Future 多通道注册） | 废除 TaskGroup 投机取消，赢家通过 `try_recv()` 消费并在 `finally` 中切除所有通道 watcher 注册（`primitives.py:230-290`） |
+| `CancelScope` | 每任务 contextvars 栈 + 单账本 `_injected` | shield 进入时 snapshot 取消计数并清零，退出时恢复；单账本精确跟踪实际注入并对称冲销；严格 RAII 作用域栈生命周期（`_cancel.py`） |
+| `select_channel` | 两阶段仲裁器（Phase 1 伪随机均匀快速 `try_recv`，Phase 2 单播唤醒多通道注册） | 废除 TaskGroup 投机取消，赢家通过 `try_recv()` 消费并在 `finally` 中切除所有通道 watcher 注册（`primitives.py:230-290`） |
 
 ---
 
@@ -69,8 +83,7 @@ waiter 结构，Rust 侧用原子操作 + flume 承载数据面**。跨线程唤
 **根因**：检查与操作不是原子的。
 **正确姿势**：合并为单次锁内操作；无法合并时用 try/except 兜底。
 **例证**：
-- `CapacityLimiter` 的三个属性分别取 `_total_lock`，并发 resize 会读到
-  混合值 → 用 `snapshot()` 单次锁内读完（`_sync.py:308-321`）。
+- `CapacityLimiter` 统一由单一把 `_lock` 保护全部 token、借出与 waiter 状态；调用 `snapshot()` 原子上锁读出 `(total, avail, borrowed)`（`_sync.py:329-497`）。
 - 通用教训（他处修复过）：`contains_key → getitem` 之间 key 可被并发删除
   → 拆开两步 + `try/except KeyError`。
 
@@ -117,9 +130,7 @@ generation 再决定是否删除。
 **例证**：`Barrier.wait()`（`_sync.py:628-643`）；同样手法在
 `Semaphore._cancel_waiter`（令牌转发而非盲删，`_sync.py:192-213`）。
 
-**FIX-12 注**：generation 守卫保护的是*下一轮*条目，但轮次凑齐前被取消的
-party 会让其余 party 永久停在屏障上——`Barrier` 没有自动 broken 状态
-（刻意为之，R4 决议）。逃生通道用 `abort()`。
+**Barrier Broken 注**：generation 守卫保护的是*下一轮*条目，且当轮次凑齐前有 party 被取消时，屏障自动转移至 Broken 状态并唤醒当前轮次所有等待者抛出异常，从根源杜绝死锁。
 
 **已知限制（FIX-15）**：`Barrier`/`Condition`/`Semaphore` 取消处理里的
 删除是每个 waiter O(n)（重建列表/dict），N 个 waiter 的取消风暴总成本
@@ -134,9 +145,7 @@ O(n²)——实测 5000 waiter ≈ 560 ms（R2 探针 E2）。真实 party 数�
 **正确姿势**：注册后由注册函数返回"是否已完成"；已完成则不等待直接返回
 （Go `sync.WaitGroup.Wait` 同款语义）。
 **例证**：`AsyncWaitGroup.wait()` + `register_waiter` 的布尔返回
-（`primitives.py:332-339`、`lib.rs:473-487`）。注意 Rust 侧文档明确：
-**所有正 delta 的 `add()` 必须 happens-before `register_waiter()`**，
-否则无锁快路径仍可能输给并发 `add()`——调用方要遵守这个顺序约束。
+（`primitives.py:332-339`、`lib.rs:473-487`），内部受 `parking_lot::Mutex` 保护。注意：**所有正 delta 的 `add()` 必须 happens-before `register_waiter()`**，确保调用方不会在工作协程启动前误观察到计数器为 0 并提前放行。
 
 ### 模式 7：跨线程共享 asyncio 对象
 
@@ -224,7 +233,7 @@ except TimeoutError:
 if limiter.available_tokens > 0:  # 例如 0.5 > 0
     await limiter.acquire()  # 若整型容量已借满则必然阻塞!
 ```
-- **正确姿势**：统一推荐 `async with limiter:` 上下文管理器；仅在 `available_tokens >= 1.0` 时期望无阻借出。
+- **正确姿势**：统一推荐 `async with limiter:` 上下文管理器；使用 `limiter.available_capacity >= 1`（或 `available_tokens >= 1.0`）确保可立即无阻借出。
 
 ---
 
@@ -293,10 +302,7 @@ if limiter.available_tokens > 0:  # 例如 0.5 > 0
 
 ### 4.5 `register_waiter` 的顺序约束
 
-`RawAsyncWaitGroup::register_waiter` 的无锁快路径（`lib.rs:474`）能输给
-并发 `add()` 0→1：**调用方必须保证所有正 delta 的 `add()` 在
-`register_waiter()` 之前 happens-before**（Go WaitGroup 同款约定）。修改
-waitgroup 语义时不要破坏这个约束，否则出现"waiter 永不唤醒"的隐蔽挂死。
+`RawAsyncWaitGroup`（`lib.rs:548`）由 `parking_lot::Mutex<WaitGroupInner>` 单互斥锁保护：**调用方必须保证所有正 delta 的 `add()` 在 `register_waiter()` 之前 happens-before**（Go WaitGroup 同款约定）。否则在计数为 0 时调用 `wait()` 会立即返回已就绪，从而漏过后续启动的并发任务。
 
 ---
 

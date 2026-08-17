@@ -370,7 +370,7 @@ EventLoopThreadPool(
 - **`cancel_scope`**：可选地把任务绑定到 `CancelScope`；已取消的 scope
   会抑制任务结果。
 - **抛出**：池已关闭时抛 `ThreadPoolClosedError`，非法 `pin_to` 下标抛
-  `ValueError`。
+  `ValueError`，传入原生 `asyncio.Future` 或向协程对象传递参数时抛 `TypeError`。
 
 ##### `get_metrics()` -> `dict[str, Any]`
 返回可 JSON 序列化的健康指标字典：
@@ -661,9 +661,10 @@ async with TaskGroup(name=None) as tg:
 
 - **`start_soon(coro_fn, *args)` -> `TaskHandle`**：派生子任务并立即返回
   句柄，不阻塞。进入组之前派生的子任务由首次进入纳入追踪。
+  - **抛出**：组退出后或从外部 Loop/线程调用时抛 `RuntimeError`（TaskGroup 物理限定于单 Loop）；孤儿任务会被取消并消费其异常。
 - **`start(coro_fn, *args)` -> `TaskHandle`**：派生子任务，阻塞直到子任务
   调用 `task_status.started()`。
-  - **抛出**：组退出后调用抛 `RuntimeError`（与 `start_soon` 相同的孤儿防护）；子任务未调用 `task_status.started()` 即退出也抛 `RuntimeError`（trio/anyio 对齐——静默返回已死任务的句柄会掩盖协议违规）。
+  - **抛出**：组退出后或从外部 Loop/线程调用抛 `RuntimeError`（与 `start_soon` 相同的防护）；子任务未调用 `task_status.started()` 即退出也抛 `RuntimeError`（trio/anyio 对齐——静默返回已死任务的句柄会掩盖协议违规）。
 - **抛出**：子任务异常在退出时重抛；多个失败以 `ExceptionGroup` 聚合。被取消的子任务不作为错误上报（trio/anyio 对齐）；宿主在组等待期间被取消时，保证所有子任务完成后再退出块。
 
 ### `TaskHandle`
@@ -779,7 +780,9 @@ CapacityLimiter(total_tokens: float)
 ```
 
 - **`total_tokens`** -> `float`：总容量（可读写）。
-- **`available_tokens`** -> `float`：当前可用令牌。
+- **`total_capacity`** -> `int`：整型底容量（`int(total_tokens)`）。
+- **`available_tokens`** -> `float`：当前可用令牌（`total_tokens - borrowed_tokens`）。
+- **`available_capacity`** -> `int`：当前可立即获取的离散整型槽位数（`max(0, int(total_tokens) - borrowed)`）。
 - **`borrowed_tokens`** -> `float`：当前借出的令牌。
 - **`snapshot()`** -> `(total, available, borrowed)`：在**一次**锁获取下
   原子一致地读取三个计数器。当其他线程可能并发调整 `total_tokens` 时，
@@ -861,6 +864,8 @@ await wg.wait()
 ```
 
 所有正数 `add()` 调用必须先于同一计数器的第一次 `wait()`（与 Go `sync.WaitGroup` 一致）：并发的 `add()` 与 `wait()` 竞争会丢失唤醒并永久挂起。允许负数增量（Go 语义），但不得把计数器减到 0 以下——否则抛出 `RuntimeError`。
+ 
+支持通过 `async with wg.holding():` 与 `tg.start_soon(wg.wrap(fn))` 进行结构化 RAII 跟踪，确保在异常与取消路径下计数器严格平衡。
 
 ---
 

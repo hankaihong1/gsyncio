@@ -6,6 +6,8 @@
 > the one-line "core idea" for each primitive follows. Full signatures and
 > parameters: [API.md](API.md). Concurrency semantics:
 > [CONCURRENCY.md](CONCURRENCY.md).
+>
+> **Architecture Note**: While gsyncio borrows the ergonomic API surface of AnyIO/Trio (`TaskGroup`, `CancelScope`, `CapacityLimiter`, etc.), all primitives execute under **Python 3.14t multi-threaded multi-event-loop physical parallelism** with OS mutexes and formal token conservation, rather than single-threaded cooperative assumptions. See [CONCURRENCY.md](CONCURRENCY.md).
 
 ---
 

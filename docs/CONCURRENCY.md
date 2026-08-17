@@ -18,6 +18,20 @@ the Rust side carries the data plane with atomics + flume**. Cross-thread
 wakeups always go through `loop.call_soon_threadsafe(...)` — asyncio objects
 are never touched directly from another thread.
 
+### 1.0 Physical Concurrency Axioms (Axiomatic Assumptions)
+
+gsyncio borrows the clean, developer-friendly API surface of AnyIO and Trio, but **fundamentally diverges from their single-threaded runtime assumptions**. In single-threaded cooperative engines (AnyIO/Trio), coroutine execution between `await` points is strictly sequential and non-preemptive; data structures require no OS mutexes and primitives act merely as coroutine scheduling throttles.
+
+In contrast, gsyncio operates under **Python 3.14t (free-threaded / no-GIL) true multi-core physical parallelism** across multiple OS threads and isolated event loops. Correctness cannot rely on single-threaded heuristics; it rests on seven formal physical concurrency axioms:
+
+0. **Paradigm Divergence from AnyIO/Trio (API Lending vs. Multi-Threaded Physics)**: AnyIO/Trio APIs (`TaskGroup`, `CancelScope`, `CapacityLimiter`, `Event`, etc.) are adopted strictly as an ergonomic interface layer. All underlying semantics are redesigned from first principles for multi-thread / multi-loop execution, requiring formal state-machine proofs, token conservation laws, and OS-level mutex synchronization.
+1. **Python 3.14t Free-Threaded True Parallelism**: Bytecode and object operations execute concurrently across CPU cores without a GIL. Any composite state transitions (e.g. counter updates + waiter notifications) must be enclosed within a single OS mutex (`threading.Lock` / `parking_lot::Mutex`) to prevent state tearing.
+2. **Cross-Thread EventLoop Isolation**: `asyncio.Task`, `Future`, and `Event` are strictly bound to a single thread and its event loop. Cross-thread notifications must strictly go through `loop.call_soon_threadsafe(...)` or Rust `FastChannel`.
+3. **ContextVar Thread/Task Locality**: `contextvars.ContextVar` is strictly local to the active OS thread and task. Cross-thread cancellation (`scope.cancel()`) must never read or modify `ContextVar` state; it relies exclusively on thread-safe locks and `call_soon_threadsafe`.
+4. **Native asyncio Cancellation & Single-Ledger Symmetric Accounting**: Built upon Python 3.11+/3.14t native `task.cancelling()` / `task.uncancel()`. A scope only compensates (`task.uncancel()`) for cancellations it explicitly injected (`_injected == True`), preventing accidental absorption of foreign cancellations. Shielding is a snapshot-and-restore mechanism.
+5. **Data Plane vs Wait Plane Separation**: Data transfer is carried out lock-free in Rust (`flume` + 64-byte-padded atomic counters), while async waiters are tracked under Python `threading.Lock` using the double-check lock pattern.
+6. **Structured Concurrency Physical Scope**: `TaskGroup` is physically scoped to a single `asyncio.AbstractEventLoop`. Multi-loop concurrency is coordinated via `EventLoopThreadPool`, `FastChannel`, and `AsyncContext`.
+
 ### 1.1 Channels (FastChannel / AsyncChannel)
 
 | Component | Lock / primitive | Waiter structure | Key invariant |
@@ -38,7 +52,7 @@ lock → await → unregister under the lock on cancellation」
 |---|---|---|---|
 | `Lock` | `threading.Lock` | `deque[(task, asyncio.Event)]` | FIFO; a dead owner (`_owner.done()`) is recycled automatically so the lock never leaks (`_sync.py:56-62`); `release()` skips done waiters (`_sync.py:90-97`) |
 | `Semaphore` | `threading.Lock` | `deque[(loop, asyncio.Event)]` | FIFO; if a cancelled waiter was already popped by `release()`, its token is **forwarded** to the next waiter or returned to the pool (`_sync.py:192-213`) |
-| `CapacityLimiter` | `_total_lock` + embedded Semaphore | same as Semaphore | `available + borrowed == total` holds under a single `_total_lock` acquisition (`snapshot()`, `_sync.py:308-321`) |
+| `CapacityLimiter` | `threading.Lock` (`_lock`) | `deque[(loop, asyncio.Event)]` | Single-lock atomic model: `available + borrowed == total` under `_lock`; atomic borrow, return, and deficit absorption under 3.14t (`_sync.py:329-497`) |
 
 ### 1.3 Events & Conditions
 
@@ -51,16 +65,16 @@ lock → await → unregister under the lock on cancellation」
 
 | Primitive | Guarding lock | Waiter structure | Key invariant |
 |---|---|---|---|
-| `Barrier` | `threading.Mutex` | `list[(loop, asyncio.Event)]` | `_generation` counter binds each waiter to its round; cancellation handlers check the generation before removing an entry (`_sync.py:628-643`). **Cancellation caveat (FIX-12)**: a party cancelled *before* the round completes leaves the remaining parties blocked forever — the barrier has no automatic broken state; `abort()` is the documented escape hatch |
-| `AsyncWaitGroup` | Rust: `parking_lot::Mutex<WaitGroupInner>` | `Vec[(loop, future)]` | Single mutex guards `counter`, `generation`, and `waiters`; `add(-n)` and `done()` to zero atomically bump `generation` and hand over the whole waiter list via `mem::take` (`lib.rs:465-540`); `register_waiter` fast path wakes immediately if already done |
+| `Barrier` | `threading.Mutex` | `list[(loop, asyncio.Event, box)]` | `_generation` counter binds each waiter to its round; on cancellation of any party before round completion, the barrier automatically enters Broken state, wakes all remaining parties with an error, and advances generation (`_sync.py:774-896`) |
+| `AsyncWaitGroup` | Rust: `parking_lot::Mutex<WaitGroupInner>` | `Vec[(loop, future)]` | Single mutex guards `counter`, `generation`, and `waiters`; `add(-n)` and `done()` to zero atomically bump `generation` and hand over the whole waiter list via `mem::take` (`lib.rs:465-540`); `register_waiter` wakes immediately if counter is zero; `holding()` provides RAII tracking |
 | `AsyncOnce` | `threading.Lock` | `deque[(loop, future)]` | leader/follower: the lock decides who executes; followers register under the lock; the leader `_wake_all`s **while holding the lock** in `finally` — registration and wakeup share one lock, so there is no lost-wakeup window (`primitives.py:377-416`) |
 
 ### 1.5 Cancellation & Structured Concurrency
 
 | Component | Mechanism | Key point |
 |---|---|---|
-| `CancelScope` | per-task contextvars stack + single-ledger `_injected` | shield snapshots and clears the cancellation count on entry, restores it on exit; single ledger tracks exact injections and symmetrically uncancels only what was injected (`_cancel.py`) |
-| `select_channel` | 2-phase deterministic arbiter (Phase 1 fast `try_recv`, Phase 2 multi-channel registration on shared future) | readiness is reported without TaskGroup speculative cancellation; winner consumes via `try_recv()` and unregisters all watcher tokens in `finally` (`primitives.py:230-290`) |
+| `CancelScope` | per-task contextvars stack + single-ledger `_injected` | shield snapshots and clears the cancellation count on entry, restores it on exit; single ledger tracks exact injections and symmetrically uncancels only what was injected; strict RAII scope stack lifetime (`_cancel.py`) |
+| `select_channel` | 2-phase arbiter (Phase 1 fast `try_recv` with pseudo-random uniform start, Phase 2 multi-channel registration with unicast wakeup) | readiness is reported without TaskGroup speculative cancellation; winner consumes via `try_recv()` and unregisters all watcher tokens in `finally` (`primitives.py:230-290`) |
 
 ---
 
@@ -77,9 +91,7 @@ the operation fails or reads stale state.
 **Correct approach**: merge into a single locked operation; when that is
 impossible, fall back with try/except.
 **Examples**:
-- `CapacityLimiter`'s three properties each take `_total_lock` separately; a
-  concurrent resize can mix values → use `snapshot()` to read all three
-  under one lock (`_sync.py:308-321`).
+- `CapacityLimiter` holds all token, borrowed, and waiter state under a single `_lock`; reading `snapshot()` atomically yields `(total, avail, borrowed)` (`_sync.py:329-497`).
 - General lesson (fixed elsewhere): `contains_key → getitem` can lose the key
   to a concurrent delete → split the two steps + `try/except KeyError`.
 
@@ -143,10 +155,7 @@ the cancellation handler compares the generation before deciding to remove.
 `Semaphore._cancel_waiter` (token forwarding instead of blind removal,
 `_sync.py:192-213`).
 
-**FIX-12 note**: the generation guard protects *next-round* entries, but a
-cancelled party whose round never completes leaves the other parties parked
-forever — `Barrier` has no automatic broken state (deliberate, R4
-decision).  Use `abort()` as the escape hatch.
+**Barrier Broken note**: the generation guard protects *next-round* entries, and a cancelled party automatically transitions the barrier into a Broken state, waking all current round parties with an error to eliminate deadlocks.
 
 **Known limitation (FIX-15)**: the cancellation-handler removal in
 `Barrier`/`Condition`/`Semaphore` is O(n) per waiter (list/dict rebuild), so
@@ -164,10 +173,7 @@ waiter is never woken.
 done; if so, return immediately without waiting (same semantics as Go
 `sync.WaitGroup.Wait`).
 **Examples**: `AsyncWaitGroup.wait()` + the boolean return of
-`register_waiter` (`primitives.py:332-339`, `lib.rs:473-487`). Note the
-Rust doc explicitly states: **all `add()` calls with a positive delta must
-happen-before `register_waiter()`**, or the lock-free fast path can still
-lose to a concurrent `add()` — callers must respect this ordering.
+`register_waiter` (`primitives.py:332-339`, `lib.rs:473-487`), guarded under `parking_lot::Mutex`. Note: **all `add()` calls with a positive delta must happen-before `register_waiter()`** to ensure callers do not observe a stale counter of 0 before workers start.
 
 ### Pattern 7: sharing asyncio objects across threads
 
@@ -258,7 +264,7 @@ except TimeoutError:
 if limiter.available_tokens > 0:  # e.g. 0.5 > 0
     await limiter.acquire()  # Blocks if integer capacity (2) is already borrowed!
 ```
-- **Correct approach**: Always use `async with limiter:`; require `available_tokens >= 1.0` for non-blocking expectations.
+- **Correct approach**: Always use `async with limiter:`; require `limiter.available_capacity >= 1` (or `available_tokens >= 1.0`) for non-blocking expectations.
 
 ---
 
@@ -342,12 +348,7 @@ Priority: **private buffer → global batch → local channel**
 
 ### 4.5 The ordering constraint on `register_waiter`
 
-The lock-free fast path of `RawAsyncWaitGroup::register_waiter`
-(`lib.rs:474`) can lose to a concurrent `add()` 0→1: **callers must ensure
-all positive-delta `add()` calls happen-before `register_waiter()`** (same
-convention as Go's WaitGroup). When changing waitgroup semantics, don't
-break this constraint, or you get a subtle hang where a waiter is never
-woken.
+In `RawAsyncWaitGroup` (`lib.rs:548`), the state machine is guarded by `parking_lot::Mutex<WaitGroupInner>`: **callers must ensure all positive-delta `add()` calls happen-before `register_waiter()`** (same convention as Go's WaitGroup). Otherwise, calling `wait()` when the counter is zero immediately returns ready and misses concurrent work started afterwards.
 
 ---
 

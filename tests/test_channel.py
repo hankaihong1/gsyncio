@@ -803,3 +803,125 @@ async def test_select_channel_timeout_error_tuple_catch() -> None:
     # Normal timeout raises gsyncio.exceptions.TimeoutError
     with pytest.raises(TimeoutError, match="select_channel timed out"):
         await select_channel(ch1, ch2, timeout=0.05)
+
+
+@pytest.mark.asyncio
+async def test_select_channel_ghost_receiver_token_forwarding() -> None:
+    """R10: When multiple select watchers wait on a shared channel, and the first
+    watcher is fulfilled by another channel (becoming a ghost receiver), the shared
+    channel's wakeup must be forwarded to subsequent watchers without lost wakeups."""
+    ch_shared = FastChannel()
+    ch_other = FastChannel()
+
+    # Waiter 1 waits on (ch_shared, ch_other)
+    w1_task = asyncio.create_task(select_channel(ch_shared, ch_other, timeout=2.0))
+    # Waiter 2 waits on (ch_shared,)
+    w2_task = asyncio.create_task(select_channel(ch_shared, timeout=2.0))
+
+    await wait_all_tasks_blocked()
+
+    # Fulfill waiter 1 via ch_other
+    await ch_other.send("other_val")
+    res1_ch, res1_val = await w1_task
+    assert res1_ch is ch_other
+    assert res1_val == "other_val"
+
+    # Now send to ch_shared -> waiter 2 must reliably receive it
+    await ch_shared.send("shared_val")
+    res2_ch, res2_val = await w2_task
+    assert res2_ch is ch_shared
+    assert res2_val == "shared_val"
+
+
+@pytest.mark.asyncio
+async def test_select_channel_fast_prng_distribution() -> None:
+    """select_channel with lock-free PRNG must select ready channels fairly across multiple rounds."""
+    ch1 = FastChannel()
+    ch2 = FastChannel()
+    ch3 = FastChannel()
+
+    counts = {ch1: 0, ch2: 0, ch3: 0}
+    rounds = 150
+    for i in range(rounds):
+        await ch1.send(f"val1_{i}")
+        await ch2.send(f"val2_{i}")
+        await ch3.send(f"val3_{i}")
+
+        selected, _ = await select_channel(ch1, ch2, ch3)
+        counts[selected] += 1
+
+        # Drain unselected items
+        for ch in (ch1, ch2, ch3):
+            if ch is not selected:
+                await ch.recv()
+
+    # All channels should be selected at least once with uniform pseudo-random start
+    assert counts[ch1] > 0
+    assert counts[ch2] > 0
+    assert counts[ch3] > 0
+    assert sum(counts.values()) == rounds
+
+
+@pytest.mark.asyncio
+async def test_fastchannel_cancellation_storm() -> None:
+    """Cancellation storm on FastChannel: 500 queued getters simultaneously cancelled."""
+    ch = FastChannel()
+    cancelled_count = 0
+
+    async def getter() -> None:
+        nonlocal cancelled_count
+        try:
+            await ch.recv()
+        except asyncio.CancelledError:
+            cancelled_count += 1
+            raise
+
+    tasks = [asyncio.create_task(getter()) for _ in range(500)]
+    await asyncio.sleep(0.01)
+    assert len(ch._getters) == 500
+
+    for t in tasks:
+        t.cancel()
+
+    await asyncio.gather(*tasks, return_exceptions=True)
+    assert cancelled_count == 500
+    assert len(ch._getters) == 0
+
+    # Normal recv/send works without leftover corruption
+    await ch.send("post_storm")
+    assert await ch.recv() == "post_storm"
+
+
+@pytest.mark.asyncio
+async def test_select_channel_cancellation_storm() -> None:
+    """Cancellation storm on select_channel: 200 select watchers simultaneously cancelled."""
+    ch1 = FastChannel()
+    ch2 = FastChannel()
+    cancelled_count = 0
+
+    async def select_watcher() -> None:
+        nonlocal cancelled_count
+        try:
+            await select_channel(ch1, ch2)
+        except asyncio.CancelledError:
+            cancelled_count += 1
+            raise
+
+    tasks = [asyncio.create_task(select_watcher()) for _ in range(200)]
+    await asyncio.sleep(0.01)
+    assert len(ch1._notifiers) == 200
+    assert len(ch2._notifiers) == 200
+
+    for t in tasks:
+        t.cancel()
+
+    await asyncio.gather(*tasks, return_exceptions=True)
+    assert cancelled_count == 200
+    assert len(ch1._notifiers) == 0
+    assert len(ch2._notifiers) == 0
+
+    # Send an item and select immediately works
+    await ch1.send("healthy")
+    chosen, val = await select_channel(ch1, ch2)
+    assert chosen is ch1
+    assert val == "healthy"

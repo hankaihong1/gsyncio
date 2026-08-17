@@ -542,3 +542,48 @@ async def test_barrier_base_exception_cleanup() -> None:
         pass
 
     assert barrier.n_waiting == 0, "Cancelled/interrupted waiter must be removed from barrier"
+
+
+@pytest.mark.asyncio
+async def test_barrier_broken_on_cancellation() -> None:
+    """Barrier automatically enters broken state when a waiting party is cancelled."""
+    barrier = Barrier(3)
+    assert not barrier.broken
+
+    async def party_cancelled() -> None:
+        await barrier.wait()
+
+    party2_exc: list[Exception] = []
+
+    async def party_survivor() -> None:
+        try:
+            await barrier.wait()
+        except RuntimeError as e:
+            party2_exc.append(e)
+
+    t1 = asyncio.create_task(party_cancelled())
+    t2 = asyncio.create_task(party_survivor())
+    await asyncio.sleep(0.02)
+
+    assert barrier.n_waiting == 2
+    assert not barrier.broken
+
+    # Cancel party 1
+    t1.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await t1
+
+    # Party 2 must be woken and receive RuntimeError (broken barrier)
+    await asyncio.wait_for(t2, timeout=2.0)
+    assert len(party2_exc) == 1
+    assert "broken" in str(party2_exc[0])
+    assert barrier.broken is True
+
+    # Subsequent waits fail immediately while broken
+    with pytest.raises(RuntimeError, match="broken"):
+        await barrier.wait()
+
+    # Reset clears broken state
+    barrier.reset()
+    assert not barrier.broken
+    assert barrier.n_waiting == 0

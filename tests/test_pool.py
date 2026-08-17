@@ -675,6 +675,7 @@ async def test_pool_cancel_scope_completes_future():
         scope = CancelScope()
 
         async def work() -> int:
+            await asyncio.sleep(0.5)
             return 42
 
         fut = pool.submit(work, cancel_scope=scope)
@@ -861,3 +862,61 @@ async def test_safe_complete_closed_loop_containment() -> None:
     # Must not raise RuntimeError
     _safe_complete(closed_loop, fut, result="test")
     _safe_complete(closed_loop, fut, exc=RuntimeError("test error"))
+
+
+@pytest.mark.asyncio
+async def test_pool_reject_raw_future_submission() -> None:
+    """submit() must reject raw asyncio.Future targets to enforce loop isolation."""
+    loop = asyncio.get_running_loop()
+    raw_fut = loop.create_future()
+    async with EventLoopThreadPool(num_threads=2) as pool:
+        with pytest.raises(TypeError, match=r"cannot be an asyncio\.Future"):
+            pool.submit(raw_fut)
+
+
+@pytest.mark.asyncio
+async def test_pool_abort_unstepped_coroutine_cleanup() -> None:
+    """Pool abort must cleanly close unstepped coroutine objects without warnings."""
+    import warnings
+
+    pool = EventLoopThreadPool(num_threads=1)
+    await pool.start()
+
+    async def slow_worker() -> None:
+        await asyncio.sleep(5.0)
+
+    # Submit a slow worker to keep the worker thread occupied
+    slow_fut = pool.submit(slow_worker)
+    await asyncio.sleep(0.01)
+
+    async def queued_coro(idx: int) -> int:
+        return idx
+
+    # Submit multiple raw coroutine objects behind the slow worker
+    coros = [queued_coro(i) for i in range(50)]
+    futs = [pool.submit(c) for c in coros]
+
+    # Abort while tasks are queued in Rust pool
+    with warnings.catch_warnings(record=True) as recorded_warnings:
+        warnings.simplefilter("always")
+        await pool.abort()
+
+    # Await slow_fut to retrieve any cancellation exception cleanly
+    try:
+        await asyncio.wait_for(slow_fut, timeout=1.0)
+    except (asyncio.CancelledError, ThreadPoolClosedError, Exception):
+        pass
+
+    done, pending = await asyncio.wait(futs, timeout=2.0)
+    assert len(pending) == 0
+    for fut in done:
+        if not fut.cancelled():
+            try:
+                exc = fut.exception()
+            except asyncio.CancelledError:
+                exc = None
+            if exc is not None:
+                assert isinstance(exc, (ThreadPoolClosedError, asyncio.CancelledError))
+
+    runtime_warnings = [w for w in recorded_warnings if issubclass(w.category, RuntimeWarning)]
+    assert not runtime_warnings, f"Unexpected warnings: {runtime_warnings}"

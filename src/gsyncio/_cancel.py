@@ -1,4 +1,4 @@
-"""Task-local cancellation scopes (anyio / trio inspired) for gsyncio."""
+"""Task-local cancellation scopes for gsyncio (cross-thread safe with single-ledger accounting)."""
 
 from __future__ import annotations
 
@@ -27,7 +27,8 @@ class CancelScope:
     Entered scopes track their own cancellation flag, an optional absolute deadline,
     and a *shield* that snapshots and clears the task's pending cancellation count
     on entry, restoring it on exit — it absorbs cancellations *already injected*
-    before entry.
+    before entry. Cross-thread cancellation is dispatched thread-safely via
+    ``loop.call_soon_threadsafe``.
     """
 
     def __init__(self, deadline: float = float("inf"), shield: bool = False) -> None:
@@ -122,18 +123,40 @@ class CancelScope:
                 return
             self._shield = value
             task = self._task
+            loop = self._loop
 
-        if task is not None and not task.done():
-            if value:
-                count = task.cancelling()
-                for _ in range(count):
-                    task.uncancel()
-                self._saved_cancel_count += count
+        if task is not None and not task.done() and loop is not None:
+
+            def _apply_shield() -> None:
+                with self._cancel_lock:
+                    if self._task is not task or task.done():
+                        return
+                if value:
+                    count = task.cancelling()
+                    for _ in range(count):
+                        task.uncancel()
+                    with self._cancel_lock:
+                        self._saved_cancel_count += count
+                else:
+                    with self._cancel_lock:
+                        saved = self._saved_cancel_count
+                        self._saved_cancel_count = 0
+                    if saved > 0:
+                        for _ in range(saved):
+                            task.cancel()
+
+            try:
+                current_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                current_loop = None
+
+            if current_loop is loop:
+                _apply_shield()
             else:
-                if self._saved_cancel_count > 0:
-                    for _ in range(self._saved_cancel_count):
-                        task.cancel()
-                    self._saved_cancel_count = 0
+                try:
+                    loop.call_soon_threadsafe(_apply_shield)
+                except RuntimeError:
+                    pass
 
     @property
     def cancelled_caught(self) -> bool:
@@ -151,28 +174,29 @@ class CancelScope:
             task = self._task
             loop = self._loop
 
-        if task is not None and not task.done():
+        if task is not None and not task.done() and loop is not None:
             try:
                 current_loop = asyncio.get_running_loop()
             except RuntimeError:
                 current_loop = None
-            if loop is not None and current_loop is not loop:
+
+            if current_loop is loop:
+                with self._cancel_lock:
+                    if self._task is task and not task.done() and task.cancel():
+                        self._injected = True
+            else:
+
+                def _deliver() -> None:
+                    with self._cancel_lock:
+                        if self._task is not task:
+                            return
+                        if not task.done() and task.cancel():
+                            self._injected = True
+
                 try:
-
-                    def _deliver() -> None:
-                        with self._cancel_lock:
-                            if self._task is not task:
-                                return
-                            if not task.done() and task.cancel():
-                                self._injected = True
-
                     loop.call_soon_threadsafe(_deliver)
                 except RuntimeError:
                     pass
-            else:
-                if task.cancel():
-                    with self._cancel_lock:
-                        self._injected = True
 
     def _take_injected(self) -> bool:
         """Return and clear the injection ledger (TaskGroup failure path)."""
@@ -206,7 +230,7 @@ class CancelScope:
         self._deadline_handle = None
         self.cancel()
 
-    def _rollback_aenter(self, clear_binding: bool = True) -> None:
+    def _rollback_aenter(self) -> None:
         """Undo the ``__aenter__`` side effects before raising from it."""
         stack = _get_scope_stack()
         if stack and stack[-1] is self:
@@ -216,10 +240,9 @@ class CancelScope:
         if self._deadline_handle is not None:
             self._deadline_handle.cancel()
             self._deadline_handle = None
-        if clear_binding:
-            with self._cancel_lock:
-                self._task = None
-                self._loop = None
+        with self._cancel_lock:
+            self._task = None
+            self._loop = None
 
     def _restore_saved_cancel_count(self, target_task: asyncio.Task[Any] | None = None) -> None:
         """Re-inject the cancellation count a shielded enter cleared."""
@@ -235,8 +258,11 @@ class CancelScope:
     # -- context manager protocol ---------------------------------------------
 
     async def __aenter__(self) -> Self:
+        host = asyncio.current_task()
+        if host is None:
+            raise RuntimeError("CancelScope must be used inside an asyncio task")
+
         with self._cancel_lock:
-            host = asyncio.current_task()
             if self._task is not None and self._task is not host:
                 raise RuntimeError(
                     "CancelScope cannot be shared across tasks: already entered by another task"
@@ -249,33 +275,29 @@ class CancelScope:
         _scope_stack_var.set((*stack, self))
 
         if self._shield:
-            task = self._task
-            if task is not None:
-                self._saved_cancel_count = task.cancelling()
-                for _ in range(self._saved_cancel_count):
-                    task.uncancel()
+            self._saved_cancel_count = host.cancelling()
+            for _ in range(self._saved_cancel_count):
+                host.uncancel()
 
         if self._deadline != float("inf"):
-            loop = asyncio.get_running_loop()
-            delta = self._deadline - loop.time()
+            delta = self._deadline - self._loop.time()
             if delta <= 0:
+                with self._cancel_lock:
+                    self._cancel_called = True
                 if self._convert_to_timeout:
-                    with self._cancel_lock:
-                        self._cancel_called = True
                     self._restore_saved_cancel_count()
                     self._rollback_aenter()
                     raise TimeoutError() from None
                 if self._cancelled_caught:
-                    self.cancel()
-                    self._rollback_aenter(clear_binding=False)
+                    if host.cancel():
+                        with self._cancel_lock:
+                            self._injected = True
                     return self
-                with self._cancel_lock:
-                    self._cancel_called = True
                 self._restore_saved_cancel_count()
                 self._rollback_aenter()
                 raise asyncio.CancelledError()
             else:
-                self._deadline_handle = loop.call_later(delta, self._deadline_callback)
+                self._deadline_handle = self._loop.call_later(delta, self._deadline_callback)
 
         if self._effectively_cancelled():
             if self._cancel_called and self._convert_to_timeout:
@@ -283,12 +305,11 @@ class CancelScope:
                 self._rollback_aenter()
                 raise TimeoutError() from None
             if self._cancel_called and self._cancelled_caught:
-                if host is not None and not host.done() and host.cancel():
+                if host.cancel():
                     with self._cancel_lock:
                         self._injected = True
-                self._rollback_aenter(clear_binding=False)
                 return self
-            if not self._shield and host is not None:
+            if not self._shield:
                 for _ in range(host.cancelling()):
                     host.uncancel()
             self._restore_saved_cancel_count()
@@ -309,13 +330,8 @@ class CancelScope:
             self._injected = False
             self._task = None
             self._loop = None
-        try:
-            stack = _get_scope_stack()
-            if stack and stack[-1] is self:
-                _scope_stack_var.set(stack[:-1])
-            else:
-                _scope_stack_var.set(tuple(s for s in stack if s is not self))
 
+        try:
             if self._deadline_handle is not None:
                 self._deadline_handle.cancel()
                 self._deadline_handle = None
@@ -350,9 +366,11 @@ class CancelScope:
 
             return None
         finally:
-            with self._cancel_lock:
-                self._task = None
-                self._loop = None
+            stack = _get_scope_stack()
+            if stack and stack[-1] is self:
+                _scope_stack_var.set(stack[:-1])
+            else:
+                _scope_stack_var.set(tuple(s for s in stack if s is not self))
 
 
 # ---------------------------------------------------------------------------

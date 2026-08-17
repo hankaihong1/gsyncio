@@ -5,7 +5,14 @@ import threading
 
 import pytest
 
-from gsyncio import AsyncContext, AsyncWaitGroup, CapacityLimiter, EventLoopThreadPool, Semaphore
+from gsyncio import (
+    AsyncContext,
+    AsyncWaitGroup,
+    CapacityLimiter,
+    EventLoopThreadPool,
+    Lock,
+    Semaphore,
+)
 from gsyncio.testing import wait_all_tasks_blocked
 
 # ---------------------------------------------------------------------------
@@ -301,25 +308,31 @@ async def test_limiter_fractional_lt_one():
     pre-fix it crashed with ValueError from Semaphore(int(0.5)) == Semaphore(0)."""
     limiter = CapacityLimiter(0.5)
     assert limiter.total_tokens == 0.5
+    assert limiter.total_capacity == 0
     assert limiter.available_tokens == 0.5
+    assert limiter.available_capacity == 0
     with pytest.raises(asyncio.TimeoutError):
         await asyncio.wait_for(limiter.acquire(), timeout=0.2)
     limiter.total_tokens = 1.5
+    assert limiter.total_capacity == 1
+    assert limiter.available_capacity == 1
     await asyncio.wait_for(limiter.acquire(), timeout=1.0)
+    assert limiter.available_capacity == 0
     limiter.release()
+    assert limiter.available_capacity == 1
 
 
 def test_semaphore_max_value_consistent_after_resize():
     """U2 re-audit: max_value is read under the lock, so a concurrent
-    CapacityLimiter resize (which rewrites _max_value from another thread)
+    CapacityLimiter resize (which updates total_tokens atomically)
     can never be observed as a torn value."""
     s = Semaphore(2)
     assert s.max_value == 2
     limiter = CapacityLimiter(1.0)
     limiter.total_tokens = 5.0
-    assert limiter._semaphore.max_value == 5  # type: ignore[attr-defined]
+    assert int(limiter.total_tokens) == 5
     limiter.total_tokens = 2.5
-    assert limiter._semaphore.max_value == 2  # type: ignore[attr-defined]
+    assert int(limiter.total_tokens) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -479,7 +492,7 @@ async def test_semaphore_base_exception_cleanup() -> None:
     t = asyncio.create_task(doomed_waiter())
     await asyncio.sleep(0.01)
     assert len(sem._waiters) == 1
-    event = sem._waiters[0][1]
+    event = next(iter(sem._waiters))
 
     # Directly set exception on event/task to simulate BaseException interrupt
     sem._cancel_waiter(event)
@@ -594,3 +607,195 @@ async def test_capacity_limiter_upscale_during_deficit_does_not_overmint() -> No
     for _ in range(4):
         limiter.release()
     assert limiter.borrowed_tokens == 0.0
+
+
+@pytest.mark.asyncio
+async def test_async_wait_group_holding() -> None:
+    """AsyncWaitGroup.holding() increments on enter and decrements on exit/exception."""
+    wg = AsyncWaitGroup()
+
+    # Normal execution
+    async def worker() -> None:
+        async with wg.holding():
+            await asyncio.sleep(0.01)
+
+    t1 = asyncio.create_task(worker())
+    t2 = asyncio.create_task(worker())
+    await asyncio.sleep(0.002)
+
+    # Wait for completion
+    await asyncio.wait_for(wg.wait(), timeout=1.0)
+    await t1
+    await t2
+
+    # Exception path
+    async def failing_worker() -> None:
+        async with wg.holding():
+            raise ValueError("boom")
+
+    with pytest.raises(ValueError, match="boom"):
+        await failing_worker()
+
+    # Wait should succeed immediately because counter is 0
+    await asyncio.wait_for(wg.wait(), timeout=0.1)
+
+
+@pytest.mark.asyncio
+async def test_async_wait_group_wrap() -> None:
+    """AsyncWaitGroup.wrap wraps callables and tracks execution."""
+    wg = AsyncWaitGroup()
+
+    async def async_worker(x: int) -> int:
+        await asyncio.sleep(0.01)
+        return x * 2
+
+    wrapped = wg.wrap(async_worker)
+    res = await wrapped(21)
+    assert res == 42
+    await asyncio.wait_for(wg.wait(), timeout=0.1)
+
+
+@pytest.mark.asyncio
+async def test_async_wait_group_track_unawaited_leak_protection() -> None:
+    """AsyncWaitGroup.track must not leak counter when tracked coroutine is closed or discarded."""
+    import gc
+
+    wg = AsyncWaitGroup()
+
+    async def sample_coro() -> int:
+        return 123
+
+    # Case 1: tracked coroutine explicitly closed
+    tracked = wg.track(sample_coro())
+    tracked.close()
+    # Counter must be 0, so wait() returns immediately
+    await asyncio.wait_for(wg.wait(), timeout=0.1)
+
+    # Case 2: tracked coroutine discarded and garbage collected
+    def discard_tracked() -> None:
+        _ = wg.track(sample_coro())
+
+    discard_tracked()
+    gc.collect()
+    await asyncio.wait_for(wg.wait(), timeout=0.1)
+
+    # Case 3: tracked coroutine awaited normally
+    tracked_normal = wg.track(sample_coro())
+    val = await tracked_normal
+    assert val == 123
+    await asyncio.wait_for(wg.wait(), timeout=0.1)
+
+
+@pytest.mark.asyncio
+async def test_cancellation_storm_lock() -> None:
+    """Cancellation storm on Lock: 500 queued waiters simultaneously cancelled."""
+    lock = Lock()
+    await lock.acquire()
+
+    cancelled_count = 0
+
+    async def waiter() -> None:
+        nonlocal cancelled_count
+        try:
+            await lock.acquire()
+            lock.release()
+        except asyncio.CancelledError:
+            cancelled_count += 1
+            raise
+
+    tasks = [asyncio.create_task(waiter()) for _ in range(500)]
+    await asyncio.sleep(0.01)
+    assert len(lock._waiters) == 500
+
+    # Cancel all waiters simultaneously
+    for t in tasks:
+        t.cancel()
+
+    await asyncio.gather(*tasks, return_exceptions=True)
+    assert cancelled_count == 500
+    assert len(lock._waiters) == 0
+
+    # Ensure lock is still operational and clean
+    lock.release()
+    assert not lock.locked
+
+    await lock.acquire()
+    assert lock.locked
+    lock.release()
+
+
+@pytest.mark.asyncio
+async def test_cancellation_storm_semaphore() -> None:
+    """Cancellation storm on Semaphore: 500 queued waiters simultaneously cancelled."""
+    sem = Semaphore(1)
+    await sem.acquire()
+    assert sem.value == 0
+
+    cancelled_count = 0
+
+    async def waiter() -> None:
+        nonlocal cancelled_count
+        try:
+            await sem.acquire()
+        except asyncio.CancelledError:
+            cancelled_count += 1
+            raise
+
+    tasks = [asyncio.create_task(waiter()) for _ in range(500)]
+    await asyncio.sleep(0.01)
+    assert len(sem._waiters) == 500
+
+    for t in tasks:
+        t.cancel()
+
+    await asyncio.gather(*tasks, return_exceptions=True)
+    assert cancelled_count == 500
+    assert len(sem._waiters) == 0
+    assert sem.value == 0
+
+    # Release permit and ensure new acquire succeeds
+    sem.release()
+    assert sem.value == 1
+    await sem.acquire()
+    assert sem.value == 0
+    sem.release()
+
+
+@pytest.mark.asyncio
+async def test_cancellation_storm_capacity_limiter() -> None:
+    """Cancellation storm on CapacityLimiter: 500 queued waiters simultaneously cancelled."""
+    limiter = CapacityLimiter(1)
+    await limiter.acquire()
+
+    cancelled_count = 0
+
+    async def waiter() -> None:
+        nonlocal cancelled_count
+        try:
+            await limiter.acquire()
+            limiter.release()
+        except asyncio.CancelledError:
+            cancelled_count += 1
+            raise
+
+    tasks = [asyncio.create_task(waiter()) for _ in range(500)]
+    await asyncio.sleep(0.01)
+    assert len(limiter._waiters) == 500
+
+    for t in tasks:
+        t.cancel()
+
+    await asyncio.gather(*tasks, return_exceptions=True)
+    assert cancelled_count == 500
+    assert len(limiter._waiters) == 0
+
+    total, avail, borrowed = limiter.snapshot()
+    assert total == 1.0
+    assert avail == 0.0
+    assert borrowed == 1.0
+
+    limiter.release()
+    total, avail, borrowed = limiter.snapshot()
+    assert total == 1.0
+    assert avail == 1.0
+    assert borrowed == 0.0

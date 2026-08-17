@@ -1,7 +1,7 @@
 [project]
 name = "gsyncio"
-version = "0.1.5"
-description = "Multi-Event-Loop Engine & Concurrency Toolkit for Python 3.14t (Free-Threaded / No-GIL)"
+version = "0.1.6"
+description = "High-performance multi-event-loop concurrency engine for Python 3.14t with Rust core"
 readme = "README.md"
 license = "MIT"
 authors = [

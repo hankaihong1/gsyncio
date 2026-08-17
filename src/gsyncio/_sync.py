@@ -32,8 +32,8 @@ class Lock:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._owner: asyncio.Task[Any] | None = None
-        self._waiters: collections.deque[tuple[asyncio.Task[Any], asyncio.Event]] = (
-            collections.deque()
+        self._waiters: collections.OrderedDict[asyncio.Event, asyncio.Task[Any]] = (
+            collections.OrderedDict()
         )
 
     @property
@@ -85,7 +85,7 @@ class Lock:
                 return
 
             event = asyncio.Event()
-            self._waiters.append((task, event))
+            self._waiters[event] = task
 
         try:
             await event.wait()
@@ -101,7 +101,7 @@ class Lock:
                 # already popped (ownership handed to us) must be forwarded —
                 # a task still queued as a waiter is a re-entrant acquire whose
                 # outer holder still legitimately owns the lock (R2 FIX-9).
-                was_waiter = self._discard_waiter(task)
+                was_waiter = self._discard_waiter(event)
                 if self._owner is task and not was_waiter:
                     self._release_locked()
             raise
@@ -130,7 +130,7 @@ class Lock:
         Caller must hold ``_lock``.
         """
         while self._waiters:
-            waiter_task, event = self._waiters.popleft()
+            event, waiter_task = self._waiters.popitem(last=False)
             if waiter_task.done():
                 continue
             self._owner = waiter_task
@@ -160,20 +160,14 @@ class Lock:
         self.release()
         return None
 
-    def _discard_waiter(self, task: asyncio.Task[Any]) -> bool:
-        """Remove *task* from ``_waiters`` (caller must hold ``_lock``).
+    def _discard_waiter(self, event: asyncio.Event) -> bool:
+        """Remove waiter matching *event* from ``_waiters`` (caller must hold ``_lock``).
 
         Returns ``True`` if the entry was still queued, ``False`` if it had
         already been popped (e.g. by ``_release_locked``) — the discrimination
         the cancel path needs to decide whether ownership must be forwarded.
         """
-        remaining: collections.deque[tuple[asyncio.Task[Any], asyncio.Event]] = collections.deque(
-            w for w in self._waiters if w[0] is not task
-        )
-        was_present = len(remaining) != len(self._waiters)
-        self._waiters.clear()
-        self._waiters.extend(remaining)
-        return was_present
+        return self._waiters.pop(event, None) is not None
 
 
 # ============================================================================
@@ -204,8 +198,8 @@ class Semaphore:
         self._value = max_value
         self._max_value = max_value
         self._lock = threading.Lock()
-        self._waiters: collections.deque[tuple[asyncio.AbstractEventLoop, asyncio.Event]] = (
-            collections.deque()
+        self._waiters: collections.OrderedDict[asyncio.Event, asyncio.AbstractEventLoop] = (
+            collections.OrderedDict()
         )
 
     def __repr__(self) -> str:
@@ -244,7 +238,7 @@ class Semaphore:
             if self._value > 0:
                 self._value -= 1
                 return
-            self._waiters.append((loop, event))
+            self._waiters[event] = loop
 
         try:
             await event.wait()
@@ -260,9 +254,7 @@ class Semaphore:
         or returned to the value pool.
         """
         with self._lock:
-            remaining = collections.deque(w for w in self._waiters if w[1] is not event)
-            was_present = len(remaining) != len(self._waiters)
-            self._waiters = remaining
+            was_present = self._waiters.pop(event, None) is not None
 
             if not was_present:
                 # WHY: release() may have already popped this waiter and handed it
@@ -270,7 +262,7 @@ class Semaphore:
                 # and shrink the pool forever. Forwarding it to the next FIFO
                 # waiter, or returning it to the value pool, keeps the count exact.
                 while self._waiters:
-                    next_loop, next_event = self._waiters.popleft()
+                    next_event, next_loop = self._waiters.popitem(last=False)
                     try:
                         next_loop.call_soon_threadsafe(next_event.set)
                         return
@@ -292,7 +284,7 @@ class Semaphore:
         with self._lock:
             if self._waiters:
                 while self._waiters:
-                    loop, event = self._waiters.popleft()
+                    event, loop = self._waiters.popitem(last=False)
                     try:
                         loop.call_soon_threadsafe(event.set)
                         return
@@ -322,31 +314,29 @@ class Semaphore:
 
 
 # ============================================================================
-# CapacityLimiter — dynamic token limiter backed by Semaphore
+# CapacityLimiter — dynamic token limiter with single-lock atomic state
 # ============================================================================
 
 
 class CapacityLimiter:
-    """An async capacity limiter backed by a :class:`Semaphore`.
+    """An async capacity limiter safe across event loops and OS threads under free-threading.
 
     The limiter maintains a total token budget (``total_tokens``) that can
-    be dynamically resized.  Available and borrowed tokens are computed from
-    the underlying semaphore value.  ``total_tokens`` may be a fractional
-    float; the underlying semaphore capacity is ``int(total_tokens)``.
+    be dynamically resized.  All state transitions (borrowing, returning,
+    and waiter queue management) are protected by a single ``threading.Lock``,
+    guaranteeing atomic updates under Python 3.14t multi-core parallelism.
+    ``total_tokens`` may be a fractional float; the integer capacity is ``int(total_tokens)``.
     """
 
     def __init__(self, total_tokens: float) -> None:
         if total_tokens <= 0:
             raise ValueError("total_tokens must be positive")
-        self._semaphore = Semaphore(int(total_tokens))
-        self._total_tokens = total_tokens
-        # WHY: borrowed is tracked explicitly instead of being derived from the
-        # semaphore value — shrinking the total below the borrowed count used
-        # to make the derived numbers fictional (probe R1-B: claimed borrowed=1
-        # while 3 were held).  avail + borrowed == total now holds by
-        # construction (R1 FIX-3).
+        self._total_tokens = float(total_tokens)
         self._borrowed = 0
-        self._total_lock = threading.Lock()
+        self._lock = threading.Lock()
+        self._waiters: collections.OrderedDict[asyncio.Event, asyncio.AbstractEventLoop] = (
+            collections.OrderedDict()
+        )
 
     def __repr__(self) -> str:
         return (
@@ -356,131 +346,116 @@ class CapacityLimiter:
         )
 
     @property
+    def total_capacity(self) -> int:
+        """Total integer token capacity."""
+        with self._lock:
+            return int(self._total_tokens)
+
+    @property
+    def available_capacity(self) -> int:
+        """Currently available discrete integer token capacity."""
+        with self._lock:
+            return max(0, int(self._total_tokens) - self._borrowed)
+
+    @property
     def total_tokens(self) -> float:
         """Total token capacity."""
-        with self._total_lock:
+        with self._lock:
             return self._total_tokens
 
     @total_tokens.setter
     def total_tokens(self, value: float) -> None:
         if value <= 0:
             raise ValueError("total_tokens must be positive")
-        with self._total_lock:
-            old = self._total_tokens
-            self._total_tokens = value
-            new_int = int(value)
-            old_int = int(old)
-            # WHY: max write + token reclaim/grow are ONE atomic region
-            # under the semaphore lock — release() checks value against max
-            # under that same lock, so it can never observe an intermediate
-            # resize state (max lowered, tokens not yet reclaimed) and raise
-            # a false over-release ValueError (R5 FIX-I / revision D).
-            with self._semaphore._lock:
-                self._semaphore._max_value = new_int
-                diff = new_int - old_int
-                if diff > 0:
-                    # Tokens should only be minted if the new capacity exceeds currently allocated tokens (borrowed + available)
-                    tokens_to_add = max(0, new_int - (self._borrowed + self._semaphore._value))
-                    for _ in range(tokens_to_add):
-                        delivered = False
-                        while self._semaphore._waiters:
-                            loop, event = self._semaphore._waiters.popleft()
-                            try:
-                                loop.call_soon_threadsafe(event.set)
-                                delivered = True
-                                break
-                            except RuntimeError:
-                                # WHY: dead loop — retry the SAME token with
-                                # the next waiter (R5 FIX-E).
-                                continue
-                        if not delivered:
-                            self._semaphore._value += 1
-                elif diff < 0:
-                    # Shrink only reclaims AVAILABLE tokens (value); borrowed ones
-                    # are untouched — the cap below is inherent (value cannot go
-                    # negative), so shrinking below the borrowed count is safe.
-                    to_reduce = -diff
-                    for _ in range(to_reduce):
-                        if self._semaphore._value > 0:
-                            self._semaphore._value -= 1
+        with self._lock:
+            self._total_tokens = float(value)
+            capacity = int(self._total_tokens)
+            # Atomically wake queued waiters if capacity increased beyond borrowed count
+            while self._waiters and self._borrowed < capacity:
+                event, loop = self._waiters.popitem(last=False)
+                try:
+                    loop.call_soon_threadsafe(event.set)
+                    self._borrowed += 1
+                except RuntimeError:
+                    # Dead loop — skip and try the next waiter
+                    continue
 
     @property
     def available_tokens(self) -> float:
         """Currently available tokens."""
-        with self._total_lock:
-            return self._available_locked()
+        with self._lock:
+            return self._total_tokens - self._borrowed
 
     @property
     def borrowed_tokens(self) -> float:
         """Currently borrowed tokens."""
-        with self._total_lock:
-            return self._total_tokens - self._available_locked()
+        with self._lock:
+            return float(self._borrowed)
 
     def snapshot(self) -> tuple[float, float, float]:
         """Return ``(total_tokens, available_tokens, borrowed_tokens)`` atomically.
 
-        The three individual properties each take ``_total_lock`` separately,
-        so a concurrent ``total_tokens`` write between two reads can mix values
-        computed against *different* totals (e.g. ``avail`` from the new total
-        with ``total`` read before the write).  This method reads all three
-        under one lock acquisition: the invariant
-        ``available + borrowed == total`` then holds by construction, since
-        ``borrowed`` is derived from the same locked ``total`` and ``avail``.
+        All three metrics are read under a single ``_lock`` acquisition, ensuring
+        ``available + borrowed == total`` holds by construction.
         """
-        with self._total_lock:
-            avail = self._available_locked()
-            return (self._total_tokens, avail, self._total_tokens - avail)
-
-    def _available_locked(self) -> float:
-        """Compute available tokens while ``_total_lock`` is held.
-
-        May be negative when the total was shrunk below the borrowed count —
-        the real state (anyio semantics), never a fictional number.
-        """
-        return self._total_tokens - self._borrowed
+        with self._lock:
+            avail = self._total_tokens - self._borrowed
+            return (self._total_tokens, avail, float(self._borrowed))
 
     async def acquire(self) -> None:
         """Acquire one token, blocking if none are available."""
-        await self._semaphore.acquire()
-        # No await between the successful acquire and the increment — a
-        # concurrent resize can never observe a half-registered borrow, and
-        # cancellation cannot be delivered in between.
-        with self._total_lock:
-            self._borrowed += 1
+        loop = asyncio.get_running_loop()
+        event = asyncio.Event()
+
+        with self._lock:
+            if self._borrowed < int(self._total_tokens):
+                self._borrowed += 1
+                return
+            self._waiters[event] = loop
+
+        try:
+            await event.wait()
+        except BaseException:
+            self._cancel_waiter(event)
+            raise
+
+    def _cancel_waiter(self, event: asyncio.Event) -> None:
+        """Handle cancellation of a waiter while waiting for a token."""
+        with self._lock:
+            was_present = self._waiters.pop(event, None) is not None
+
+            if not was_present:
+                # The waiter was already popped and granted a token (_borrowed was incremented).
+                # Forward to next waiter if within capacity:
+                capacity = int(self._total_tokens)
+                while self._waiters and self._borrowed <= capacity:
+                    next_event, next_loop = self._waiters.popitem(last=False)
+                    try:
+                        next_loop.call_soon_threadsafe(next_event.set)
+                        return
+                    except RuntimeError:
+                        continue
+                self._borrowed -= 1
 
     def release(self) -> None:
         """Release one token.
 
-        :raises ValueError: if released more times than acquired (borrowed
-            count is already zero — the over-release case).
-        WHY the cap is clamped, not propagated: after the total was shrunk
-        below the borrowed count, returning a token is a legal return of an
-        over-budget borrow — the token is absorbed (value stays at max)
-        instead of raising, so the accounting ``avail + borrowed == total``
-        converges back to the real state (R5 revision D).
+        :raises ValueError: if released more times than acquired.
         """
-        with self._total_lock:
+        with self._lock:
             if self._borrowed <= 0:
                 raise ValueError("CapacityLimiter released too many times")
-            can_restore = (self._borrowed - 1) < int(self._total_tokens)
-            if can_restore:
-                with self._semaphore._lock:
-                    token_delivered = False
-                    while self._semaphore._waiters:
-                        loop, event = self._semaphore._waiters.popleft()
-                        try:
-                            loop.call_soon_threadsafe(event.set)
-                            token_delivered = True
-                            break
-                        except RuntimeError:
-                            # WHY: dead loop — keep looking for a live waiter;
-                            # if none remain the token is absorbed below (R5
-                            # FIX-E).
-                            continue
-                    if not token_delivered and self._semaphore._value < self._semaphore._max_value:
-                        self._semaphore._value += 1
-            # else: over-budget return — absorbed; token is neither delivered nor added to value
             self._borrowed -= 1
+            capacity = int(self._total_tokens)
+            if self._borrowed < capacity:
+                while self._waiters:
+                    event, loop = self._waiters.popitem(last=False)
+                    try:
+                        loop.call_soon_threadsafe(event.set)
+                        self._borrowed += 1
+                        return
+                    except RuntimeError:
+                        continue
 
     async def __aenter__(self) -> Self:
         await self.acquire()
@@ -512,7 +487,9 @@ class Event:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._flag = False
-        self._waiters: list[tuple[asyncio.AbstractEventLoop, asyncio.Event]] = []
+        self._waiters: collections.OrderedDict[asyncio.Event, asyncio.AbstractEventLoop] = (
+            collections.OrderedDict()
+        )
 
     def is_set(self) -> bool:
         """Return ``True`` if the event has been set."""
@@ -528,10 +505,10 @@ class Event:
         """
         with self._lock:
             self._flag = True
-            waiters = self._waiters
-            self._waiters = []
+            waiters = list(self._waiters.items())
+            self._waiters.clear()
 
-        for loop, event in waiters:
+        for event, loop in waiters:
             try:
                 loop.call_soon_threadsafe(event.set)
             except RuntimeError:
@@ -553,12 +530,12 @@ class Event:
             if self._flag:
                 return
             event = asyncio.Event()
-            self._waiters.append((loop, event))
+            self._waiters[event] = loop
         try:
             await event.wait()
         except BaseException:
             with self._lock:
-                self._waiters = [(l, e) for (l, e) in self._waiters if e is not event]
+                self._waiters.pop(event, None)
             raise
 
 
@@ -583,8 +560,8 @@ class Condition:
     def __init__(self, lock: Lock | None = None) -> None:
         self._lock = lock if lock is not None else Lock()
         self._waiters_lock = threading.Lock()
-        self._waiters: collections.deque[tuple[asyncio.AbstractEventLoop, asyncio.Event]] = (
-            collections.deque()
+        self._waiters: collections.OrderedDict[asyncio.Event, asyncio.AbstractEventLoop] = (
+            collections.OrderedDict()
         )
 
     # -- context-manager support (delegates to the underlying Lock) ---------
@@ -637,7 +614,7 @@ class Condition:
         loop = asyncio.get_running_loop()
         event = asyncio.Event()
         with self._waiters_lock:
-            self._waiters.append((loop, event))
+            self._waiters[event] = loop
         try:
             self._lock.release()
         except BaseException:
@@ -718,7 +695,8 @@ class Condition:
             count = min(n, len(self._waiters))
             popped: list[tuple[asyncio.AbstractEventLoop, asyncio.Event]] = []
             for _ in range(count):
-                popped.append(self._waiters.popleft())
+                event, loop = self._waiters.popitem(last=False)
+                popped.append((loop, event))
             return popped
 
     def _discard_waiter(self, event: asyncio.Event) -> bool:
@@ -729,16 +707,13 @@ class Condition:
         — in which case the notification must be forwarded.
         """
         with self._waiters_lock:
-            remaining = collections.deque(entry for entry in self._waiters if entry[1] is not event)
-            was_present = len(remaining) != len(self._waiters)
-            self._waiters = remaining
-            return was_present
+            return self._waiters.pop(event, None) is not None
 
     def _forward_notify(self) -> None:
         """Pass a lost notification to the next FIFO waiter (caller holds nothing)."""
         with self._waiters_lock:
             while self._waiters:
-                next_loop, next_event = self._waiters.popleft()
+                next_event, next_loop = self._waiters.popitem(last=False)
                 try:
                     next_loop.call_soon_threadsafe(next_event.set)
                     return
@@ -817,13 +792,22 @@ class Barrier:
         self._parties = parties
         self._mutex = threading.Lock()
         self._generation = 0
-        self._waiters: list[tuple[asyncio.AbstractEventLoop, asyncio.Event, list[int | None]]] = []
+        self._waiters: collections.OrderedDict[
+            asyncio.Event, tuple[asyncio.AbstractEventLoop, list[int | None]]
+        ] = collections.OrderedDict()
         self._aborted = False
+        self._broken = False
 
     @property
     def parties(self) -> int:
         """Total number of parties required to pass the barrier."""
         return self._parties
+
+    @property
+    def broken(self) -> bool:
+        """Return ``True`` if the barrier is in a broken or aborted state."""
+        with self._mutex:
+            return self._broken or self._aborted
 
     @property
     def n_waiting(self) -> int:
@@ -837,7 +821,7 @@ class Barrier:
         Returns a :class:`BarrierWaitResult` with ``parties`` set to the
         barrier's party count and ``index`` set to the task's arrival index.
 
-        :raises RuntimeError: if :meth:`abort` or :meth:`reset` is called.
+        :raises RuntimeError: if the barrier is broken, aborted, or reset.
         """
         loop = asyncio.get_running_loop()
         event = asyncio.Event()
@@ -846,9 +830,11 @@ class Barrier:
         with self._mutex:
             if self._aborted:
                 raise RuntimeError("barrier has been aborted")
+            if self._broken:
+                raise RuntimeError("barrier is broken")
             n = len(self._waiters) + 1
             if n == self._parties:
-                for idx, (l, e, b) in enumerate(self._waiters, start=1):
+                for idx, (e, (l, b)) in enumerate(self._waiters.items(), start=1):
                     b[0] = idx
                     try:
                         l.call_soon_threadsafe(e.set)
@@ -859,28 +845,34 @@ class Barrier:
                 self._waiters.clear()
                 self._generation += 1
                 return BarrierWaitResult(parties=self._parties, index=0)
-            entry = (loop, event, box)
-            self._waiters.append(entry)
+            self._waiters[event] = (loop, box)
             generation = self._generation
 
         try:
             await event.wait()
         except BaseException:
             with self._mutex:
-                # WHY: The generation guard stops a cancelled waiter from deleting
-                # an entry that already advanced to the next round. If a full party
-                # set woke us, our entry is gone and the generation incremented, so
-                # skipping the removal protects the next round's waiters.
+                # Automatic Broken state: if a waiting party is cancelled in the
+                # current round before it finishes, mark the barrier broken and
+                # wake all remaining waiting parties with an error to prevent deadlock.
                 if generation == self._generation:
-                    try:
-                        self._waiters.remove(entry)
-                    except ValueError:
-                        pass
+                    self._broken = True
+                    broken_waiters = list(self._waiters.items())
+                    self._waiters.clear()
+                    self._generation += 1
+                    for e, (l, b) in broken_waiters:
+                        b[0] = -1
+                        try:
+                            l.call_soon_threadsafe(e.set)
+                        except RuntimeError:
+                            pass
             raise
 
         with self._mutex:
             if self._aborted and generation == self._generation:
                 raise RuntimeError("barrier has been aborted")
+            if box[0] == -1 or (self._broken and generation < self._generation):
+                raise RuntimeError("barrier broken by concurrent cancellation")
             if box[0] is None:
                 raise RuntimeError("barrier was reset while waiting")
             return BarrierWaitResult(parties=self._parties, index=box[0])
@@ -893,10 +885,11 @@ class Barrier:
         """
         with self._mutex:
             self._aborted = True
-            waiters = self._waiters
-            self._waiters = []
+            self._broken = True
+            waiters = list(self._waiters.items())
+            self._waiters.clear()
 
-        for loop, event, _box in waiters:
+        for event, (loop, _box) in waiters:
             try:
                 loop.call_soon_threadsafe(event.set)
             except RuntimeError:
@@ -910,12 +903,13 @@ class Barrier:
         :exc:`RuntimeError`.
         """
         with self._mutex:
-            waiters = self._waiters
-            self._waiters = []
+            waiters = list(self._waiters.items())
+            self._waiters.clear()
             self._generation += 1
             self._aborted = False
+            self._broken = False
 
-        for loop, event, _box in waiters:
+        for event, (loop, _box) in waiters:
             try:
                 loop.call_soon_threadsafe(event.set)
             except RuntimeError:

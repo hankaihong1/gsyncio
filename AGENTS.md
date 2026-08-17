@@ -12,8 +12,20 @@ Python 3.14t (free-threaded / no-GIL). It wraps a Rust core (`_gsyncio_core`)
 built with PyO3, flume, and parking_lot, and exposes `EventLoopThreadPool`,
 `FastChannel`, `select_channel`, `TaskGroup`, `CancelScope`, and async
 synchronization primitives (`AsyncWaitGroup`, `AsyncOnce`, `AsyncRWMutex`,
-`Lock`, `Semaphore`, `Condition`, `Barrier`). The public API is intentionally
-minimal, modeled after `asyncssh`'s top-level-facade style.
+`Lock`, `Semaphore`, `Condition`, `Barrier`, `CapacityLimiter`). The public API
+is intentionally minimal, modeled after `asyncssh`'s top-level-facade style.
+
+**Crucial Paradigm Distinction: API Lending vs. Single-Threaded Semantics Rejection**:
+`gsyncio` borrows the clean, familiar API surface and ergonomics of AnyIO and
+Trio (`TaskGroup`, `CancelScope`, `CapacityLimiter`, `Event`, etc.), but
+**fundamentally rejects their single-threaded, zero-contention semantic
+assumptions**. AnyIO and Trio were designed for single-threaded, single-event-loop
+cooperative multitasking where OS locks are unnecessary and primitives serve
+merely as cooperative coroutine throttles. In contrast, `gsyncio` operates under
+Python 3.14t true multi-core physical parallelism across multiple OS threads and
+isolated event loops. Correctness in `gsyncio` cannot rely on single-threaded
+cooperative heuristics; it requires **formal axiomatic reasoning, state-machine
+invariants, token conservation laws, and multi-thread signal forwarding**.
 
 ---
 
@@ -68,7 +80,7 @@ searches, never modify.
 | `pyproject.toml` / `Cargo.toml` / `uv.lock` / `Cargo.lock` | Build & dependency manifests | Yes (when changing deps) |
 | `Makefile` | Command entry point (develop/test/lint/bench/all) | Yes — prefer it over raw commands |
 | `.gitignore` / `.pre-commit-config.yaml` | VCS ignores / pre-commit hooks (ruff + cargo) | Yes (when changing hooks) |
-| `AGENTS.md` / `README.md` / `CONTRIBUTING.md` / `docs/` (English files) | Docs | Yes (sync when behavior changes; docs `*_ZH.md` are the Chinese mirrors — same content, do not maintain separately) |
+| `AGENTS.md` / `README.md` / `ROADMAP.md` / `CONTRIBUTING.md` / `docs/` (English files) | Docs | Yes (sync when behavior changes; docs `*_ZH.md` are the Chinese mirrors — same content, do not maintain separately) |
 | `build.rs` | libpython link logic (extension-module detection) | Only for cargo-test link paths |
 | `deny.toml` / `rust-toolchain.toml` / `.editorconfig` / `.python-version` | Toolchain pinning | No (leave alone) |
 | `LICENSE` / `CODE_OF_CONDUCT.md` / `SECURITY.md` / `CODEOWNERS` / `CITATION.cff` / `CHANGELOG.md` | GitHub ecosystem files | No (unless asked) |
@@ -276,28 +288,28 @@ the related code.**
    without the next `await` re-raising `CancelledError`. Without it,
    `Condition.wait()` deadlocks on cancel.
 
-3. **Barrier generation tracking** (`_sync.py:559-643`):
+3. **Barrier automatic Broken state machine & generation tracking** (`_sync.py:774-896`):
    A `_generation` counter ties every waiter to the exact round it joined.
-   Cancellation handlers check the generation before removing their entry,
-   preventing the wrong-round-removal bug where a cancelled waiter from round N
-   deletes a round N+1 entry and the barrier never reaches its party count.
+   On cancellation of any waiting party before round completion, the barrier
+   automatically marks itself broken, wakes all remaining waiting parties with an
+   error, and advances the generation, preventing deadlocks without requiring manual abort.
 
-4. **Condition latch** (`_sync.py:455-511`):
+4. **Condition latch** (`_sync.py:539-744`):
    `notify()` does not require the lock, avoiding the notifier-blocks-while-
    sleeper-sleeps deadlock. Sticky `asyncio.Event` + register-before-release
    closes the lost-notification window.
 
-5. **Work-stealing with the `num_polling` gate** (`lib.rs:296-301`):
+5. **Work-stealing with the `num_polling` gate** (`lib.rs:320-330`):
    A soft atomic gate (`num_polling < max(num_workers/2, 1)`) limits
    concurrent global-queue pollers. The gate is momentary (acquired per
    `pop_work` call, released immediately via `PollerGuard`), so any worker can
    win it — no hard role assignments that drift with load.
 
-6. **Rust global queue and batch pull** (`lib.rs:285-351`):
+6. **Rust global queue and batch pull with 3-source drain** (`lib.rs:308-384`):
    Three-tier consumption: private buffer → global batch pull → local channel.
    The push side falls back from local to global when a per-worker channel is
-   full, preserving liveness. Batch size formula amortizes the flume pop cost
-   across many items.
+   full, preserving liveness. Drain phase validates all three sources (global queue,
+   private buffer, local channel) are completely empty before worker loop termination.
 
 ---
 

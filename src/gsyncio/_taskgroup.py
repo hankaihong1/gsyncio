@@ -116,6 +116,7 @@ class TaskGroup:
 
     def __init__(self, name: str | None = None) -> None:
         self._name: str | None = name
+        self._loop: asyncio.AbstractEventLoop | None = None
         self._children: set[TaskHandle] = set()
         # WHY: _children is mutated from the hosting task (start_soon/start/
         # _wait_children) and read from any thread (cancel_all), so every
@@ -146,6 +147,7 @@ class TaskGroup:
         # never called when __aenter__ raises (a pushed scope would leak).
         if self._cancel_scope.cancel_called:
             raise RuntimeError("TaskGroup is not reusable after failure")
+        self._loop = asyncio.get_running_loop()
         with self._children_lock:
             # WHY: children spawned BEFORE the first entry are part of the
             # first cycle — clearing them would silently orphan the tasks
@@ -177,6 +179,7 @@ class TaskGroup:
             # can never spawn an orphan after the group ended (R3 FIX-20).
             with self._children_lock:
                 self._exited = True
+            self._loop = None
 
     async def _aexit_impl(
         self,
@@ -419,6 +422,12 @@ class TaskGroup:
         The coroutine is scheduled on the event loop; this method does not
         block.
         """
+        current_loop = asyncio.get_running_loop()
+        if self._loop is not None and current_loop is not self._loop:
+            raise RuntimeError(
+                "TaskGroup is physically scoped to a single event loop and cannot spawn tasks "
+                "from a foreign event loop or thread. Use EventLoopThreadPool for cross-loop tasks."
+            )
         # WHY: coro_fn(*args) is user code — never run it under
         # _children_lock (threading.Lock is not reentrant and user code may
         # call back into the group).
@@ -444,6 +453,12 @@ class TaskGroup:
         The coroutine receives a :class:`TaskStatus` instance as its first
         argument.
         """
+        current_loop = asyncio.get_running_loop()
+        if self._loop is not None and current_loop is not self._loop:
+            raise RuntimeError(
+                "TaskGroup is physically scoped to a single event loop and cannot spawn tasks "
+                "from a foreign event loop or thread. Use EventLoopThreadPool for cross-loop tasks."
+            )
         task_status = TaskStatus()
         task = asyncio.create_task(coro_fn(task_status, *args))
         handle = TaskHandle(task)

@@ -48,7 +48,12 @@ def test_all_public_symbols_documented() -> None:
 
 def test_doc_code_blocks_parse() -> None:
     """All python code blocks in README / docs must be syntactically valid."""
-    for name in ("README.md", "docs/API.md", "docs/CHOOSING.md", "docs/CONCURRENCY.md"):
+    for name in (
+        "README.md",
+        "docs/API.md",
+        "docs/CHOOSING.md",
+        "docs/CONCURRENCY.md",
+    ):
         path = ROOT / name
         for i, block in enumerate(_extract_python_blocks(path)):
             try:
