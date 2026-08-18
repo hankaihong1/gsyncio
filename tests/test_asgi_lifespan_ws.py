@@ -469,6 +469,14 @@ async def test_asgi_http2_slow_streaming_body_no_loop_freeze() -> None:
         writer.write(client_conn.data_to_send())
         await writer.drain()
 
+        # Receive server connection preface & settings to synchronize connection state
+        raw = await asyncio.wait_for(reader.read(4096), timeout=2.0)
+        client_conn.receive_data(raw)
+        to_send = client_conn.data_to_send()
+        if to_send:
+            writer.write(to_send)
+            await writer.drain()
+
         # Send headers without ending stream
         client_conn.send_headers(
             stream_id=1,
