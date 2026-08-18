@@ -16,8 +16,6 @@ h2 = "0.4.15"
 http = "1.5.0"
 bytes = "1.12.1"
 tokio = { version = "1.53.1", features = ["rt", "rt-multi-thread", "net", "io-util", "macros", "sync"] }
-rustls = "0.23.43"
-tokio-rustls = "0.26.4"
 
 [build-dependencies]
 pyo3-build-config = "0.29"
