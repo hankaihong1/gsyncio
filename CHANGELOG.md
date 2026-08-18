@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-08-18
+
+### Added & Optimized
+- **Pure-Python Cross-Platform ASGI Benchmark Engine (`benchmarks/bench_asgi_throughput.py`)**:
+  - Implemented high-performance multi-threaded HTTP/1.1 Keep-Alive raw socket load generator.
+  - 100% native on Windows, macOS, and Linux with zero external command dependencies (eliminated `ab` requirement).
+  - Achieves 70,000+ QPS with multi-core physical scaling across worker event loops.
+- **Rust SIMD FastHttpParser & Zero-Allocation Assembly (`src/http.rs`)**:
+  - Direct ASGI `PyList[(PyBytes, PyBytes)]` tuple assembly in Rust C-layer, eliminating 20+ intermediate small-object allocations per HTTP request.
+  - Global `OnceLock<InternedMethods>` static interning for common HTTP verbs (`GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD`, `OPTIONS`) and protocol versions (`1.0`, `1.1`, `2.0`), enabling zero-allocation method resolution across worker threads.
+- **Rust SIMD RFC 6455 WebSocket Unmasking (`src/websocket.rs`, `src/multiloop/_websocket.py`)**:
+  - 64-bit auto-vectorized chunk XOR unmasking with `PyBytes::new_with` single-pass memory safety under Python 3.14t No-GIL.
+  - Zero-copy WebSocket frame header parser (`FastWebSocketParser::parse_frame_header`).
+- **Rust `RawAsyncRWMutex` 64-Bit Atomic Core (`src/rwlock.rs`, `src/multiloop/rwlock.py`)**:
+  - 64-bit atomic state machine with writer-preference fairness.
+  - Cancellation token conservation and automatic waiter cleanup (`remove_waiter`), preventing cross-language GC reference leaks and writer-cancellation reader starvation.
+- **Platform-Aware Multi-Core Connection Balancing (`src/multiloop/server.py`)**:
+  - Linux: Symmetric kernel-level `SO_REUSEPORT` 4-tuple BPF hash balancing across worker event loops.
+  - macOS / BSD: Multi-worker shared-socket racing accept (`loop.sock_accept(shared_sock)`) achieving perfectly balanced 25% traffic distribution per worker and 91,650+ QPS.
+- **ASGI & FastAPI High-Throughput Benchmarks (`benchmarks/bench_asgi_throughput.py`)**:
+  - Real-world POST payload throughput increased from 34.1k to **83,168 req/s (+143% speedup)**.
+  - Ultra-lightweight JSON Ping stabilized at **91,125 ~ 91,653 req/s**.
+  - Multi-core CPU task dispatch achieving **3.65x physical speedup** on 4 workers (91.3% of theoretical limit).
+
 ## [0.1.0] - 2026-08-18
 
 ### Added

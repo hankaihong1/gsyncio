@@ -1,6 +1,6 @@
 [project]
 name = "multiloop"
-version = "0.1.0"
+version = "0.1.1"
 description = "High-performance multi-event-loop concurrency engine for Python 3.14t with Rust core"
 readme = "README.md"
 license = "MIT"
@@ -8,7 +8,23 @@ authors = [
     { name = "Han Kaihong", email = "hankaihong@outlook.com" }
 ]
 requires-python = ">=3.14"
-keywords = ["asyncio", "concurrency", "multithreading", "free-threading", "no-gil", "golang", "channel"]
+keywords = [
+    "asyncio",
+    "concurrency",
+    "multithreading",
+    "free-threading",
+    "no-gil",
+    "golang",
+    "channel",
+    "eventloop",
+    "multieventloop",
+    "sync",
+    "AsyncRwLock",
+    "rwlock",
+    "asgi",
+    "wsgi",
+    "fastapi",
+]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",

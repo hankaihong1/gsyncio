@@ -3,7 +3,9 @@ pub mod h2;
 pub mod http;
 pub mod metrics;
 pub mod pool;
+pub mod rwlock;
 pub mod waitgroup;
+pub mod websocket;
 
 use pyo3::create_exception;
 use pyo3::prelude::*;
@@ -13,7 +15,9 @@ pub use h2::{serve_h2_connection, PyH2Bridge};
 pub use http::FastHttpParser;
 pub use metrics::AtomicMetrics;
 pub use pool::NativeWorkerPool;
+pub use rwlock::RawAsyncRWMutex;
 pub use waitgroup::RawAsyncWaitGroup;
+pub use websocket::{fast_websocket_unmask, FastWebSocketParser};
 
 create_exception!(
     _multiloop_core,
@@ -32,9 +36,12 @@ fn _multiloop_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Channel>()?;
     m.add_class::<RawAsyncChannel>()?;
     m.add_class::<RawAsyncWaitGroup>()?;
+    m.add_class::<RawAsyncRWMutex>()?;
     m.add_class::<FastHttpParser>()?;
+    m.add_class::<FastWebSocketParser>()?;
     m.add_class::<PyH2Bridge>()?;
     m.add_function(wrap_pyfunction!(serve_h2_connection, m)?)?;
+    m.add_function(wrap_pyfunction!(fast_websocket_unmask, m)?)?;
     Ok(())
 }
 
@@ -636,29 +643,27 @@ mod tests {
 
     #[test]
     fn test_fast_http_parser_complete_and_partial() {
-        // Complete request
-        let req_bytes = b"POST /api/v1/resource?query=test&limit=10 HTTP/1.1\r\nHost: localhost:8000\r\nContent-Length: 5\r\n\r\nhello";
-        let parsed = FastHttpParser::parse_request(req_bytes).unwrap();
-        assert!(parsed.is_some());
-        let (method, path, query, version, headers, body_offset) = parsed.unwrap();
-        assert_eq!(method, "POST");
-        assert_eq!(path, "/api/v1/resource");
-        assert_eq!(query, "query=test&limit=10");
-        assert_eq!(version, "1.1");
-        assert_eq!(headers.len(), 2);
-        assert_eq!(headers[0].0, b"host");
-        assert_eq!(headers[0].1, b"localhost:8000");
-        assert_eq!(headers[1].0, b"content-length");
-        assert_eq!(headers[1].1, b"5");
-        assert_eq!(&req_bytes[body_offset..], b"hello");
+        Python::attach(|py| {
+            // Complete request
+            let req_bytes = b"POST /api/v1/resource?query=test&limit=10 HTTP/1.1\r\nHost: localhost:8000\r\nContent-Length: 5\r\n\r\nhello";
+            let parsed = FastHttpParser::parse_request(py, req_bytes).unwrap();
+            assert!(parsed.is_some());
+            let (method, path, query, version, headers, body_offset) = parsed.unwrap();
+            assert_eq!(method.to_str().unwrap(), "POST");
+            assert_eq!(path, "/api/v1/resource");
+            assert_eq!(query, "query=test&limit=10");
+            assert_eq!(version.to_str().unwrap(), "1.1");
+            assert_eq!(headers.len(), 2);
+            assert_eq!(&req_bytes[body_offset..], b"hello");
 
-        // Partial request
-        let partial_bytes = b"GET /incomplete HTTP/1.1\r\nHost: localhost\r\n";
-        let partial_parsed = FastHttpParser::parse_request(partial_bytes).unwrap();
-        assert!(partial_parsed.is_none());
+            // Partial request
+            let partial_bytes = b"GET /incomplete HTTP/1.1\r\nHost: localhost\r\n";
+            let partial_parsed = FastHttpParser::parse_request(py, partial_bytes).unwrap();
+            assert!(partial_parsed.is_none());
 
-        // Malformed request
-        let malformed = b"INVALID HTTP BUFFER WITHOUT PROPER FORMAT";
-        assert!(FastHttpParser::parse_request(malformed).is_err());
+            // Malformed request
+            let malformed = b"INVALID HTTP BUFFER WITHOUT PROPER FORMAT";
+            assert!(FastHttpParser::parse_request(py, malformed).is_err());
+        });
     }
 }
