@@ -1,12 +1,12 @@
-"""Tests for gsyncio.Condition and gsyncio.Barrier primitives."""
+"""Tests for multiloop.Condition and multiloop.Barrier primitives."""
 
 import asyncio
 import threading
 
 import pytest
 
-from gsyncio import Barrier, Condition, Lock
-from gsyncio.testing import wait_all_tasks_blocked
+from multiloop import Barrier, Condition, Lock
+from multiloop.testing import wait_all_tasks_blocked
 
 # ---------------------------------------------------------------------------
 # Condition tests
@@ -144,6 +144,44 @@ async def test_condition_context_manager():
     async with cond:
         assert cond._lock.locked
     assert not cond._lock.locked
+
+
+@pytest.mark.asyncio
+async def test_condition_cancel_during_reacquire_forwards_notification():
+    """If a notified waiter is cancelled while re-acquiring the lock,
+    the notification must be forwarded to the next live waiter.
+    """
+    cond = Condition()
+    woken: list[int] = []
+
+    async def waiter(idx: int) -> None:
+        async with cond:
+            await cond.wait()
+            woken.append(idx)
+
+    t1 = asyncio.create_task(waiter(1))
+    t2 = asyncio.create_task(waiter(2))
+    await wait_all_tasks_blocked()
+    assert len(cond._waiters) == 2
+
+    # Acquire lock in main task after waiters have released it inside wait()
+    async with cond:
+        # Notify 1 waiter while holding the lock (t1's event is set, t1 wakes up from event.wait()
+        # and starts trying to reacquire cond._lock, but cond._lock is held by main task)
+        cond.notify(1)
+        await asyncio.sleep(0.02)
+
+        # Cancel t1 while t1 is blocked waiting inside _reacquire_lock()
+        t1.cancel()
+        await asyncio.sleep(0.02)
+
+    # Main task has released cond lock
+    with pytest.raises(asyncio.CancelledError):
+        await t1
+
+    # t2 MUST receive the forwarded notification and complete
+    await asyncio.wait_for(t2, timeout=2.0)
+    assert woken == [2]
 
 
 # ---------------------------------------------------------------------------
@@ -587,3 +625,44 @@ async def test_barrier_broken_on_cancellation() -> None:
     barrier.reset()
     assert not barrier.broken
     assert barrier.n_waiting == 0
+
+
+@pytest.mark.asyncio
+async def test_barrier_subsequent_round_broken_does_not_affect_graduated_party() -> None:
+    """A party that graduated from round G must not fail if round G+1 is broken concurrently."""
+    barrier = Barrier(2)
+    t1_results: list[object] = []
+    t1_errors: list[Exception] = []
+
+    async def party_1() -> None:
+        try:
+            res = await barrier.wait()
+            t1_results.append(res)
+        except Exception as e:
+            t1_errors.append(e)
+
+    # Start party 1 (Round 0)
+    t1 = asyncio.create_task(party_1())
+    await asyncio.sleep(0.01)
+    assert barrier.n_waiting == 1
+
+    # Party 2 completes Round 0 and immediately sets broken on Round 1 while Party 1's generation is 0
+    with barrier._mutex:
+        # Complete Round 0 for party 1
+        waiter_e, (waiter_l, waiter_b) = next(iter(barrier._waiters.items()))
+        waiter_b[0] = 1
+        waiter_l.call_soon_threadsafe(waiter_e.set)
+        barrier._waiters.clear()
+        barrier._generation += 1  # generation is now 1
+
+        # Now simulate Round 1 cancellation/broken while party 1 has generation=0
+        barrier._broken = True
+        barrier._generation += 1  # generation is now 2
+
+    # Now let Party 1 run its post-wait block with generation=0, _broken=True, _generation=2
+    await t1
+
+    # Party 1 had box[0] == 1 (graduated from Round 0), so it must NOT raise broken error!
+    assert len(t1_errors) == 0, f"Party 1 erroneously failed with: {t1_errors}"
+    assert len(t1_results) == 1
+    assert t1_results[0].index == 1

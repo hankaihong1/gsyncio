@@ -1,6 +1,6 @@
 [project]
-name = "gsyncio"
-version = "0.1.6"
+name = "multiloop"
+version = "0.1.0"
 description = "High-performance multi-event-loop concurrency engine for Python 3.14t with Rust core"
 readme = "README.md"
 license = "MIT"
@@ -24,12 +24,15 @@ classifiers = [
 ]
 dependencies = []
 
+[project.scripts]
+multiloop = "multiloop.cli:main"
+
 [project.urls]
-Homepage = "https://github.com/hankaihong1/gsyncio"
-Changelog = "https://github.com/hankaihong1/gsyncio/blob/main/CHANGELOG.md"
-Repository = "https://github.com/hankaihong1/gsyncio"
-Documentation = "https://github.com/hankaihong1/gsyncio/tree/main/docs"
-Issues = "https://github.com/hankaihong1/gsyncio/issues"
+Homepage = "https://github.com/hankaihong1/multiloop"
+Changelog = "https://github.com/hankaihong1/multiloop/blob/main/CHANGELOG.md"
+Repository = "https://github.com/hankaihong1/multiloop"
+Documentation = "https://github.com/hankaihong1/multiloop/tree/main/docs"
+Issues = "https://github.com/hankaihong1/multiloop/issues"
 
 [build-system]
 requires = ["maturin>=1.5,<2.0"]
@@ -38,10 +41,11 @@ build-backend = "maturin"
 [tool.maturin]
 features = ["pyo3/extension-module"]
 python-source = "src"
-module-name = "gsyncio._gsyncio_core"
+module-name = "multiloop._multiloop_core"
 
 [dependency-groups]
 dev = [
+    "h2>=4.1.0",
     "httpx>=0.28.1",
     "maturin[zig]>=1.13.3",
     "mypy>=2.3.0",
@@ -98,8 +102,6 @@ lint.ignore = [
 
 [tool.pyright]
 typeCheckingMode = "strict"
-include = ["src/gsyncio"]
-exclude = ["**/__pycache__", "**/_gsyncio_core.*"]
+include = ["src/multiloop"]
+exclude = ["**/__pycache__", "**/_multiloop_core.*"]
 reportPrivateUsage = "none"
-
-

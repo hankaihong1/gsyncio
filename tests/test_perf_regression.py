@@ -9,7 +9,7 @@ import time
 
 import pytest
 
-from gsyncio.pool import EventLoopThreadPool
+from multiloop.pool import EventLoopThreadPool
 
 
 @pytest.mark.slow

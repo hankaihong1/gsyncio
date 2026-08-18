@@ -1,4 +1,4 @@
-# Dependabot configuration for gsyncio
+# Dependabot configuration for multiloop
 #
 # Note: The pip ecosystem is intentionally NOT configured here.
 # All Python dependencies live in PEP 735 [dependency-groups] (see
@@ -8,7 +8,7 @@
 
 version: 2
 updates:
-  # Rust workspace (gsyncio-core engine): pyo3, flume, parking_lot
+  # Rust workspace (multiloop-core engine): pyo3, flume, parking_lot
   - package-ecosystem: "cargo"
     directory: "/"
     schedule:

@@ -77,8 +77,8 @@ jobs:
 
       - name: Python Strict Static Analysis (Mypy, Pyright & Ruff)
         run: |
-          uv run mypy --strict src/gsyncio
-          uv run pyright src/gsyncio
+          uv run mypy --strict src/multiloop
+          uv run pyright src/multiloop
           uv run ruff check .
 
       - name: Cargo Deny Check
@@ -194,7 +194,7 @@ jobs:
           uv run pytest
 
   # Docs-only changes skip the heavy matrix and are gated by this single
-  # cheap job (no Rust build: test_docs.py only imports gsyncio from src/,
+  # cheap job (no Rust build: test_docs.py only imports multiloop from src/,
   # which works without the extension via graceful fallback).
   docs:
     name: Docs Drift Check

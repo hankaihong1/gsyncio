@@ -1,4 +1,4 @@
-"""Cross-thread task context and cancellation manager."""
+"""Cross-thread task context and cancellation manager (Go context.Context style)."""
 
 from __future__ import annotations
 
@@ -7,27 +7,29 @@ import threading
 from collections.abc import Callable
 from typing import Any, Self
 
-from gsyncio._cancel import CancelScope
-from gsyncio.pool import EventLoopThreadPool
+from multiloop._cancel import CancelScope
+from multiloop.pool import EventLoopThreadPool
+
+__all__ = ["AsyncContext"]
 
 
 class AsyncContext:
-    """Cross-thread Context for cascading Task cancellation (Go `context.Context` style).
+    """Hierarchical cross-thread cancellation context inspired by Go's ``context.Context``.
 
-    This class enables hierarchical task cancellation across different worker event loops.
-    Supports both explicit Go-style :meth:`cancel` and Pythonic ``async with`` scope management.
+    Enables structured, cascading task cancellation across independent OS threads and isolated
+    asyncio event loops. Supports explicit programmatic cancellation (:meth:`cancel`) as well
+    as automatic cancellation upon exiting an ``async with`` block.
 
-    :param parent:
-        Optional parent context. If specified, cancelling `parent` automatically cancels this child context.
-    :type parent: AsyncContext or None
+    :param parent: Optional parent context. If provided, cancelling the parent automatically
+                   cascades cancellation to this child context.
     """
 
     def __init__(self, parent: AsyncContext | None = None) -> None:
         self._parent = parent
         self._cancelled = False
         self._lock = threading.Lock()
-        self._children: list[AsyncContext] = []
-        # Track futures and per-task cancel scopes
+        self._children: set[AsyncContext] = set()
+        # Track pending futures and their per-task cancel scopes
         self._futures: dict[asyncio.Future[Any], asyncio.AbstractEventLoop | None] = {}
         self._scopes: dict[asyncio.Future[Any], CancelScope] = {}
 
@@ -39,10 +41,7 @@ class AsyncContext:
 
     @property
     def parent(self) -> AsyncContext | None:
-        """Return the parent context, or ``None`` for a root context.
-
-        Read-only: the parent is fixed at construction time.
-        """
+        """Return the parent context, or ``None`` for a root context (read-only)."""
         return self._parent
 
     def _add_child(self, child: AsyncContext) -> None:
@@ -51,25 +50,18 @@ class AsyncContext:
             if self._cancelled:
                 cancelled = True
             else:
-                self._children.append(child)
+                self._children.add(child)
         if cancelled:
             child.cancel()
 
     def _remove_child(self, child: AsyncContext) -> None:
-        """Remove a child context from the registered children list (cleanup)."""
+        """Remove a child context from the registered set to prevent memory retention."""
         with self._lock:
-            try:
-                self._children.remove(child)
-            except ValueError:
-                pass
+            self._children.discard(child)
 
     @property
     def is_cancelled(self) -> bool:
-        """Return whether the context has been cancelled.
-
-        :returns: ``True`` if cancelled, ``False`` otherwise.
-        :rtype: :class:`bool`
-        """
+        """Return True if this context has been cancelled."""
         with self._lock:
             return self._cancelled
 
@@ -80,22 +72,13 @@ class AsyncContext:
         *args: Any,
         **kwargs: Any,
     ) -> asyncio.Future[Any]:
-        """Submit a task to a thread pool bound to this context.
+        """Submit a task to a thread pool bound to this cancellation context.
 
-        :param pool:
-            The `EventLoopThreadPool` instance.
-
-        :param target:
-            The target coroutine or callable task.
-
-        :param args:
-            Positional arguments to pass to `target`.
-
-        :param kwargs:
-            Keyword arguments to pass to `target`.
-
-        :returns: An :class:`asyncio.Future` bound to this context.
-        :rtype: :class:`asyncio.Future`
+        :param pool: The :class:`~multiloop.EventLoopThreadPool` instance to execute the task.
+        :param target: The target coroutine function or callable task.
+        :param args: Positional arguments to forward to `target`.
+        :param kwargs: Keyword arguments to forward to `target`.
+        :returns: An :class:`asyncio.Future` tracking the task's execution.
         """
         with self._lock:
             if self._cancelled:
@@ -108,9 +91,7 @@ class AsyncContext:
         fut_res: asyncio.Future[Any] = pool.submit(target, *args, cancel_scope=scope, **kwargs)
 
         with self._lock:
-            # WHY: cancel() can fire between the first check above and pool.submit().
-            # Without this second check the task would keep running in the pool
-            # after cancellation, so the future and scope are cancelled immediately instead.
+            # Double check: handle race where cancel() fired between initial check and pool.submit()
             if self._cancelled:
                 scope.cancel()
                 if not fut_res.done():
@@ -119,10 +100,6 @@ class AsyncContext:
                         try:
                             fut_loop.call_soon_threadsafe(fut_res.cancel)
                         except RuntimeError:
-                            # WHY: the future's loop closed between the
-                            # snapshot and the wakeup — the future is gone
-                            # with it; skip instead of surfacing a spurious
-                            # error to the submitter (R5 FIX-E pattern).
                             pass
                     else:
                         fut_res.cancel()
@@ -134,26 +111,18 @@ class AsyncContext:
                     submit_loop = None
                 self._futures[fut_res] = submit_loop
                 self._scopes[fut_res] = scope
-                # WHY: drop the entry as soon as the task finishes — without
-                # this every completed submission stays tracked forever and
-                # cancel() walks stale futures (R3 FIX-21).
                 fut_res.add_done_callback(self._discard_future)
 
         return fut_res
 
     def _discard_future(self, fut: asyncio.Future[Any]) -> None:
-        """Remove a finished future and scope from the tracking dicts (done-callback).
-
-        The callback runs on the future's owning loop, so the dict access is
-        serialised with submit()/cancel() via ``_lock``; a completed entry is
-        simply absent the next time cancel() walks the dict.
-        """
+        """Remove a completed future and its scope from tracking dicts."""
         with self._lock:
             self._futures.pop(fut, None)
             self._scopes.pop(fut, None)
 
     def cancel(self) -> None:
-        """Cancel this context and thread-safely cascade to all child contexts and futures."""
+        """Cancel this context and thread-safely propagate cancellation to all child contexts and futures."""
         with self._lock:
             if self._cancelled:
                 return
@@ -165,7 +134,7 @@ class AsyncContext:
             self._futures.clear()
             self._scopes.clear()
 
-        # Detach from parent to prevent memory retention
+        # Detach from parent to prevent reference cycle leaks
         if self._parent is not None:
             self._parent._remove_child(self)
 
@@ -181,11 +150,6 @@ class AsyncContext:
                     try:
                         loop.call_soon_threadsafe(fut.cancel)
                     except RuntimeError:
-                        # WHY: the future's loop closed between the snapshot
-                        # and the wakeup — the future is gone with it; skip
-                        # it instead of aborting the whole cascade, which
-                        # would leave the remaining futures and children
-                        # uncancelled (R5 FIX-E pattern).
                         pass
                 else:
                     fut.cancel()

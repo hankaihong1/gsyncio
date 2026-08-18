@@ -5,7 +5,7 @@ Run: uv run python examples/00_pool_basics.py
 
 import asyncio
 
-import gsyncio
+import multiloop
 
 
 async def heavy_task(x: int) -> int:
@@ -17,7 +17,7 @@ async def heavy_task(x: int) -> int:
 async def main() -> None:
     # The pool is an async context manager: entering starts the worker
     # threads, exiting shuts them down gracefully.
-    async with gsyncio.EventLoopThreadPool(num_threads=4) as pool:
+    async with multiloop.EventLoopThreadPool(num_threads=4) as pool:
         # 1. Submit a single task (global queue + work stealing)
         fut1 = pool.submit(heavy_task, 21)
         print("single task:", await fut1)  # 42

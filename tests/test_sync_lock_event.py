@@ -1,4 +1,4 @@
-"""Tests for gsyncio.Lock and gsyncio.Event cross-event-loop-safe primitives."""
+"""Tests for multiloop.Lock and multiloop.Event cross-event-loop-safe primitives."""
 
 import asyncio
 import threading
@@ -6,8 +6,8 @@ from typing import Any
 
 import pytest
 
-from gsyncio import Condition, Event, Lock
-from gsyncio.testing import wait_all_tasks_blocked
+from multiloop import Condition, Event, Lock
+from multiloop.testing import wait_all_tasks_blocked
 
 # ---------------------------------------------------------------------------
 # Lock tests
@@ -321,14 +321,14 @@ async def test_lock_event_combined():
 
 
 # ---------------------------------------------------------------------------
-# FIX-5 regression tests (BUG-8/W11/W21: handoff-to-cancelled-waiter must
+# Regression tests
 # forward) — 2026-08-10 audit
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_lock_handoff_to_cancelled_waiter_forwards() -> None:
-    """BUG-8: releasing the lock onto a waiter that is then cancelled before
+    """releasing the lock onto a waiter that is then cancelled before
     it wakes must forward the lock to the next FIFO waiter instead of
     stranding ownership on a dead task."""
     lock = Lock()
@@ -440,19 +440,19 @@ async def _release_after(lock: Lock) -> None:
 
 
 # ---------------------------------------------------------------------------
-# FIX-6 regression test (BUG-10: RWMutex writer cancel must wake readers)
+# Regression tests
 # — 2026-08-10 audit
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_writer_cancel_wakes_blocked_readers() -> None:
-    """BUG-10: cancelling a pending writer must wake readers blocked on it.
+    """cancelling a pending writer must wake readers blocked on it.
 
     A cancelled writer decrements pending_writers without notifying _read_ok —
     blocked readers then wait forever on a condition that is already false.
     """
-    from gsyncio import AsyncRWMutex
+    from multiloop import AsyncRWMutex
 
     rw = AsyncRWMutex()
     reader_done = asyncio.Event()
@@ -483,7 +483,7 @@ async def test_writer_cancel_wakes_blocked_readers() -> None:
 
 
 # ---------------------------------------------------------------------------
-# FIX-E (R5 audit): wakeup loops must tolerate waiters whose loop was closed
+# Regression test: wakeup loops must tolerate waiters whose loop was closed
 # ---------------------------------------------------------------------------
 
 
@@ -512,7 +512,7 @@ def _register_on_abandoned_loop(coro_factory: Any) -> None:
 
 @pytest.mark.asyncio
 async def test_event_set_tolerates_closed_loop_waiter() -> None:
-    """FIX-E: ``Event.set()`` must wake live-loop waiters even when a stale
+    """``Event.set()`` must wake live-loop waiters even when a stale
     waiter's loop was closed — pre-fix the first ``call_soon_threadsafe``
     raised RuntimeError and aborted the wakeup loop."""
     ev = Event()
@@ -526,7 +526,7 @@ async def test_event_set_tolerates_closed_loop_waiter() -> None:
 
 @pytest.mark.asyncio
 async def test_lock_release_tolerates_closed_loop_waiter() -> None:
-    """FIX-E: releasing a lock whose FIFO head lives on a closed loop must
+    """releasing a lock whose FIFO head lives on a closed loop must
     hand ownership to the next live waiter — pre-fix ``release()`` raised
     RuntimeError after transferring ownership to the dead task and the lock
     was permanently broken (every later acquire hung)."""

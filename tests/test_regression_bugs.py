@@ -10,19 +10,19 @@ import threading
 
 import pytest
 
-pytest.importorskip("gsyncio")
+pytest.importorskip("multiloop")
 
-import gsyncio
-from gsyncio.pool import EventLoopThreadPool
-from gsyncio.primitives import AsyncWaitGroup, FastChannel
-from gsyncio.testing import wait_all_tasks_blocked
+import multiloop
+from multiloop.pool import EventLoopThreadPool
+from multiloop.primitives import AsyncWaitGroup, Channel
+from multiloop.testing import wait_all_tasks_blocked
 
 # ── Bug A: Hang when Rust extension is missing ───────────────────────────
 
 
 @pytest.mark.asyncio
 async def test_regression_bug_a_fallback_error():
-    """Bug A: EventLoopThreadPool hangs forever when _gsyncio_core is missing.
+    """Bug A: EventLoopThreadPool hangs forever when _multiloop_core is missing.
 
     When the Rust native extension is unavailable, NativeWorkerPool is set to
     None (pool.py:13-22). The _worker_dispatcher (pool.py:168-170) immediately
@@ -36,10 +36,10 @@ async def test_regression_bug_a_fallback_error():
     This test FAILS against current code because the pool hangs instead of
     completing or raising an error.
     """
-    import gsyncio.pool
+    import multiloop.pool
 
     # Simulate missing Rust extension
-    gsyncio.pool.NativeWorkerPool = None
+    multiloop.pool.NativeWorkerPool = None
 
     pool = EventLoopThreadPool(num_threads=1)
     try:
@@ -49,10 +49,10 @@ async def test_regression_bug_a_fallback_error():
         await pool.close()
         # Restore NativeWorkerPool for other tests
         try:
-            from gsyncio._gsyncio_core import NativeWorkerPool as _restore  # noqa: N813
+            from multiloop._multiloop_core import NativeWorkerPool as _restore  # noqa: N813
         except ImportError:
             _restore = None
-        gsyncio.pool.NativeWorkerPool = _restore
+        multiloop.pool.NativeWorkerPool = _restore
 
 
 # ── Bug B: Channel waiter future leak on timeout/cancellation ────────────
@@ -60,18 +60,18 @@ async def test_regression_bug_a_fallback_error():
 
 @pytest.mark.asyncio
 async def test_regression_bug_b_channel_leak_send():
-    """Bug B (send): FastChannel must not leak waiter futures in _putters.
+    """Bug B (send): Channel must not leak waiter futures in _putters.
 
     Historical root cause: channel send cleanup used ``except Exception``,
     which does NOT catch ``asyncio.CancelledError`` (BaseException in 3.8+).
     When a blocked send is cancelled by asyncio.wait_for(timeout), the
     CancelledError escaped past the cleanup and the waiter future was never
     removed from _putters.  The shared _BaseChannel._wait_and_send now uses
-    ``except BaseException`` — this test pins that behavior on FastChannel.
+    ``except BaseException`` — this test pins that behavior on Channel.
 
     Expected (fixed): after timeout/cancellation, _putters should be empty.
     """
-    ch = FastChannel(maxsize=1)
+    ch = Channel(maxsize=1)
     await ch.send("first")  # Fill the bounded channel
 
     # Block on a send that can never complete (channel full, no receiver).
@@ -86,14 +86,14 @@ async def test_regression_bug_b_channel_leak_send():
 
 @pytest.mark.asyncio
 async def test_regression_bug_b_channel_leak_recv():
-    """Bug B (recv): FastChannel must not leak getter futures in _getters.
+    """Bug B (recv): Channel must not leak getter futures in _getters.
 
     Same root cause as the send leak — ``except Exception`` missed
     CancelledError when a blocked recv is cancelled by wait_for.
 
     Expected (fixed): after timeout/cancellation, _getters should be empty.
     """
-    ch = FastChannel()  # Empty channel — recv() will block.
+    ch = Channel()  # Empty channel — recv() will block.
 
     with pytest.raises(asyncio.TimeoutError):
         await asyncio.wait_for(ch.recv(), timeout=0.01)
@@ -173,16 +173,16 @@ async def test_regression_bug_d_select_channel_timeout_leak():
     Historical root cause: select_channel's _read_one tasks blocked on
     ch.recv(); on timeout the pending tasks were cancelled but without an
     ``except BaseException`` cleanup the CancelledError escaped and waiter
-    futures remained in _getters.  Pinned here on FastChannel.
+    futures remained in _getters.  Pinned here on Channel.
 
     Expected (fixed): after select_channel timeout, all channels' _getters
     should be empty (cancelled waiters cleaned up by except BaseException).
     """
-    ch1 = FastChannel()
-    ch2 = FastChannel()
+    ch1 = Channel()
+    ch2 = Channel()
 
-    with pytest.raises(gsyncio.TimeoutError):
-        await gsyncio.select_channel(ch1, ch2, timeout=0.01)
+    with pytest.raises(multiloop.TimeoutError):
+        await multiloop.select_channel(ch1, ch2, timeout=0.01)
 
     # Yield to the event loop so cancelled tasks run their cleanup
     await asyncio.sleep(0)
@@ -197,18 +197,15 @@ async def test_regression_bug_d_select_channel_timeout_leak():
     )
 
 
-# ── R2 FIX-9: Lock re-entrancy + cancellation ownership theft ─────────────
+# ── Lock re-entrancy + cancellation ownership theft ────────────────────────
 
 
 @pytest.mark.asyncio
 async def test_lock_reentrant_acquire_raises():
-    """R2-FIX-9 (probe R2-A2): same-task re-acquire raises RuntimeError
-    (asyncio.Lock parity) instead of silently queueing into a self-deadlock.
-
-    Pre-fix: the inner acquire parks forever (deadlock); when an external
-    timeout breaks it, the outer holder loses ownership (see the next test).
+    """Same-task re-acquire raises RuntimeError (asyncio.Lock parity) instead of
+    silently queueing into a self-deadlock.
     """
-    lock = gsyncio.Lock()
+    lock = multiloop.Lock()
     async with lock:
         with pytest.raises(RuntimeError):
             async with lock:
@@ -217,14 +214,11 @@ async def test_lock_reentrant_acquire_raises():
 
 @pytest.mark.asyncio
 async def test_lock_reentrant_cancel_no_ownership_theft():
-    """R2-FIX-9 (probe R2-A1): a cancelled re-entrant acquire must NOT hand
-    the lock to a queued waiter while the outer holder is still inside its
-    critical section — that violates mutual exclusion.
-
-    Pre-fix log (probe): T2 entered its critical section while T1 was still
-    inside, and T1's outer __aexit__ then raised "does not own the lock".
+    """A cancelled re-entrant acquire must NOT hand the lock to a queued waiter
+    while the outer holder is still inside its critical section — that violates
+    mutual exclusion.
     """
-    lock = gsyncio.Lock()
+    lock = multiloop.Lock()
     t1_in_cs = {"v": False}
 
     async def t1():
@@ -240,7 +234,7 @@ async def test_lock_reentrant_cancel_no_ownership_theft():
                 await asyncio.sleep(0.3)  # keep the outer critical section
                 t1_in_cs["v"] = False
         except RuntimeError:
-            pass  # pre-fix: outer __aexit__ loses ownership
+            pass
 
     async def t2():
         async with lock:
@@ -256,21 +250,16 @@ async def test_lock_reentrant_cancel_no_ownership_theft():
     assert not any(isinstance(r, BaseException) for r in results), results
 
 
-# ── U3 FIX-1 + FIX-10: AsyncRWMutex release shielding + nesting ────────────
+# ── AsyncRWMutex release shielding + nesting ───────────────────────────────
 
 
 @pytest.mark.asyncio
 async def test_rwmutex_cancel_cleanup_leak():
-    """R1-FIX-1 contract: a cancelled *holder* must complete its release path
-    (readers back to 0, a queued writer admitted).  The finally block re-
-    acquires the inner Lock, and that re-acquire must never be interrupted by
-    a pending cancellation (R1 probe A observed readers stuck at 1 and the
-    writer hanging forever).  On 3.14 the single-shot delivery semantics make
-    the plain single-cancel path safe; the shield guards the residual-count
-    paths (user shield restore leaving _must_cancel set).  This test pins the
-    observable contract.
+    """A cancelled holder must complete its release path (readers back to 0,
+    a queued writer admitted). The finally block re-acquires the inner Lock,
+    and that re-acquire must never be interrupted by a pending cancellation.
     """
-    rw = gsyncio.AsyncRWMutex()
+    rw = multiloop.AsyncRWMutex()
     entered = asyncio.Event()
 
     async def holder() -> None:
@@ -297,28 +286,29 @@ async def test_rwmutex_cancel_cleanup_leak():
 
 @pytest.mark.asyncio
 async def test_rwmutex_nesting_rejected():
-    """R2-FIX-10: reader→writer / writer→reader / writer→writer nesting
-    raises RuntimeError instead of silently self-deadlocking; reader→reader
-    re-entry stays legal."""
-    rw = gsyncio.AsyncRWMutex()
+    """reader→writer / writer→reader / writer→writer nesting raises
+    RuntimeError instead of silently self-deadlocking; reader→reader re-entry
+    stays legal.
+    """
+    rw = multiloop.AsyncRWMutex()
 
     with pytest.raises(RuntimeError):
         async with rw.reader():
             async with asyncio.timeout(0.5):
                 async with rw.writer():
-                    pass  # pragma: no cover — pre-fix hangs until timeout
+                    pass
 
     with pytest.raises(RuntimeError):
         async with rw.writer():
             async with asyncio.timeout(0.5):
                 async with rw.reader():
-                    pass  # pragma: no cover
+                    pass
 
     with pytest.raises(RuntimeError):
         async with rw.writer():
             async with asyncio.timeout(0.5):
                 async with rw.writer():
-                    pass  # pragma: no cover
+                    pass
 
     # Re-entrant reads are allowed (shared lock).
     async with rw.reader(), rw.reader():
@@ -327,30 +317,25 @@ async def test_rwmutex_nesting_rejected():
 
 @pytest.mark.asyncio
 async def test_rwmutex_double_reader_writer_still_rejected():
-    """R5 revision A: reader depth counting — after the *first* nested reader
-    exits (still inside the second), writer() must still be rejected.  A
-    plain set would drop the registration on the first exit and let the
-    writer hang (pre-fix behavior: no detection at all → hangs)."""
-    rw = gsyncio.AsyncRWMutex()
+    """Reader depth counting — after the *first* nested reader exits (still
+    inside the second), writer() must still be rejected.
+    """
+    rw = multiloop.AsyncRWMutex()
     async with rw.reader():
         async with rw.reader():
             pass  # first exit: depth 2 → 1, task still registered
         with pytest.raises(RuntimeError):
             async with asyncio.timeout(0.5):
                 async with rw.writer():
-                    pass  # pragma: no cover
+                    pass
 
 
 @pytest.mark.asyncio
 async def test_rwmutex_cancelled_writer_preserves_holder_state():
-    """U3 contract: a *queued* writer cancelled while another writer holds
-    the lock must not touch the holder's state.  Structurally the acquire
-    phase throws before the outer ``try: yield`` is entered, so only the
-    inner finally (pending_writers decrement) runs — this test pins that
-    contract (and the explicit ``acquired`` guard in the release path) so a
-    future restructure cannot let a cancelled queued writer flip _writer to
-    False and admit readers while the holder is still inside."""
-    rw = gsyncio.AsyncRWMutex()
+    """A queued writer cancelled while another writer holds the lock must not
+    touch the holder's state.
+    """
+    rw = multiloop.AsyncRWMutex()
     async with rw.writer():
         w2_entered = asyncio.Event()
 
@@ -377,20 +362,17 @@ async def test_rwmutex_cancelled_writer_preserves_holder_state():
             pass
 
 
-# ---------------------------------------------------------------------------
-# FIX-F (R5 audit): select_channel caller cancellation must clean up
-# ---------------------------------------------------------------------------
+# ── select_channel caller cancellation cleanup ─────────────────────────────
 
 
 @pytest.mark.asyncio
 async def test_select_channel_caller_cancel_cleans_up() -> None:
-    """FIX-F: cancelling the select_channel caller must unregister the
-    channel notifiers and stop the select machinery — pre-fix the notifier
-    stayed registered (and the select task alive) until the channel's next
-    send."""
-    from gsyncio.primitives import FastChannel, select_channel
+    """Cancelling the select_channel caller must unregister the channel
+    notifiers and stop the select machinery.
+    """
+    from multiloop.primitives import Channel, select_channel
 
-    ch = FastChannel()
+    ch = Channel()
     sel = asyncio.create_task(select_channel(ch))
     await wait_all_tasks_blocked()
     await asyncio.sleep(0)

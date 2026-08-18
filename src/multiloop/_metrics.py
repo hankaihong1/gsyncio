@@ -1,12 +1,16 @@
-"""Lock-free atomic performance metrics for EventLoopThreadPool."""
+"""Lock-free atomic performance metrics collector for EventLoopThreadPool."""
+
+from __future__ import annotations
 
 from typing import Any, Protocol
 
-from gsyncio._rust import _try_import_rust_class
+from multiloop._rust import _try_import_rust_class
+
+__all__ = ["AtomicMetrics", "MetricsCollector"]
 
 
 class _MetricsProtocol(Protocol):
-    """Protocol for the Rust AtomicMetrics class."""
+    """Protocol for the native Rust AtomicMetrics class."""
 
     def __init__(self, num_threads: int) -> None: ...
     def inc_active(self, index: int) -> None: ...
@@ -24,15 +28,15 @@ class _MetricsProtocol(Protocol):
 
 
 AtomicMetrics: type[_MetricsProtocol] | None = _try_import_rust_class(
-    "gsyncio._gsyncio_core", "AtomicMetrics"
+    "multiloop._multiloop_core", "AtomicMetrics"
 )
 
 
 class MetricsCollector:
-    """Wraps the Rust ``AtomicMetrics`` lock-free counters into a Python-friendly API.
+    """Wraps Rust ``AtomicMetrics`` lock-free counters into a Python-friendly telemetry collector.
 
-    Provides per-worker ``inc_active`` / ``dec_active`` helpers and a snapshot dict
-    identical in shape to the original :meth:`EventLoopThreadPool.get_metrics` output.
+    Provides per-worker ``inc_active`` / ``dec_active`` helpers and a snapshot dictionary
+    for monitoring thread-pool performance, worker saturation, and work-stealing efficiency.
     """
 
     def __init__(self, num_threads: int) -> None:
@@ -43,27 +47,30 @@ class MetricsCollector:
 
     @property
     def is_enabled(self) -> bool:
-        """``True`` when the Rust extension loaded successfully."""
+        """Return True when the native Rust metrics extension is loaded and active."""
         return self._metrics is not None
 
     def inc_active(self, index: int) -> None:
+        """Increment the active task counter for worker at ``index``."""
         if self._metrics:
             self._metrics.inc_active(index)
 
     def dec_active(self, index: int) -> None:
+        """Decrement active and increment completed task counters for worker at ``index``."""
         if self._metrics:
             self._metrics.dec_active(index)
 
     def get_active(self, index: int) -> int:
+        """Get the current count of active tasks for worker at ``index``."""
         if self._metrics:
             return self._metrics.get_active(index)
         return 0
 
     def get_snapshot(self, is_running: bool) -> dict[str, Any]:
-        """Return a metrics snapshot with the same shape as
-        :meth:`EventLoopThreadPool.get_metrics`.
+        """Return an instantaneous metrics snapshot across all worker threads.
 
-        :param is_running: Whether the owning pool is currently running.
+        :param is_running: Whether the owning thread pool is active.
+        :returns: Telemetry dictionary including active, completed, global pull, and park counts.
         """
         active_tasks = [
             self._metrics.get_active(i) if self._metrics else 0 for i in range(self._num_threads)

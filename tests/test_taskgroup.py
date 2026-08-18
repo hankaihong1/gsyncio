@@ -1,4 +1,4 @@
-"""Tests for gsyncio TaskGroup (structured concurrency)."""
+"""Tests for multiloop TaskGroup (structured concurrency)."""
 
 import asyncio
 import threading
@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from gsyncio._taskgroup import TaskGroup, TaskHandle, TaskStatus, _TaskStatus
+from multiloop._taskgroup import TaskGroup, TaskHandle, TaskStatus, _TaskStatus
 
 
 async def _worker(value: Any) -> Any:
@@ -217,13 +217,13 @@ async def test_taskgroup_start_child_crash_cleans_up():
 
 
 # ---------------------------------------------------------------------------
-# FIX-3 regression tests (BUG-3/9: structured-concurrency contract) — 2026-08-10
+# Regression tests
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_body_and_child_exceptions_both_visible() -> None:
-    """BUG-3: a body exception must not be silently dropped when children fail."""
+    """a body exception must not be silently dropped when children fail."""
 
     async def child_fail() -> None:
         raise ValueError("child")
@@ -232,7 +232,7 @@ async def test_body_and_child_exceptions_both_visible() -> None:
         async with TaskGroup() as tg:
             tg.start_soon(child_fail)
             # Yield once so the child actually runs and fails before the
-            # body raises — both exceptions must surface (BUG-3).
+            # body raises — both exceptions must surface ().
             await asyncio.sleep(0)
             raise KeyError("body")
 
@@ -262,7 +262,7 @@ async def test_body_cancel_propagates_without_merge() -> None:
 
 @pytest.mark.asyncio
 async def test_cancel_cancels_stuck_child() -> None:
-    """BUG-9: cancelling a TaskGroup body must cancel stuck children so the
+    """cancelling a TaskGroup body must cancel stuck children so the
     group exits promptly instead of hanging forever."""
 
     async def stuck() -> None:
@@ -337,12 +337,12 @@ async def test_cancel_all_concurrent_start_soon() -> None:
     await asyncio.gather(*(h._task for h in handles), return_exceptions=True)
 
 
-# ── U4 FIX-20: exit guard + re-entry cleanup ───────────────────────────────
+# ───────────────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
 async def test_start_soon_after_exit_raises() -> None:
-    """R3-FIX-20 (probe R3-C): start_soon() after the group exited must raise
+    """start_soon() after the group exited must raise
     instead of silently spawning an orphan task that nobody waits for —
     and the orphan must be cancelled, not left running."""
     tg = TaskGroup()
@@ -359,8 +359,7 @@ async def test_reenter_after_body_exception_clean() -> None:
     """R5 revision C: re-entering after a body-exception exit must start a fresh
     lifecycle — the old children (pre-cancelled by __aexit__) must not be
     re-collected, or their stale CancelledError resurfaces on the second
-    exit (probe R5: the body-exception path leaves the scope uncancelled,
-    so re-entry was admitted and then re-raised the stale error)."""
+    exit."""
     tg = TaskGroup()
 
     async def boom() -> None:
@@ -380,7 +379,7 @@ async def test_reenter_after_body_exception_clean() -> None:
 
 @pytest.mark.asyncio
 async def test_reenter_after_normal_exit_ok() -> None:
-    """FIX-20: normal exit → re-enter is a fresh lifecycle (children cleared,
+    """normal exit → re-enter is a fresh lifecycle (children cleared,
     start_soon works again)."""
     tg = TaskGroup()
     async with tg:
@@ -392,7 +391,7 @@ async def test_reenter_after_normal_exit_ok() -> None:
 
 
 # ---------------------------------------------------------------------------
-# FIX-C (R5 audit): start() must not hang when the child fails before started()
+# Regression test: start() must not hang when the child fails before started()
 # ---------------------------------------------------------------------------
 
 
@@ -402,7 +401,7 @@ async def _child_fails_before_started(_ts: TaskStatus) -> None:
 
 @pytest.mark.asyncio
 async def test_start_child_failure_raises_not_hangs() -> None:
-    """FIX-C: a child that raises before calling ``started()`` must surface
+    """a child that raises before calling ``started()`` must surface
     its exception from ``start()`` — pre-fix ``start()`` blocked forever
     (the started-event is never set)."""
     with pytest.raises(ValueError, match="boom before started"):
@@ -412,7 +411,7 @@ async def test_start_child_failure_raises_not_hangs() -> None:
 
 @pytest.mark.asyncio
 async def test_start_child_failure_reported_once() -> None:
-    """FIX-C: the same child exception must not be reported twice (start()
+    """the same child exception must not be reported twice (start()
     raises it AND the group re-collects it into an ExceptionGroup)."""
     with pytest.raises(ValueError, match="boom before started") as excinfo:
         async with TaskGroup() as tg:
@@ -443,7 +442,7 @@ async def test_cancel_all_then_normal_exit_is_silent() -> None:
     """R8 Unit 1: cancel_all() victims must not be reported at group exit.
 
     Pre-fix the soft-exit branch raised the victims' CancelledErrors into
-    the host task (probe R8-D): a public-API cancel_all() followed by a
+    the host task: a public-API cancel_all() followed by a
     normal body exit failed the whole task with a spurious CE group.
     """
 
@@ -465,7 +464,7 @@ async def test_start_failure_siblings_not_reported() -> None:
     Pre-fix the sibling's CancelledError was collected (not in
     cancelled_by_scope) and the group exit raised it via the soft-exit
     branch while the real ValueError had already been delivered by
-    start() (probe R8-B2)."""
+    start()."""
 
     async def failing_child(task_status: TaskStatus) -> None:
         task_status.started()
@@ -486,9 +485,8 @@ async def test_externally_cancelled_child_is_silent() -> None:
     """R8 Unit 1: a child cancelled by task.cancel() is not an error.
 
     trio/anyio both absorb externally cancelled children (anyio filters
-    every child CancelledError in task_done); gsyncio previously raised
-    the CE out of the group and spuriously cancelled the host task
-    (probe R8-A)."""
+    every child CancelledError in task_done); multiloop previously raised
+    the CE out of the group and spuriously cancelled the host task."""
 
     async def child() -> None:
         await asyncio.sleep(30)
@@ -511,7 +509,7 @@ async def test_host_cancel_waits_for_children_to_finish() -> None:
     children must be FINISHED before the block exits (trio/anyio parity).
 
     Pre-fix the host's except handler ran while the child's finally had
-    not (probe R8-C2: gsyncio False vs anyio True) — the structured-
+    not — the structured-
     concurrency guarantee was broken on the cancellation path."""
 
     child_finally_ran = asyncio.Event()
@@ -550,8 +548,7 @@ async def test_host_cancel_waits_for_children_to_finish() -> None:
 @pytest.mark.asyncio
 async def test_preexisting_children_tracked_through_first_entry() -> None:
     """R8 Unit 3: children spawned BEFORE the first entry stay tracked —
-    the group waits for them at exit (probe R8-E: previously the entry
-    cleared _children, silently orphaning the task)."""
+    the group waits for them at exit."""
 
     finished = asyncio.Event()
 

@@ -1,29 +1,29 @@
-# AGENTS.md — AI Agent Onboarding Guide for gsyncio
+# AGENTS.md — AI Agent Onboarding Guide for multiloop
 
-> **Repository**: [hankaihong1/gsyncio](https://github.com/hankaihong1/gsyncio)
+> **Repository**: [hankaihong1/multiloop](https://github.com/hankaihong1/multiloop)
 > **License**: MIT
 
 ---
 
 ## 1. Project Identity
 
-**gsyncio** is a multi-event-loop engine and Go-style concurrency toolkit for
-Python 3.14t (free-threaded / no-GIL). It wraps a Rust core (`_gsyncio_core`)
+**multiloop** is a multi-event-loop engine and Go-style concurrency toolkit for
+Python 3.14t (free-threaded / no-GIL). It wraps a Rust core (`_multiloop_core`)
 built with PyO3, flume, and parking_lot, and exposes `EventLoopThreadPool`,
-`FastChannel`, `select_channel`, `TaskGroup`, `CancelScope`, and async
+`Channel`, `select_channel`, `TaskGroup`, `CancelScope`, and async
 synchronization primitives (`AsyncWaitGroup`, `AsyncOnce`, `AsyncRWMutex`,
 `Lock`, `Semaphore`, `Condition`, `Barrier`, `CapacityLimiter`). The public API
 is intentionally minimal, modeled after `asyncssh`'s top-level-facade style.
 
 **Crucial Paradigm Distinction: API Lending vs. Single-Threaded Semantics Rejection**:
-`gsyncio` borrows the clean, familiar API surface and ergonomics of AnyIO and
+`multiloop` borrows the clean, familiar API surface and ergonomics of AnyIO and
 Trio (`TaskGroup`, `CancelScope`, `CapacityLimiter`, `Event`, etc.), but
 **fundamentally rejects their single-threaded, zero-contention semantic
 assumptions**. AnyIO and Trio were designed for single-threaded, single-event-loop
 cooperative multitasking where OS locks are unnecessary and primitives serve
-merely as cooperative coroutine throttles. In contrast, `gsyncio` operates under
+merely as cooperative coroutine throttles. In contrast, `multiloop` operates under
 Python 3.14t true multi-core physical parallelism across multiple OS threads and
-isolated event loops. Correctness in `gsyncio` cannot rely on single-threaded
+isolated event loops. Correctness in `multiloop` cannot rely on single-threaded
 cooperative heuristics; it requires **formal axiomatic reasoning, state-machine
 invariants, token conservation laws, and multi-thread signal forwarding**.
 
@@ -32,28 +32,35 @@ invariants, token conservation laws, and multi-thread signal forwarding**.
 ## 2. Directory Map
 
 ```
-gsyncio/
+multiloop/
 ├── src/
-│   ├── gsyncio/              # Python package (17 modules)
+│   ├── multiloop/              # Python package (19 modules)
 │   │   ├── __init__.py       # Public API surface — start here
 │   │   ├── pool.py           # EventLoopThreadPool engine
-│   │   ├── primitives.py     # FastChannel, select_channel, AsyncWaitGroup, AsyncOnce
-│   │   ├── context.py        # AsyncContext
+│   │   ├── primitives.py     # Channel, select_channel, AsyncWaitGroup, AsyncOnce
+│   │   ├── context.py        # AsyncContext (O(1) set tracking)
 │   │   ├── _cancel.py        # CancelScope, fail_after, move_on_after, shield
 │   │   ├── _sync.py          # Lock, Semaphore, Event, Condition, Barrier
 │   │   ├── _taskgroup.py     # TaskGroup, TaskHandle
 │   │   ├── rwlock.py         # AsyncRWMutex (async read-write lock)
-│   │   ├── asgi.py           # GsyncioASGIWorker
-│   │   ├── server.py         # ConnectionPinningServer
+│   │   ├── asgi.py           # MultiloopASGIWorker (ASGI 3.0, Lifespan, WebSockets, H2)
+│   │   ├── wsgi.py           # MultiloopWSGIWorker (WSGI 1.0.1, PEP 3333 synchronous runner)
+│   │   ├── cli.py            # multiloop run CLI server runner
+│   │   ├── server.py         # ConnectionPinningServer (SO_REUSEPORT multi-core listener)
 │   │   ├── _channel_base.py  # Shared waiter deques, _wake_all, _wakeup_next
 │   │   ├── _rust.py          # _try_import_rust_class helper
 │   │   ├── _metrics.py       # MetricsCollector
 │   │   ├── _options.py       # PoolOptions dataclass
 │   │   ├── _logging.py       # get_logger, set_log_level
-│   │   ├── exceptions.py     # GsyncioError hierarchy
+│   │   ├── exceptions.py     # MultiloopError hierarchy
 │   │   └── testing/          # Test helpers
-│   └── lib.rs                # Rust core: NativeWorkerPool, FastChannel,
-│                              #   AtomicMetrics, RawAsyncWaitGroup
+│   ├── lib.rs                # Rust pymodule registration & tests
+│   ├── metrics.rs            # AtomicMetrics & 64-byte PaddedAtomic
+│   ├── pool.rs               # NativeWorkerPool & PollerGuard
+│   ├── channel.rs            # Channel, RawAsyncChannel (Anti-Barging FIFO)
+│   ├── waitgroup.rs          # RawAsyncWaitGroup & WaitGroupInner
+│   ├── http.rs               # FastHttpParser (SIMD httparse)
+│   └── h2.rs                 # PyH2Bridge, serve_h2_connection (Tokio H2 Runtime)
 ├── tests/                    # 27 test files (pytest + pytest-asyncio)
 ├── benchmarks/               # 3 benchmark scripts
 ├── examples/                 # Runnable examples (python examples/00_*.py)
@@ -80,7 +87,7 @@ searches, never modify.
 | `pyproject.toml` / `Cargo.toml` / `uv.lock` / `Cargo.lock` | Build & dependency manifests | Yes (when changing deps) |
 | `Makefile` | Command entry point (develop/test/lint/bench/all) | Yes — prefer it over raw commands |
 | `.gitignore` / `.pre-commit-config.yaml` | VCS ignores / pre-commit hooks (ruff + cargo) | Yes (when changing hooks) |
-| `AGENTS.md` / `README.md` / `ROADMAP.md` / `CONTRIBUTING.md` / `docs/` (English files) | Docs | Yes (sync when behavior changes; docs `*_ZH.md` are the Chinese mirrors — same content, do not maintain separately) |
+| `AGENTS.md` / `README.md` / `CONTRIBUTING.md` / `docs/` (English files) | Docs | Yes (sync when behavior changes; docs `*_ZH.md` are the Chinese mirrors — same content, do not maintain separately) |
 | `build.rs` | libpython link logic (extension-module detection) | Only for cargo-test link paths |
 | `deny.toml` / `rust-toolchain.toml` / `.editorconfig` / `.python-version` | Toolchain pinning | No (leave alone) |
 | `LICENSE` / `CODE_OF_CONDUCT.md` / `SECURITY.md` / `CODEOWNERS` / `CITATION.cff` / `CHANGELOG.md` | GitHub ecosystem files | No (unless asked) |
@@ -115,7 +122,7 @@ searches, never modify.
 - **Package manager**: `uv` exclusively — do not use `pip`.
 - **Rust toolchain**: stable (via rustup).
 - **Rust extension optional**: every Python module that depends on the Rust
-  core uses `_try_import_rust_class()` (`src/gsyncio/_rust.py`) for graceful
+  core uses `_try_import_rust_class()` (`src/multiloop/_rust.py`) for graceful
   fallback when the extension is not compiled.
 - **Commit style**: conventional, concise. PRs target `main`.
 - **Request before code, green before merge**: for any non-trivial change,
@@ -147,37 +154,38 @@ searches, never modify.
 
 ### Recommended reading order for AI agents
 
-1. **`src/gsyncio/__init__.py`** — Public API surface. Every exported symbol is
+1. **`src/multiloop/__init__.py`** — Public API surface. Every exported symbol is
    re-exported here. Start here to understand the module layout.
 
-2. **`src/gsyncio/pool.py`** — Core engine. `EventLoopThreadPool` orchestrates
+2. **`src/multiloop/pool.py`** — Core engine. `EventLoopThreadPool` orchestrates
    OS threads running isolated asyncio event loops. The `submit()` method has
    two paths (global queue via `push_global`, local queue via `push_local`).
    `_worker_dispatcher` is the per-worker event loop that calls `pop_work()`
    and spawns tasks.
 
 3. **`src/lib.rs`** — Rust backend. Four `#[pyclass]` types: `NativeWorkerPool`
-   (global + per-worker flume queues, batch-pull pop_work), `FastChannel`
+   (global + per-worker flume queues, batch-pull pop_work), `Channel`
    (lock-free flume channel), `AtomicMetrics` (padded atomic counters),
    `RawAsyncWaitGroup` (atomic counter + mutex-protected waiter list).
 
-4. **`src/gsyncio/primitives.py`** — `FastChannel` Python wrapper with the
+4. **`src/multiloop/primitives.py`** — `Channel` Python wrapper with the
    double-checked lock pattern, `select_channel`, `AsyncWaitGroup`,
    `AsyncOnce`.
 
-5. **`src/gsyncio/_cancel.py`** — `CancelScope` with shield semantics, using
+5. **`src/multiloop/_cancel.py`** — `CancelScope` with shield semantics, using
    `task.uncancel()` / `task.cancel()` snapshot/restore on Python 3.11+.
 
 ### For bug investigation
 
 - Run the failing test: `uv run pytest tests/<file>.py::<test_name> -xvs`
-- Stress-test for race conditions: `uv run pytest tests/<file>.py -p no:cacheprovider --count=50`
+- Stress-test for race conditions (**single target file only, never the whole suite**):
+  `uv run pytest tests/<file>.py -p no:cacheprovider --count=50`
 - Run last-failed tests: `uv run pytest --lf`
 
 ### Module dependency map (simplified)
 
 ```
-__init__.py  ──┬── pool.py ────────── _rust.py ── _gsyncio_core (lib.rs)
+__init__.py  ──┬── pool.py ────────── _rust.py ── _multiloop_core (lib.rs)
                 ├── primitives.py ──── _channel_base.py
                 ├── _cancel.py
                 ├── _sync.py
@@ -210,10 +218,11 @@ hold regardless:
    features) an `examples/` script — `tests/test_docs.py` enforces the first
    two.
 5. Concurrency behavior changes must be stress-tested with
-   `pytest-repeat --count=50`, never a single run.
+   `pytest-repeat --count=50` on the **specific target test file or function**,
+   never across the entire test suite or multiple socket-heavy files at once.
 6. **Bugs require a minimal reproduction test first** (deterministic data,
-   stable FAIL, `--count=50` to confirm reproduction rate); a fix is not done
-   until that test passes stably.
+   stable FAIL, `--count=50` on that target test to confirm reproduction rate);
+   a fix is not done until that test passes stably.
 7. **GitHub Actions is for CI, not debugging** — no debug commits, no
    temporary diagnostic workflows, no remote-runner bisecting. If code needs
    debugging on another platform's machine, ask the user to arrange access
@@ -248,17 +257,20 @@ pops so no single worker greedily drains the global queue.
 
 ### Rust core components
 
-| Component | Crate | Purpose |
-|-----------|-------|---------|
-| `NativeWorkerPool` | PyO3 + flume | Lock-free global queue + per-worker bounded (256) local channels, batch-pull `pop_work`, soft poller gate |
-| `FastChannel` | flume | Lock-free bounded/unbounded channel, exposed to Python as `gsyncio.primitives.FastChannel` |
-| `AtomicMetrics` | `std::sync::atomic` | 64-byte-padded per-worker counters (`active`, `completed`, `global_pull_count`, `park_count`, etc.) — prevents false sharing |
-| `RawAsyncWaitGroup` | parking_lot `Mutex<WaitGroupInner>` | Go-style atomic counter + generation + waiter list with single-mutex state machine |
+| Component | Source file | Crate | Purpose |
+|---|---|---|---|
+| `NativeWorkerPool` | `src/pool.rs` | PyO3 + flume | Lock-free global queue + per-worker bounded (256) local channels, batch-pull `pop_work`, soft poller gate |
+| `Channel` | `src/channel.rs` | flume | Lock-free bounded/unbounded channel, exposed to Python as `multiloop.primitives.Channel` |
+| `RawAsyncChannel` | `src/channel.rs` | parking_lot + PyO3 | Python-independent async channel core with anti-barging FIFO ordering protection |
+| `AtomicMetrics` | `src/metrics.rs` | `std::sync::atomic` | 64-byte-padded per-worker counters (`active`, `completed`, `global_pull_count`, `park_count`, etc.) — prevents false sharing |
+| `RawAsyncWaitGroup` | `src/waitgroup.rs` | parking_lot `Mutex<WaitGroupInner>` | Go-style atomic counter + generation + waiter list with single-mutex state machine |
+| `FastHttpParser` | `src/http.rs` | httparse | SIMD zero-copy HTTP/1.x header parser |
+| `PyH2Bridge` & `serve_h2_connection` | `src/h2.rs` | tokio + h2 | Tokio HTTP/2 async multiplexing runtime bridge |
 
 ### Python-side patterns
 
 - **`_try_import_rust_class(module, name)`** (`_rust.py`): Every module that
-  depends on `_gsyncio_core` imports Rust classes through this function.
+  depends on `_multiloop_core` imports Rust classes through this function.
   Returns `None` if the extension is missing — no import-time crash.
 
 - **`CancelScope` with shield** (`_cancel.py`): Uses `task.cancelling()` /
@@ -266,17 +278,19 @@ pops so no single worker greedily drains the global queue.
   cleanup code (like re-acquiring a lock in `Condition.wait()`) runs to
   completion even under cancellation.
 
-- **`Condition` latch** (`_sync.py`): `notify()` does NOT require the
-  underlying lock. Waiters register via sticky `asyncio.Event` under a
-  separate `_waiters_lock`, closing the lost-notification window.
+- **`Condition` latch & cancellation forwarding** (`_sync.py`): `notify()`
+  does NOT require the underlying lock. Waiters register via sticky
+  `asyncio.Event` under a separate `_waiters_lock`. If a waiter is cancelled
+  while re-acquiring the lock after being notified, it automatically forwards
+  the notification to the next waiter to conserve notification tokens.
 
-### Six non-obvious design decisions
+### Seven non-obvious design decisions
 
 These are the places where a change that looks like a simplification usually
 breaks a real correctness or performance property. **Read each before modifying
 the related code.**
 
-1. **Double-check lock in `FastChannel`** (`primitives.py:150-227`):
+1. **Double-check lock in `Channel`** (`primitives.py:150-227`):
    The flume queue is lock-free, but the Python waiter deques are not. A
    fast-path `try_send`/`try_recv` outside the lock, followed by a re-check
    under the lock, closes the lost-wakeup window between the lock-free buffer
@@ -288,27 +302,34 @@ the related code.**
    without the next `await` re-raising `CancelledError`. Without it,
    `Condition.wait()` deadlocks on cancel.
 
-3. **Barrier automatic Broken state machine & generation tracking** (`_sync.py:774-896`):
+3. **Condition notification forwarding on re-acquire cancellation** (`_sync.py:624-646`):
+   When a `wait()` coroutine is awakened by `notify()` but receives a cancellation
+   request while waiting to re-acquire the underlying mutex, the notification
+   token has already been deducted. The cancellation handler MUST forward
+   `_forward_notify()` to ensure subsequent waiters are not starved.
+
+4. **Barrier automatic Broken state machine & generation tracking** (`_sync.py:774-896`):
    A `_generation` counter ties every waiter to the exact round it joined.
    On cancellation of any waiting party before round completion, the barrier
    automatically marks itself broken, wakes all remaining waiting parties with an
    error, and advances the generation, preventing deadlocks without requiring manual abort.
 
-4. **Condition latch** (`_sync.py:539-744`):
+5. **Condition latch** (`_sync.py:539-744`):
    `notify()` does not require the lock, avoiding the notifier-blocks-while-
    sleeper-sleeps deadlock. Sticky `asyncio.Event` + register-before-release
    closes the lost-notification window.
 
-5. **Work-stealing with the `num_polling` gate** (`lib.rs:320-330`):
+6. **Work-stealing with the `num_polling` gate** (`src/pool.rs:170-200`):
    A soft atomic gate (`num_polling < max(num_workers/2, 1)`) limits
    concurrent global-queue pollers. The gate is momentary (acquired per
    `pop_work` call, released immediately via `PollerGuard`), so any worker can
    win it — no hard role assignments that drift with load.
 
-6. **Rust global queue and batch pull with 3-source drain** (`lib.rs:308-384`):
+7. **Rust global queue and batch pull with 3-source drain** (`src/pool.rs:160-230`):
    Three-tier consumption: private buffer → global batch pull → local channel.
    The push side falls back from local to global when a per-worker channel is
    full, preserving liveness. Drain phase validates all three sources (global queue,
+   private buffer, local channel) are completely empty before worker loop termination.
    private buffer, local channel) are completely empty before worker loop termination.
 
 ---
@@ -338,8 +359,8 @@ make lint             # ruff + mypy + pyright + cargo clippy + cargo fmt --check
 
 # Individual:
 uv run ruff check .
-uv run mypy --strict src/gsyncio
-uv run pyright src/gsyncio
+uv run mypy --strict src/multiloop
+uv run pyright src/multiloop
 cargo clippy -- -D warnings
 cargo fmt --check
 ```

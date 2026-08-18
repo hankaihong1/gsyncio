@@ -1,5 +1,5 @@
 name: Bug Report
-description: Report a bug in gsyncio
+description: Report a bug in multiloop
 labels: ["bug"]
 body:
   - type: textarea
@@ -18,7 +18,7 @@ body:
       description: Steps to reproduce the behavior. Include a minimal code example if possible.
       placeholder: |
         ```python
-        import gsyncio
+        import multiloop
 
         # minimal reproduction snippet
         ```
@@ -43,8 +43,8 @@ body:
       value: |
         - OS: [e.g. macOS 15, Ubuntu 24.04]
         - Python version: [e.g. 3.14.0t]
-        - gsyncio version: [e.g. 0.1.0]
-        - Rust toolchain: [e.g. nightly-2025-06-01]
+        - multiloop version: [e.g. 0.1.0]
+        - Rust toolchain: [e.g. stable]
       render: markdown
     validations:
       required: true

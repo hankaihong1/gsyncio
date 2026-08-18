@@ -24,7 +24,7 @@ See CONTRIBUTING.md -> "Pre-submission checklist" for details.
 
 - [ ] Tests pass (`uv run pytest -x -m "not slow"`)
 - [ ] Lint passes (`uv run ruff check .`)
-- [ ] Type check passes (`uv run mypy --strict src/gsyncio`)
+- [ ] Type check passes (`uv run mypy --strict src/multiloop`)
 - [ ] Rust clippy passes (`cargo clippy -- -D warnings`)
 - [ ] Rust fmt (`cargo fmt --check`)
 - [ ] CHANGELOG updated (if applicable)

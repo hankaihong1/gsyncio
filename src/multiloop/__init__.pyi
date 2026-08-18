@@ -1,4 +1,4 @@
-"""Type stubs for gsyncio package."""
+"""Type stubs for multiloop package."""
 
 import asyncio
 import enum
@@ -7,9 +7,9 @@ import types
 from collections.abc import AsyncGenerator, AsyncIterator, Callable
 from typing import Any, Self
 
-from gsyncio.exceptions import (
+from multiloop.exceptions import (
     ChannelClosedError,
-    GsyncioError,
+    MultiloopError,
     ThreadPoolClosedError,
     TimeoutError,
     WouldBlock,
@@ -24,15 +24,16 @@ __all__ = [
     "BarrierWaitResult",
     "CancelScope",
     "CapacityLimiter",
+    "Channel",
     "ChannelClosedError",
     "Condition",
     "ConnectionPinningServer",
     "Event",
     "EventLoopThreadPool",
-    "FastChannel",
-    "GsyncioASGIWorker",
-    "GsyncioError",
     "Lock",
+    "MultiloopASGIWorker",
+    "MultiloopError",
+    "MultiloopWSGIWorker",
     "PoolOptions",
     "Semaphore",
     "TaskGroup",
@@ -128,9 +129,9 @@ class EventLoopThreadPool:
         **kwargs: Any,
     ) -> asyncio.Future[Any]: ...
 
-# -- FastChannel ----------------------------------------------------------
+# -- Channel --------------------------------------------------------------
 
-class FastChannel:
+class Channel:
     def __init__(self, maxsize: int = 0) -> None: ...
     def close(self) -> None: ...
     @property
@@ -140,6 +141,7 @@ class FastChannel:
     def empty(self) -> bool: ...
     def full(self) -> bool: ...
     async def send(self, item: Any) -> None: ...
+    def send_sync(self, item: Any, timeout: float | None = None) -> None: ...
     async def recv(self, timeout: float | None = None) -> Any: ...
     def try_send(self, item: Any) -> bool: ...
     def try_recv(self) -> Any: ...
@@ -231,9 +233,38 @@ class ConnectionPinningServer:
         exc_tb: types.TracebackType | None,
     ) -> None: ...
 
-# -- GsyncASGIWorker ------------------------------------------------------
+# -- MultiloopASGIWorker --------------------------------------------------
 
-class GsyncioASGIWorker:
+class MultiloopASGIWorker:
+    app: Callable[..., Any]
+    pool: EventLoopThreadPool
+    host: str
+    port: int
+    lifespan: str
+
+    def __init__(
+        self,
+        app: Callable[..., Any],
+        pool: EventLoopThreadPool,
+        host: str = "127.0.0.1",
+        port: int = 0,
+        lifespan: str = "auto",
+    ) -> None: ...
+    @property
+    def is_running(self) -> bool: ...
+    async def start(self) -> None: ...
+    async def close(self) -> None: ...
+    async def __aenter__(self) -> Self: ...
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: types.TracebackType | None,
+    ) -> None: ...
+
+# -- MultiloopWSGIWorker --------------------------------------------------
+
+class MultiloopWSGIWorker:
     app: Callable[..., Any]
     pool: EventLoopThreadPool
     host: str

@@ -6,12 +6,12 @@ Run: uv run python examples/04_sync_primitives.py
 
 import asyncio
 
-import gsyncio
+import multiloop
 
 
 async def main() -> None:
     # 1. Lock: mutual exclusion (FIFO-fair, safe across event loops/threads)
-    lock = gsyncio.Lock()
+    lock = multiloop.Lock()
     shared = 0
 
     async def increment() -> None:
@@ -25,7 +25,7 @@ async def main() -> None:
     print("shared under Lock =", shared)  # 10 (would be < 10 without the lock)
 
     # 2. Semaphore: caps concurrency (at most 2 tasks run here simultaneously)
-    sem = gsyncio.Semaphore(2)
+    sem = multiloop.Semaphore(2)
     running = 0
     peak = 0
 
@@ -41,7 +41,7 @@ async def main() -> None:
     print("Semaphore peak concurrency =", peak)  # 2
 
     # 3. Event: one-shot broadcast (sticky — once set, never cleared)
-    event = gsyncio.Event()
+    event = multiloop.Event()
 
     async def waiter(name: str) -> None:
         await event.wait()
@@ -54,7 +54,7 @@ async def main() -> None:
 
     # 4. Condition: wait on a predicate (wait() releases the lock, notify()
     #    does not require holding it)
-    cond = gsyncio.Condition()
+    cond = multiloop.Condition()
     data: list[int] = []
 
     async def consumer() -> None:
@@ -72,7 +72,7 @@ async def main() -> None:
 
     # 5. Barrier: N parties must arrive before all pass together (auto-reset
     #    every round)
-    barrier = gsyncio.Barrier(3)
+    barrier = multiloop.Barrier(3)
 
     async def party(name: str) -> None:
         result = await barrier.wait()

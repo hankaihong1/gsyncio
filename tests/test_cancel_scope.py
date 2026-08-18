@@ -3,7 +3,7 @@ import threading
 
 import pytest
 
-from gsyncio import (
+from multiloop import (
     AsyncContext,
     CancelScope,
     EventLoopThreadPool,
@@ -15,7 +15,7 @@ from gsyncio import (
     move_on_after,
     move_on_at,
 )
-from gsyncio.testing import wait_all_tasks_blocked
+from multiloop.testing import wait_all_tasks_blocked
 
 
 @pytest.mark.asyncio
@@ -59,7 +59,7 @@ async def test_nested_respects_parent() -> None:
 
 @pytest.mark.asyncio
 async def test_fail_after_timeout() -> None:
-    """fail_after(0.001) raises TimeoutError (gsyncio.TimeoutError)."""
+    """fail_after(0.001) raises TimeoutError (multiloop.TimeoutError)."""
     # Bind the scope BEFORE the with: on a slow loop the 1ms deadline can
     # expire between creation and entry, and __aenter__ then raises
     # TimeoutError directly — `as scope` would never bind (UnboundLocalError
@@ -331,11 +331,7 @@ async def test_async_context_cross_thread_cancellation():
 @pytest.mark.asyncio
 async def test_async_context_cancel_survives_dead_loop() -> None:
     """A dead loop in the cancel() cascade must be skipped, not abort the
-    whole cascade (R5 FIX-E completion).
-
-    Pre-fix: context.py's futures loop had no per-call RuntimeError guard,
-    so one dead loop made cancel() raise RuntimeError and later futures were
-    never cancelled.
+    whole cascade.
     """
     ctx = AsyncContext()
     loop = asyncio.get_running_loop()
@@ -367,14 +363,14 @@ async def test_async_context_cancel_survives_dead_loop() -> None:
 
 
 # ---------------------------------------------------------------------------
-# FIX-1 regression tests (BUG-1/5: cancellation-count leaks & swallowed
+# Regression tests
 # external cancels) — 2026-08-10 audit
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_timeout_leaves_cancelling_zero() -> None:
-    """BUG-1: fail_after/move_on_after timeouts must not leak cancelling() counts.
+    """fail_after/move_on_after timeouts must not leak cancelling() counts.
 
     A leaked count surfaces as a spurious CancelledError on the next await
     (or worse, gets consumed by TaskGroup._wait_children's uncancel()).
@@ -400,8 +396,8 @@ async def test_timeout_leaves_cancelling_zero() -> None:
 
 @pytest.mark.asyncio
 async def test_timeout_then_taskgroup_no_spurious_cancel() -> None:
-    """BUG-1: timeout leak consumed by TaskGroup must not cancel the next await."""
-    from gsyncio import TaskGroup
+    """timeout leak consumed by TaskGroup must not cancel the next await."""
+    from multiloop import TaskGroup
 
     task = asyncio.current_task()
     assert task is not None
@@ -427,7 +423,7 @@ async def test_timeout_then_taskgroup_no_spurious_cancel() -> None:
 
 @pytest.mark.asyncio
 async def test_move_on_after_does_not_swallow_external_cancel() -> None:
-    """BUG-5: move_on_after must absorb only its own deadline cancel."""
+    """move_on_after must absorb only its own deadline cancel."""
 
     async def worker() -> None:
         async with move_on_after(5.0):
@@ -475,17 +471,17 @@ async def test_cancel_scope_cannot_share_across_tasks() -> None:
 
 
 # ============================================================================
-# R1 FIX-2 / R3 FIX-18 regression tests — aenter rollback + deadline edges
+# Regression tests
 # ============================================================================
 
 
 @pytest.mark.asyncio
 async def test_aenter_raise_does_not_leak_stack() -> None:
-    """R1-FIX-2: entering a scope under a cancelled ancestor raises, but must
+    """entering a scope under a cancelled ancestor raises, but must
     not leave a stale scope on the task-local stack, a live deadline timer,
     or a retained _task binding (__aexit__ is never called on aenter raise).
     """
-    from gsyncio._cancel import _get_scope_stack
+    from multiloop._cancel import _get_scope_stack
 
     outer = CancelScope()
     await outer.__aenter__()
@@ -506,7 +502,7 @@ async def test_aenter_raise_does_not_leak_stack() -> None:
 
 @pytest.mark.asyncio
 async def test_fail_after_zero_raises_timeout() -> None:
-    """R3-FIX-18: fail_after(0) raises TimeoutError and leaks no cancel count
+    """fail_after(0) raises TimeoutError and leaks no cancel count
     (previously: bare CancelledError + task.cancelling() == 1).
     """
     task = asyncio.current_task()
@@ -519,7 +515,7 @@ async def test_fail_after_zero_raises_timeout() -> None:
 
 @pytest.mark.asyncio
 async def test_move_on_zero_silent_with_await() -> None:
-    """R3-FIX-18: move_on_after(0) is silent; the body's first await is
+    """move_on_after(0) is silent; the body's first await is
     cancelled and the injected count is undone on exit.
     """
     task = asyncio.current_task()
@@ -535,7 +531,7 @@ async def test_move_on_zero_silent_with_await() -> None:
 
 @pytest.mark.asyncio
 async def test_move_on_zero_silent_no_await() -> None:
-    """R3-FIX-18: move_on_after(0) with an await-free body completes cleanly —
+    """move_on_after(0) with an await-free body completes cleanly —
     the __aexit__ compensation uncancels the injection that was never delivered.
     """
     task = asyncio.current_task()
@@ -548,9 +544,9 @@ async def test_move_on_zero_silent_no_await() -> None:
 
 @pytest.mark.asyncio
 async def test_deadline_nan_rejected() -> None:
-    """R3-FIX-18: NaN deadlines raise ValueError at construction — previously
+    """NaN deadlines raise ValueError at construction — previously
     call_later(NaN) corrupted the loop's selector timeout and crashed it with
-    TypeError (probe R3-F).
+    TypeError.
     """
     with pytest.raises(ValueError):
         CancelScope(deadline=float("nan"))
@@ -565,11 +561,10 @@ async def test_deadline_nan_rejected() -> None:
 
 @pytest.mark.asyncio
 async def test_no_scope_poisoning_after_expiry() -> None:
-    """R1-FIX-2/R3-FIX-18: after an expired-deadline entry (or a cancelled-
-    ancestor entry), the same task can still enter fresh scopes and TaskGroups
-    (probe R2 chain: the leaked scope poisoned every later __aenter__).
+    """/after an expired-deadline entry (or a cancelled-
+    ancestor entry), the same task can still enter fresh scopes and TaskGroups.
     """
-    from gsyncio import TaskGroup
+    from multiloop import TaskGroup
 
     async def noop() -> None:
         pass
@@ -730,7 +725,7 @@ async def test_plain_scope_caught_cancel_leaves_zero_count() -> None:
 @pytest.mark.asyncio
 async def test_leaked_count_not_amplified_by_shield() -> None:
     """R7-A real damage: a leaked count must not be snapshotted by a shield
-    and re-injected (probe R7-A2).
+    and re-injected.
 
     Pre-fix: the residual count was snapshotted by the shield's __aenter__ as
     a "real cancellation"; on exit _restore_saved_cancel_count re-injected
@@ -759,7 +754,7 @@ async def test_checkpoint_consumes_pending_cancel() -> None:
     Pre-fix: with the injection pending (sync code section, _must_cancel
     undelivered), checkpoint()'s user-level raise did not decrement
     cancelling(); the next real future await delivered a second
-    CancelledError (probe R7-B: DOUBLE-DELIVERY).
+    CancelledError.
     """
     task = asyncio.current_task()
     assert task is not None
@@ -821,7 +816,7 @@ def test_cancel_ledger_requires_actual_injection() -> None:
     an external cancellation that landed in between."""
     # Local import: the test touches private members, so it needs the
     # implementation module (the package stub only exposes the public API).
-    from gsyncio._cancel import CancelScope
+    from multiloop._cancel import CancelScope
 
     async def main() -> None:
         scope = CancelScope()

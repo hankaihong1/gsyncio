@@ -1,4 +1,4 @@
-# gsyncio 并发正确性指南（Concurrency Correctness Guide）
+# multiloop 并发正确性指南（Concurrency Correctness Guide）
 **[English](CONCURRENCY.md)**
 
 
@@ -10,30 +10,30 @@
 
 ## 1. 并发模型总览（谁锁什么、谁等什么）
 
-gsyncio 的同步原语遵循同一个骨架：**Python 侧一把 `threading.Lock` 保护
+multiloop 的同步原语遵循同一个骨架：**Python 侧一把 `threading.Lock` 保护
 waiter 结构，Rust 侧用原子操作 + flume 承载数据面**。跨线程唤醒一律走
 `loop.call_soon_threadsafe(...)`，绝不跨线程直接触碰 asyncio 对象。
 
 ### 1.0 并发物理假设公理体系（Physical Concurrency Axioms）
 
-gsyncio 借用了 AnyIO 和 Trio 的顶层 API 命名与人体工程学接口，但在底层**彻底脱离其单线程无竞争假设**。在单线程协作式运行时（AnyIO/Trio）中，协程在 `await` 之间的执行是绝对串行非抢占的，容器操作无需 OS 锁，原语仅作为协作式并发量节流阀。
+multiloop 借用了 AnyIO 和 Trio 的顶层 API 命名与人体工程学接口，但在底层**彻底脱离其单线程无竞争假设**。在单线程协作式运行时（AnyIO/Trio）中，协程在 `await` 之间的执行是绝对串行非抢占的，容器操作无需 OS 锁，原语仅作为协作式并发量节流阀。
 
-与之相反，gsyncio 运行在 **Python 3.14t（自由线程 / 无 GIL）多核物理真并行**之上的多 OS 线程与独立事件循环中。并发正确性不能依赖单线程直觉，必须建立在以下七项严密的形式化物理假设与公理之上：
+与之相反，multiloop 运行在 **Python 3.14t（自由线程 / 无 GIL）多核物理真并行**之上的多 OS 线程与独立事件循环中。并发正确性不能依赖单线程直觉，必须建立在以下七项严密的形式化物理假设与公理之上：
 
 0. **与 AnyIO/Trio 的范式分水岭（API 借用 vs 多线程物理公理）**：AnyIO/Trio API（`TaskGroup`、`CancelScope`、`CapacityLimiter`、`Event` 等）仅作为人体工程学调用界面被借用。所有底层语义完全基于多线程/多 Loop 物理模型重新设计，严格依赖状态机代数闭包、代币守恒律与 OS 互斥锁同步。
 1. **Python 3.14t 自由线程（无 GIL）真并行假设**：字节码与对象读写在多核 CPU 上真并行执行，无全局解释器锁保护。任何涉及复合状态的操作（如计数器增减 + 等待者队列出入队）必须收敛在单一 OS 互斥锁（`threading.Lock` / `parking_lot::Mutex`）临界区内，杜绝复合锁竞争撕裂。
-2. **跨线程 EventLoop 物理隔离公理**：`asyncio.Task`、`Future` 与 `Event` 严格物理绑定于单一 OS 线程及其 EventLoop。跨线程通信与唤醒绝对只能通过 `loop.call_soon_threadsafe(...)` 或 Rust `FastChannel` 派发。
+2. **跨线程 EventLoop 物理隔离公理**：`asyncio.Task`、`Future` 与 `Event` 严格物理绑定于单一 OS 线程及其 EventLoop。跨线程通信与唤醒绝对只能通过 `loop.call_soon_threadsafe(...)` 或 Rust `Channel` 派发。
 3. **ContextVar 线程/任务局部性公理**：`contextvars.ContextVar` 严格归属于当前 OS 线程与当前 Task。跨线程取消（`scope.cancel()`）严禁跨线程读取 ContextVar 栈，仅依赖线程互斥锁与 `call_soon_threadsafe`。
 4. **asyncio 原生取消与单账本对称记账公理**：完全基于 Python 3.11+/3.14t 原生 `task.cancelling()` 与 `task.uncancel()` 机制。Scope 仅对其显式注入的取消（`_injected == True`）执行对称的 `task.uncancel()` 冲销，绝不误吞外部第三方取消。Shield 严格采用快照-恢复（Snapshot-and-Restore）模型。
 5. **数据面与等待面物理分离公理**：数据流由 Rust 核心无锁承载（`flume` + 64 字节对齐原子计数器），异步等待队列由 Python `threading.Lock` 保护并执行双检锁协议。
-6. **结构化并发物理作用域公理**：`TaskGroup` 物理限定于单个 `asyncio.AbstractEventLoop` 内部。跨 Loop、跨线程并发由 `EventLoopThreadPool`、`FastChannel` 与 `AsyncContext` 协同编排。
+6. **结构化并发物理作用域公理**：`TaskGroup` 物理限定于单个 `asyncio.AbstractEventLoop` 内部。跨 Loop、跨线程并发由 `EventLoopThreadPool`、`Channel` 与 `AsyncContext` 协同编排。
 
-### 1.1 通道类（FastChannel / AsyncChannel）
+### 1.1 通道类（Channel）
 
 | 组件 | 锁/原语 | waiter 结构 | 关键不变量 |
 |---|---|---|---|
-| Rust `FastChannel` | flume channel（有界/无界）+ `AtomicBool is_closed` | 无 | `try_send` 返回 `false` 仅表示满；**关闭后先排空再报错**——与 `close()` 竞争的 send 可能仍短暂入队（flume 侧惰性关闭），因此"已关闭"通道可能先短暂接收再排空，之后所有操作才报错（`src/lib.rs:387-418`；R4 决议：比 Go 的关闭后 send panic 更宽容） |
-| Python `_BaseChannel` | `threading.Lock`（`_lock`） | `_getters` / `_putters` 两个 `deque[(loop, future)]` | waiter 注册与唤醒必须在 `_lock` 下完成（`src/gsyncio/_channel_base.py:75-78`） |
+| Rust `Channel` | flume channel（有界/无界）+ `AtomicBool is_closed` | 无 | `try_send` 返回 `false` 仅表示满；**关闭后先排空再报错**——与 `close()` 竞争的 send 可能仍短暂入队（flume 侧惰性关闭），因此"已关闭"通道可能先短暂接收再排空，之后所有操作才报错（`src/lib.rs:387-418`；R4 决议：比 Go 的关闭后 send panic 更宽容） |
+| Python `_BaseChannel` | `threading.Lock`（`_lock`） | `_getters` / `_putters` 两个 `deque[(loop, future)]` | waiter 注册与唤醒必须在 `_lock` 下完成（`src/multiloop/_channel_base.py:75-78`） |
 | 唤醒协议 | — | — | `_wake_all` 从 deque **左侧消费式**唤醒：唤醒一个就弹出，stale future 自然丢弃（`_channel_base.py:29-50`） |
 
 **数据面与等待面分离**：flume 管数据（无锁），Python 锁只管"谁在等"。
@@ -53,7 +53,7 @@ gsyncio 借用了 AnyIO 和 Trio 的顶层 API 命名与人体工程学接口，
 | 原语 | 保护锁 | waiter 结构 | 关键不变量 |
 |---|---|---|---|
 | `Event` | `threading.Lock` | `list[(loop, asyncio.Event)]` | **sticky**（trio 语义，无 clear）；`set()` 锁内换出列表、锁外逐个 `call_soon_threadsafe`（`_sync.py:385-398`） |
-| `Condition` | `_waiters_lock`（waiter 队列）+ 底层 `Lock` | `deque[(loop, asyncio.Event)]` | `notify()` **不需要**持底层锁（`_sync.py:507-522`）；`wait()` 释放锁 → 等通知 → **shield 下重获取锁**（`_sync.py:472-505`） |
+| `Condition` | `_waiters_lock`（waiter 队列）+ 底层 `Lock` | `deque[(loop, asyncio.Event)]` | `notify()` **不需要**持底层锁（`_sync.py:507-522`）；`wait()` 释放锁 → 等通知 → **shield 下重获锁且取消时自动转发通知**（`_sync.py:624-646`） |
 
 ### 1.4 屏障与组同步
 
@@ -97,7 +97,7 @@ future 时数据已经被取走，future 永远没人 resolve → 挂死。
 `_wakeup_next` 都在 `_lock` 下完成。
 **例证**：`_wait_and_send`（`_channel_base.py:136-177`）、`_recv_impl`
 （`primitives.py:165-197`）——这就是 AGENTS.md 六项决策里的 "Double-check
-lock in FastChannel"。
+lock in Channel"。
 
 ### 模式 3：取消路径的锁重获取（shield 缺失 → 死锁）
 
@@ -132,9 +132,9 @@ generation 再决定是否删除。
 
 **Barrier Broken 注**：generation 守卫保护的是*下一轮*条目，且当轮次凑齐前有 party 被取消时，屏障自动转移至 Broken 状态并唤醒当前轮次所有等待者抛出异常，从根源杜绝死锁。
 
-**已知限制（FIX-15）**：`Barrier`/`Condition`/`Semaphore` 取消处理里的
+**已知限制**：`Barrier`/`Condition`/`Semaphore` 取消处理里的
 删除是每个 waiter O(n)（重建列表/dict），N 个 waiter 的取消风暴总成本
-O(n²)——实测 5000 waiter ≈ 560 ms（R2 探针 E2）。真实 party 数量级下可
+O(n²)——实测 5000 waiter ≈ 560 ms。真实 party 数量级下可
 接受；记录在案，防止后人"优化"成 wrong-round bug。
 
 ### 模式 6：注册-完成竞态（register-after-done）
@@ -154,7 +154,7 @@ O(n²)——实测 5000 waiter ≈ 560 ms（R2 探针 E2）。真实 party 数�
 **根因**：asyncio 对象不是线程安全的；`call_soon_threadsafe` 是唯一安全
 的跨线程注入通道。
 **正确姿势**：跨线程一律 `loop.call_soon_threadsafe(fut.set_result, ...)`
-或 `call_soon_threadsafe(event.set)`；线程间通信用 `FastChannel`，不要
+或 `call_soon_threadsafe(event.set)`；线程间通信用 `Channel`，不要
 直接传 asyncio 原语。
 **例证**：`_wake_all`（`_channel_base.py:41-48`）、`Event.set`
 （`_sync.py:397-398`）、`Lock.release`（`_sync.py:96`）。
@@ -208,21 +208,21 @@ while True:
 ```
 - **正确姿势**：若需要就绪通道间的统计学公平调度，在循环轮询前打乱（shuffle）通道列表。
 
-**3. `Barrier` 单方超时取消未调用 `abort()`**：
-- **陷阱**：`Barrier` 在单方取消时不自动进入 broken 破损状态（FIX-12）。若某一参与方超时离开，其余 `parties - 1` 个参与方将永久阻塞。
+**3. `Barrier` 单方超时与自动破损状态机**：
+- **陷阱**：当某个等待方被取消或超时退出时，`Barrier` 会自动进入 Broken 破损状态并唤醒当前轮次的所有其他等待方抛出 `RuntimeError`。在此之后，后续的 `wait()` 会持续抛出异常，直到显式调用 `barrier.reset()`。
 - **错误示例**：
 ```python
 try:
     await asyncio.wait_for(barrier.wait(), timeout=1.0)
 except TimeoutError:
-    pass  # 其余参与方永久挂死!
+    pass  # 屏障已破损；后续 wait() 调用将直接失败!
 ```
 - **正确姿势**：
 ```python
 try:
     await asyncio.wait_for(barrier.wait(), timeout=1.0)
 except TimeoutError:
-    barrier.abort()
+    barrier.reset()  # 重置屏障代际以允许后续轮次继续运行
     raise
 ```
 
@@ -254,8 +254,8 @@ if limiter.available_tokens > 0:  # 例如 0.5 > 0
       原子？取消/失败时令牌是否转发或归还（不丢失、不凭空多出）？
 - [ ] Rust 侧改动是否触碰 **poller 计数、batch pull 或原子操作**？→ 见
       第 4 节：RAII guard 是否保住计数？内存序是否够用？
-- [ ] 新行为是否用 `pytest-repeat --count=50` 压测（不能只跑单次）？测试
-      是否加 `@pytest.mark.free_threading`（3.14t 专用压测）？
+- [ ] 新行为是否针对**目标测试文件/函数**用 `pytest-repeat --count=50` 压测
+      （禁止全量套件盲目多倍压测）？测试是否加 `@pytest.mark.free_threading`（3.14t 专用压测）？
 - [ ] 发现 bug 时：是否先写了**最小复现测试**（确定性数据、稳定 FAIL）
       才开始修？（见第 5 节强制流程）
 
@@ -268,7 +268,7 @@ if limiter.available_tokens > 0:  # 例如 0.5 > 0
 | 组件 | 线程边界 | 注意 |
 |---|---|---|
 | `NativeWorkerPool` | 任意线程可 `push_global`/`push_local`；`pop_work` 仅 worker 线程 | 关池先丢 sender 再置 flag（`lib.rs:219-225`） |
-| `FastChannel` | 任意线程可 send/recv | flume 本身无锁；`is_closed` 是 flag store/load（Release/Acquire） |
+| `Channel` | 任意线程可 send/recv | flume 本身无锁；`is_closed` 是 flag store/load（Release/Acquire） |
 | `RawAsyncWaitGroup` | 任意线程可 add/done/register | 计数 AcqRel；waiter 列表 parking_lot Mutex |
 
 ### 4.2 软 poller 门（`num_polling`）

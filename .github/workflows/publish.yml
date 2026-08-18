@@ -209,11 +209,11 @@ jobs:
       # 只从 dist 装、不碰 PyPI；pip 自动选匹配本机 arch/python 的 wheel，
       # 某平台缺对应 wheel 时此步失败 → 缺口在上传前暴露。
       - name: Install wheel (no index)
-        run: uv pip install gsyncio --no-index --no-deps --find-links dist --force-reinstall
+        run: uv pip install multiloop --no-index --no-deps --find-links dist --force-reinstall
 
       # 冒烟：直接 import 扩展模块，跨编译/容器构建的坏产物在此暴露。
       - name: Smoke test (extension import)
-        run: uv run python -c "import gsyncio._gsyncio_core as m; import gsyncio; assert gsyncio.__version__; print('ok:', m.__file__)"
+        run: uv run python -c "import multiloop._multiloop_core as m; import multiloop; assert multiloop.__version__; print('ok:', m.__file__)"
 
       # 完整测试套件跑在 wheel 上（addopts 自带 not slow）。
       # free_threading 测试不再排除：CancelScope / CapacityLimiter 的并发

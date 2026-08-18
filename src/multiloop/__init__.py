@@ -1,20 +1,20 @@
-"""gsyncio: Multi-event-loop engine & concurrency toolkit for Python 3.14t.
+"""multiloop: Multi-event-loop engine & concurrency toolkit for Python 3.14t.
 
 A high-performance, Go-like concurrency library for free-threaded Python,
 built around a Rust core. Key capabilities:
 
 - EventLoopThreadPool with round-robin scheduling and work stealing
-- FastChannel and select_channel for Go-style communication
+- Channel and select_channel for Go-style communication
 - CancelScope and TaskGroup for structured concurrency
 - AsyncContext, AsyncWaitGroup, AsyncOnce, AsyncRWMutex primitives
-- ASGI worker (GsyncioASGIWorker) for FastAPI-style servers
+- ASGI worker (MultiloopASGIWorker) for FastAPI-style servers
 
-Docs: https://github.com/hankaihong1/gsyncio (docs/API.md, docs/sphinx_html/).
+Docs: https://github.com/hankaihong1/multiloop (docs/API.md, docs/sphinx_html/).
 """
 
 from typing import Any
 
-from gsyncio._cancel import (
+from multiloop._cancel import (
     CancelScope,
     checkpoint,
     current_effective_deadline,
@@ -23,8 +23,8 @@ from gsyncio._cancel import (
     move_on_after,
     move_on_at,
 )
-from gsyncio._logging import get_logger, set_log_level
-from gsyncio._sync import (
+from multiloop._logging import get_logger, set_log_level
+from multiloop._sync import (
     Barrier,
     BarrierWaitResult,
     CapacityLimiter,
@@ -33,35 +33,43 @@ from gsyncio._sync import (
     Lock,
     Semaphore,
 )
-from gsyncio._taskgroup import TaskGroup, TaskHandle, TaskStatus
-from gsyncio.asgi import GsyncioASGIWorker
-from gsyncio.context import AsyncContext
-from gsyncio.exceptions import (
+from multiloop._taskgroup import TaskGroup, TaskHandle, TaskStatus
+from multiloop.asgi import MultiloopASGIWorker
+from multiloop.context import AsyncContext
+from multiloop.exceptions import (
     ChannelClosedError,
-    GsyncioError,
+    MultiloopError,
     ThreadPoolClosedError,
     TimeoutError,
     WouldBlock,
 )
-from gsyncio.pool import (
+from multiloop.pool import (
     EventLoopThreadPool,
     PoolOptions,
     create_pool,
 )
-from gsyncio.primitives import (
+from multiloop.primitives import (
     AsyncOnce,
     AsyncWaitGroup,
-    FastChannel,
+    Channel,
     select_channel,
 )
-from gsyncio.rwlock import AsyncRWMutex
-from gsyncio.server import ConnectionPinningServer
+from multiloop.rwlock import AsyncRWMutex
+from multiloop.server import ConnectionPinningServer
+from multiloop.wsgi import MultiloopWSGIWorker
 
-__version__ = "0.1.6"
+__version__ = "0.1.0"
 
 
 async def run_in_pool(coro: Any, *args: Any, num_threads: int = 0, **kwargs: Any) -> Any:
-    """Run a coroutine in a freshly-created pool (one-shot convenience)."""
+    """Run a coroutine in a freshly-created pool (one-shot convenience).
+
+    :param coro: Coroutine function or coroutine object to run.
+    :param num_threads: Worker thread count (0 for auto-detection).
+    :param args: Positional arguments for ``coro``.
+    :param kwargs: Keyword arguments for ``coro``.
+    :returns: Result returned by ``coro``.
+    """
     pool = EventLoopThreadPool(num_threads=num_threads)
     await pool.start()
     try:
@@ -80,15 +88,16 @@ __all__ = [
     "BarrierWaitResult",
     "CancelScope",
     "CapacityLimiter",
+    "Channel",
     "ChannelClosedError",
     "Condition",
     "ConnectionPinningServer",
     "Event",
     "EventLoopThreadPool",
-    "FastChannel",
-    "GsyncioASGIWorker",
-    "GsyncioError",
     "Lock",
+    "MultiloopASGIWorker",
+    "MultiloopError",
+    "MultiloopWSGIWorker",
     "PoolOptions",
     "Semaphore",
     "TaskGroup",

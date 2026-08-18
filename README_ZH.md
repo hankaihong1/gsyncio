@@ -1,6 +1,6 @@
-# gsyncio：多事件循环引擎与 Golang 级并发工具包（Python 3.14t）
+# multiloop：多事件循环引擎与 Golang 级并发工具包（Python 3.14t）
 
-[![CI](https://img.shields.io/github/actions/workflow/status/hankaihong1/gsyncio/ci.yml)](https://github.com/hankaihong1/gsyncio/actions/workflows/ci.yml)
+[![CI](https://img.shields.io/github/actions/workflow/status/hankaihong1/multiloop/ci.yml)](https://github.com/hankaihong1/multiloop/actions/workflows/ci.yml)
 [![Python 3.14](https://img.shields.io/badge/Python-3.14-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -23,7 +23,7 @@
 
 ## 简介 (Introduction)
 
-`gsyncio` 是专为 **Python 3.14t (Free-Threaded / 无 GIL)** 打造的高性能多
+`multiloop` 是专为 **Python 3.14t (Free-Threaded / 无 GIL)** 打造的高性能多
 事件循环线程池框架与 Golang 级并发原语工具包。采用类似 **`asyncssh`** 的
 顶级 API 设计，既支持零配置顶层函数访问，也支持显式线程池管理。
 
@@ -34,18 +34,18 @@
 ### 环境要求 (Prerequisites)
 
 - **Python 3.14+**：需要 Free-Threaded（无 GIL）构建，如 `3.14t`。
-- **Rust stable 工具链**：用于从源码构建 `_gsyncio_core` C 扩展。
+- **Rust stable 工具链**：用于从源码构建 `_multiloop_core` C 扩展。
 
 ### 通过 pip 安装
 
 ```bash
-pip install gsyncio
+pip install multiloop
 ```
 
 ### 通过 uv 安装
 
 ```bash
-uv add gsyncio
+uv add multiloop
 ```
 
 ### 从源码构建
@@ -67,19 +67,19 @@ maturin develop --release
 graph TD
     UserApp[User Application / FastAPI / ASGI 3.0] -->|pool.submit| Scheduler[Round-Robin Scheduler]
     
-    subgraph gsyncio Core Engine
+    subgraph multiloop Core Engine
         Scheduler -->|Round-Robin Notify| W1[Worker Loop Thread 1]
         Scheduler -->|Round-Robin Notify| W2[Worker Loop Thread 2]
         Scheduler -->|Round-Robin Notify| W3[Worker Loop Thread 3]
         
-        W1 <-->|Atomic Metrics| RustCore[Rust C-Extension _gsyncio_core]
+        W1 <-->|Atomic Metrics| RustCore[Rust C-Extension _multiloop_core]
         W2 <-->|Atomic Metrics| RustCore
         W3 <-->|Atomic Metrics| RustCore
     end
     
     subgraph Golang Concurrency Toolkit
-        RustCore <--> FastChan[FastChannel / flume]
-        FastChan <--> Select[gsyncio.select_channel]
+        RustCore <--> FastChan[Channel / flume]
+        FastChan <--> Select[multiloop.select_channel]
         FastChan <--> Context[AsyncContext]
         RustCore <--> WaitGroup[AsyncWaitGroup]
     end
@@ -94,23 +94,27 @@ graph TD
 - 🎯 **Round-Robin Worker Distribution**：任务推入共享无锁队列，工作线程按
   工作窃取（Work-Stealing）模型拉取执行，唤醒通知以 Round-Robin 方式分发
   到各 Worker Loop。
-- 🦀 **Rust Engine (`_gsyncio_core`)**：底层无锁原语与 C 扩展由 Rust
+- 🦀 **Rust Engine (`_multiloop_core`)**：底层无锁原语与 C 扩展由 Rust
   (PyO3 + `flume` + `parking_lot`) 编写，带来零忙等待 (0% CPU Idle) 与
   极高通道吞吐。
 - 🚀 **`asyncssh`-Style Top-Level API Facade**：提供
-  `gsyncio.select_channel(...)`、`gsyncio.EventLoopThreadPool` 等极简 API，
+  `multiloop.select_channel(...)`、`multiloop.EventLoopThreadPool` 等极简 API，
   可通过 `async with` 上下文管理池生命周期。
 - 🦫 **Golang-Style Concurrency Primitives**：
-  - `FastChannel`（支持 `async for item in ch:` 优雅迭代）
-  - `gsyncio.select_channel(*channels)`（多通道选优复用）
+  - `Channel`（支持 `async for item in ch:` 优雅迭代）
+  - `multiloop.select_channel(*channels)`（多通道选优复用）
   - `AsyncContext`（跨线程级联 Task 取消与超时广播）
   - `AsyncWaitGroup` & `AsyncOnce` & `AsyncRWMutex`（读写分离锁）
+- 🌐 **高性能 Web 引擎支持**：
+  - `MultiloopASGIWorker`：挂载 FastAPI / Starlette / ASGI 3.0，支持 Lifespan 生命周期与 RFC 6455 全双工 WebSocket。
+  - `MultiloopWSGIWorker`：支持同步 Django / Flask (PEP 3333) 在多线程池中运行并通过无锁通道流式传输。
+  - `multiloop run` CLI 命令行服务器支持零宕机热重载。
 
 ---
 
 ## 当前状态与已知限制（Current Status & Known Limits）
 
-**gsyncio 是面向自由线程 CPython（3.14t）的实验性项目。** 其并发核心经过
+**multiloop 是面向自由线程 CPython（3.14t）的实验性项目。** 其并发核心经过
 十轮系统性审计（R6–R10），每轮都以确定性复现测试与压力验证
 （`pytest --count=50`）收尾——[docs/CONCURRENCY.md](docs/CONCURRENCY.md)
 是操作手册。API 处于 0.x 阶段：版本之间可能发生行为调整。若在其上构建，
@@ -118,7 +122,7 @@ graph TD
 
 ### 已验证性能（M1 8GB，Python 3.14t）
 
-| 工作负载 | 单 loop | gsyncio 4-worker | 加速比 |
+| 工作负载 | 单 loop | multiloop 4-worker | 加速比 |
 |---|---|---|---|
 | CPU 密集任务调度（40 × 200 万次运算） | 2.96 s | 0.84 s | **3.5x** |
 | I/O + CPU 混合（400 任务，2 ms sleep + 4 万次运算） | 511 QPS | 1259 QPS | **2.5x** |
@@ -147,7 +151,7 @@ graph TD
 
 ```python
 import asyncio
-import gsyncio
+import multiloop
 
 
 async def heavy_task(x: int):
@@ -157,7 +161,7 @@ async def heavy_task(x: int):
 
 async def main():
     # 使用 async with 自动管理线程池生命周期
-    async with gsyncio.EventLoopThreadPool() as pool:
+    async with multiloop.EventLoopThreadPool() as pool:
         # 提交异步协程任务 (共享队列 + 工作窃取调度)
         fut1 = pool.submit(heavy_task, 21)
 
@@ -174,16 +178,16 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-### 2. Golang 风格 Channel 优雅迭代与 `gsyncio.select_channel`
+### 2. Golang 风格 Channel 优雅迭代与 `multiloop.select_channel`
 
 ```python
 import asyncio
-import gsyncio
+import multiloop
 
 
 async def main():
-    ch1 = gsyncio.FastChannel()
-    ch2 = gsyncio.FastChannel()
+    ch1 = multiloop.Channel()
+    ch2 = multiloop.Channel()
 
     async def producer():
         await ch1.send("Data from Channel 1")
@@ -191,8 +195,8 @@ async def main():
 
     asyncio.create_task(producer())
 
-    # gsyncio.select_channel 等待最先就绪的通道
-    selected_ch, val = await gsyncio.select_channel(ch1, ch2)
+    # multiloop.select_channel 等待最先就绪的通道
+    selected_ch, val = await multiloop.select_channel(ch1, ch2)
     print(f"Received: {val}")
 
 
@@ -204,10 +208,10 @@ if __name__ == "__main__":
 
 ```python
 import asyncio
-import gsyncio
+import multiloop
 
 
-async def worker(name: str, wg: gsyncio.AsyncWaitGroup):
+async def worker(name: str, wg: multiloop.AsyncWaitGroup):
     try:
         await asyncio.sleep(0.02)  # 模拟耗时任务
         print(f"worker {name} done")
@@ -216,10 +220,10 @@ async def worker(name: str, wg: gsyncio.AsyncWaitGroup):
 
 
 async def main():
-    wg = gsyncio.AsyncWaitGroup()
+    wg = multiloop.AsyncWaitGroup()
 
     # 在 4 线程线程池中并发派发 5 个任务
-    async with gsyncio.EventLoopThreadPool(num_threads=4) as pool:
+    async with multiloop.EventLoopThreadPool(num_threads=4) as pool:
         for i in range(5):
             wg.add()  # 计数器 +1
             pool.submit(worker, f"task-{i}", wg)
@@ -237,7 +241,7 @@ if __name__ == "__main__":
 
 ```python
 import asyncio
-import gsyncio
+import multiloop
 
 
 async def fetch(name: str, delay: float):
@@ -248,8 +252,8 @@ async def fetch(name: str, delay: float):
 async def main():
     try:
         # fail_after 为整个结构化并发块设定超时上限 (0.1 秒)
-        async with gsyncio.fail_after(0.1):
-            async with gsyncio.TaskGroup() as tg:
+        async with multiloop.fail_after(0.1):
+            async with multiloop.TaskGroup() as tg:
                 # start_soon 立即派生子任务，返回 TaskHandle
                 h1 = tg.start_soon(fetch, "fast", 0.01)
                 h2 = tg.start_soon(fetch, "slow", 0.5)
@@ -271,15 +275,15 @@ if __name__ == "__main__":
 ## 🎮 在线演示 (Live Demo)
 
 不想写代码就想先玩一玩？
-[gsyncio-fastapi-demo](https://github.com/hankaihong1/gsyncio-fastapi-demo)
-是一个真实运行在 `GsyncioASGIWorker` 上的 FastAPI 应用——刻意不用
+[multiloop-fastapi-demo](https://github.com/hankaihong1/multiloop-fastapi-demo)
+是一个真实运行在 `MultiloopASGIWorker` 上的 FastAPI 应用——刻意不用
 uvicorn。它的页面本身就是一块实时仪表盘：每 2 秒从
 `EventLoopThreadPool.get_metrics()` 拉取真实指标，展示 4 个事件循环线程
 各自处理了多少请求。
 
 ```bash
-git clone https://github.com/hankaihong1/gsyncio-fastapi-demo
-cd gsyncio-fastapi-demo
+git clone https://github.com/hankaihong1/multiloop-fastapi-demo
+cd multiloop-fastapi-demo
 uv sync
 uv run python app.py        # 然后打开 http://127.0.0.1:8000
 ```

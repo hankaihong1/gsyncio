@@ -1,7 +1,7 @@
-"""Cross-event-loop-safe synchronization primitives.
+"""Cross-event-loop safe synchronization primitives for multiloop.
 
-Lock, Event, Semaphore, and CapacityLimiter — all safe for use across
-multiple event-loop threads and external OS threads.
+Includes Lock, Semaphore, CapacityLimiter, Event, Condition, and Barrier — all engineered
+for Python 3.14t multi-core physical parallelism and cross-event-loop thread safety.
 """
 
 from __future__ import annotations
@@ -12,21 +12,30 @@ import threading
 from collections.abc import Callable
 from typing import Any, Self
 
+__all__ = [
+    "Barrier",
+    "BarrierWaitResult",
+    "CapacityLimiter",
+    "Condition",
+    "Event",
+    "Lock",
+    "Semaphore",
+]
+
 # ============================================================================
 # Lock — fair FIFO mutex
 # ============================================================================
 
 
 class Lock:
-    """A fair FIFO mutex that is safe to use across event loops and OS threads.
+    """A fair FIFO mutex that is safe to use across independent event loops and OS threads.
 
-    The lock itself is thread-safe, but release is bound to the *owning
-    task*: the task that acquired the lock must release it (calling
-    :meth:`release` from any other task — or from a thread with no running
-    asyncio task — raises :class:`RuntimeError`).  Unlike
-    :class:`asyncio.Lock`, the same lock may be acquired by tasks living on
-    different event loops, so a hand-off between loops is possible by
-    design — the owner task is the only authority over release (FIX-5).
+    Acquisition and release are bound to the *owning task*: only the task that acquired
+    the lock may release it. Calling :meth:`release` from any other task or non-async context
+    raises :class:`RuntimeError`.
+
+    Unlike standard :class:`asyncio.Lock`, `multiloop.Lock` can be acquired by tasks running
+    on physically different OS threads and distinct event loops.
     """
 
     def __init__(self) -> None:
@@ -38,45 +47,33 @@ class Lock:
 
     @property
     def locked(self) -> bool:
-        """Return ``True`` when the lock is currently held."""
+        """Return True when the lock is currently held."""
         with self._lock:
             return self._owner is not None
 
     @property
     def owner(self) -> asyncio.Task[Any] | None:
-        """Return the owning task, or ``None`` if the lock is free."""
+        """Return the owning asyncio task, or None if free."""
         with self._lock:
             return self._owner
 
     async def acquire(self) -> None:
-        """Acquire the lock, blocking until it becomes available.
+        """Acquire the lock, blocking in strict FIFO order until it becomes available.
 
-        Waiters are served in strict FIFO order.  If the current task
-        is cancelled while waiting, its waiter entry is removed from
-        the queue and a :class:`asyncio.CancelledError` is propagated.
+        If the waiting task is cancelled while blocked, its waiter registration is safely
+        removed and ownership token forwarding is executed if ownership was already transferred.
         """
-        # WHY: on 3.14 current_task() RAISES RuntimeError when no loop is
-        # running instead of returning None — the try/except converts the
-        # bare "no running event loop" into the documented message (R5
-        # FIX-J).
         try:
             task = asyncio.current_task()
         except RuntimeError:
-            raise RuntimeError("acquire() must be called from an asyncio task") from None
-        if task is None:  # defensive narrowing for older interpreters
-            raise RuntimeError("acquire() must be called from an asyncio task")
+            raise RuntimeError("acquire() must be called from an active asyncio task") from None
+        if task is None:
+            raise RuntimeError("acquire() must be called from an active asyncio task")
 
         with self._lock:
-            # WHY: asyncio.Lock rejects same-task re-acquisition up front;
-            # silently queueing would self-deadlock, and a cancelled
-            # re-entrant acquire would hit the ambiguous _owner-is-task check
-            # in the cancel path below, handing the lock to a waiter while
-            # the still-running outer holder believes it owns it (R2 FIX-9).
             if self._owner is task:
                 raise RuntimeError("Lock is not reentrant: already held by the current task")
-            # WHY: The owner task can die without releasing (CancelledError racing
-            # release). We delegate recovery to _release_locked() to pass ownership
-            # to the first queued waiter (preserving FIFO) rather than barging in.
+            # If the previous owner died without release, recover gracefully
             if self._owner is not None and self._owner.done():
                 self._release_locked()
 
@@ -91,33 +88,24 @@ class Lock:
             await event.wait()
         except BaseException:
             with self._lock:
-                # WHY: release() may already have popped this waiter and handed
-                # it ownership (BUG-8).  The lock would then belong to a dead
-                # task and every later FIFO waiter starves.  Forward it to the
-                # next live waiter — the same token-forwarding pattern as
-                # Semaphore._cancel_waiter; a cancelled successor forwards
-                # again via its own cancel handler (chain forwarding).
-                # was_waiter discriminates: only an entry that release() had
-                # already popped (ownership handed to us) must be forwarded —
-                # a task still queued as a waiter is a re-entrant acquire whose
-                # outer holder still legitimately owns the lock (R2 FIX-9).
+                # If release() had already popped our waiter and granted ownership before cancellation,
+                # we must forward the ownership to the next pending waiter to prevent deadlock.
                 was_waiter = self._discard_waiter(event)
                 if self._owner is task and not was_waiter:
                     self._release_locked()
             raise
 
     def release(self) -> None:
-        """Release the lock, handing ownership to the next waiter (if any).
+        """Release the lock, passing ownership to the next queued FIFO waiter.
 
-        :raises RuntimeError: if called by a task that does not own the lock.
+        :raises RuntimeError: If called by a task that does not own the lock.
         """
-        # WHY: same 3.14 current_task() semantics as acquire() (R5 FIX-J).
         try:
             task = asyncio.current_task()
         except RuntimeError:
-            raise RuntimeError("release() must be called from an asyncio task") from None
-        if task is None:  # defensive narrowing for older interpreters
-            raise RuntimeError("release() must be called from an asyncio task")
+            raise RuntimeError("release() must be called from an active asyncio task") from None
+        if task is None:
+            raise RuntimeError("release() must be called from an active asyncio task")
 
         with self._lock:
             if self._owner is not task:
@@ -125,10 +113,7 @@ class Lock:
             self._release_locked()
 
     def _release_locked(self) -> None:
-        """Hand ownership to the next live waiter, or free the lock.
-
-        Caller must hold ``_lock``.
-        """
+        """Hand ownership to the next live waiter, or free the lock (caller must hold ``_lock``)."""
         while self._waiters:
             event, waiter_task = self._waiters.popitem(last=False)
             if waiter_task.done():
@@ -138,10 +123,7 @@ class Lock:
             try:
                 waiter_loop.call_soon_threadsafe(event.set)
             except RuntimeError:
-                # WHY: the waiter's loop was closed (abandoned loop) — it can
-                # never take ownership.  Keep scanning for a live waiter
-                # instead of leaving the lock owned by a dead task, which
-                # would break every later acquire (R5 FIX-E).
+                # Closed loop — continue scanning for next live waiter
                 continue
             return
 
@@ -161,12 +143,7 @@ class Lock:
         return None
 
     def _discard_waiter(self, event: asyncio.Event) -> bool:
-        """Remove waiter matching *event* from ``_waiters`` (caller must hold ``_lock``).
-
-        Returns ``True`` if the entry was still queued, ``False`` if it had
-        already been popped (e.g. by ``_release_locked``) — the discrimination
-        the cancel path needs to decide whether ownership must be forwarded.
-        """
+        """Remove waiter matching `event` from `_waiters`. Caller must hold `_lock`."""
         return self._waiters.pop(event, None) is not None
 
 
@@ -176,23 +153,17 @@ class Lock:
 
 
 class Semaphore:
-    """A cross-thread-safe async semaphore with fair FIFO waiters.
+    """A cross-thread-safe async semaphore with fair FIFO waiter queuing.
 
-    Waiters are queued in a :class:`~collections.deque`.  ``acquire()``
-    implements fair FIFO ordering by pushing new waiters to the right and
-    waking from the left.  Cancelling a waiting ``acquire()`` is safe: the
-    cancelled waiter is removed from the queue and, if a token had already
-    been transferred by a concurrent ``release()``, the token is passed to
-    the next waiter or returned to the pool.
+    Provides fair FIFO scheduling across multiple OS threads and event loops.
+    Cancellation is token-conservative: if a waiter is cancelled after a permit has been
+    transferred to it by a concurrent `release()`, that permit is automatically forwarded
+    to the next waiting task or returned to the value pool.
 
-    All internal state mutations are protected by a :class:`threading.Lock`,
-    making the semaphore safe for use across event-loop threads.
+    :param max_value: Maximum permit capacity. Must be >= 0.
     """
 
     def __init__(self, max_value: int) -> None:
-        # WHY: asyncio.Semaphore(0) is legal — a gate that starts closed and
-        # is opened by release().  Rejecting it broke CapacityLimiter with
-        # fractional totals in (0,1) (R2 FIX-11).
         if max_value < 0:
             raise ValueError("max_value must be >= 0")
         self._value = max_value
@@ -212,25 +183,18 @@ class Semaphore:
 
     @property
     def value(self) -> int:
-        """Number of available permits."""
+        """Number of currently available permits."""
         with self._lock:
             return self._value
 
     @property
     def max_value(self) -> int:
-        """Maximum number of permits."""
-        # WHY: CapacityLimiter's total_tokens setter rewrites _max_value from
-        # another thread — the read must be under the same lock or the
-        # free-threaded build races (U2 re-audit).
+        """Maximum permit capacity."""
         with self._lock:
             return self._max_value
 
     async def acquire(self) -> None:
-        """Acquire a permit, blocking in FIFO order if none are available.
-
-        Cancellation-safe: if cancelled while waiting, the waiter is removed
-        from the queue and any token already transferred is passed on.
-        """
+        """Acquire a permit, blocking in FIFO order if none are currently available."""
         loop = asyncio.get_running_loop()
         event = asyncio.Event()
 
@@ -247,39 +211,25 @@ class Semaphore:
             raise
 
     def _cancel_waiter(self, event: asyncio.Event) -> None:
-        """Remove *event* from the waiter deque if still present.
-
-        If *event* was already popped by ``release()`` the token that was
-        transferred to the cancelled waiter is forwarded to the next waiter
-        or returned to the value pool.
-        """
+        """Handle cancellation of a waiting task, preserving permit conservation."""
         with self._lock:
             was_present = self._waiters.pop(event, None) is not None
 
             if not was_present:
-                # WHY: release() may have already popped this waiter and handed it
-                # a permit. Dropping the entry would silently destroy that permit
-                # and shrink the pool forever. Forwarding it to the next FIFO
-                # waiter, or returning it to the value pool, keeps the count exact.
+                # Permit was already popped and transferred to this waiter. Forward to next:
                 while self._waiters:
                     next_event, next_loop = self._waiters.popitem(last=False)
                     try:
                         next_loop.call_soon_threadsafe(next_event.set)
                         return
                     except RuntimeError:
-                        # WHY: dead loop — this waiter can never take the
-                        # token; keep forwarding to the next live one, and if
-                        # none remain the token returns to the pool below
-                        # (R5 FIX-E).
                         continue
                 self._value += 1
 
     def release(self) -> None:
-        """Release a permit, waking the first FIFO waiter if any.
+        """Release a permit, waking the first FIFO waiter or restoring available count.
 
-        :raises ValueError: if the semaphore already holds ``max_value``
-            permits and no waiter is parked (asyncio.Semaphore parity —
-            a silent over-release would corrupt the count forever, R1 FIX-3).
+        :raises ValueError: If released more times than the initialized max_value without pending waiters.
         """
         with self._lock:
             if self._waiters:
@@ -289,9 +239,6 @@ class Semaphore:
                         loop.call_soon_threadsafe(event.set)
                         return
                     except RuntimeError:
-                        # WHY: dead loop — drop this waiter and keep looking;
-                        # if none remain, the token returns to the pool (R5
-                        # FIX-E).
                         continue
                 self._value += 1
                 return
@@ -321,11 +268,11 @@ class Semaphore:
 class CapacityLimiter:
     """An async capacity limiter safe across event loops and OS threads under free-threading.
 
-    The limiter maintains a total token budget (``total_tokens``) that can
-    be dynamically resized.  All state transitions (borrowing, returning,
-    and waiter queue management) are protected by a single ``threading.Lock``,
+    Maintains a dynamically resizable token budget (`total_tokens`). All token allocations,
+    borrowing counts, and waiter queues are protected by a single `threading.Lock`,
     guaranteeing atomic updates under Python 3.14t multi-core parallelism.
-    ``total_tokens`` may be a fractional float; the integer capacity is ``int(total_tokens)``.
+
+    :param total_tokens: Initial total capacity token budget. Must be > 0.
     """
 
     def __init__(self, total_tokens: float) -> None:
@@ -359,7 +306,7 @@ class CapacityLimiter:
 
     @property
     def total_tokens(self) -> float:
-        """Total token capacity."""
+        """Total token capacity budget."""
         with self._lock:
             return self._total_tokens
 
@@ -370,14 +317,12 @@ class CapacityLimiter:
         with self._lock:
             self._total_tokens = float(value)
             capacity = int(self._total_tokens)
-            # Atomically wake queued waiters if capacity increased beyond borrowed count
             while self._waiters and self._borrowed < capacity:
                 event, loop = self._waiters.popitem(last=False)
                 try:
                     loop.call_soon_threadsafe(event.set)
                     self._borrowed += 1
                 except RuntimeError:
-                    # Dead loop — skip and try the next waiter
                     continue
 
     @property
@@ -393,17 +338,13 @@ class CapacityLimiter:
             return float(self._borrowed)
 
     def snapshot(self) -> tuple[float, float, float]:
-        """Return ``(total_tokens, available_tokens, borrowed_tokens)`` atomically.
-
-        All three metrics are read under a single ``_lock`` acquisition, ensuring
-        ``available + borrowed == total`` holds by construction.
-        """
+        """Return ``(total_tokens, available_tokens, borrowed_tokens)`` atomically."""
         with self._lock:
             avail = self._total_tokens - self._borrowed
             return (self._total_tokens, avail, float(self._borrowed))
 
     async def acquire(self) -> None:
-        """Acquire one token, blocking if none are available."""
+        """Acquire one token, blocking if current borrowed count has reached capacity."""
         loop = asyncio.get_running_loop()
         event = asyncio.Event()
 
@@ -420,13 +361,11 @@ class CapacityLimiter:
             raise
 
     def _cancel_waiter(self, event: asyncio.Event) -> None:
-        """Handle cancellation of a waiter while waiting for a token."""
+        """Handle cancellation while waiting for a token."""
         with self._lock:
             was_present = self._waiters.pop(event, None) is not None
 
             if not was_present:
-                # The waiter was already popped and granted a token (_borrowed was incremented).
-                # Forward to next waiter if within capacity:
                 capacity = int(self._total_tokens)
                 while self._waiters and self._borrowed <= capacity:
                     next_event, next_loop = self._waiters.popitem(last=False)
@@ -438,9 +377,9 @@ class CapacityLimiter:
                 self._borrowed -= 1
 
     def release(self) -> None:
-        """Release one token.
+        """Release one borrowed token.
 
-        :raises ValueError: if released more times than acquired.
+        :raises ValueError: If released more times than acquired.
         """
         with self._lock:
             if self._borrowed <= 0:
@@ -477,11 +416,10 @@ class CapacityLimiter:
 
 
 class Event:
-    """A cross-event-loop-safe event with trio-style semantics (no clear).
+    """A cross-event-loop safe one-shot event with trio-style semantics (no clear).
 
-    An :class:`Event` can be *set* (from any thread / event loop) and
-    *waited* on (asynchronously).  Once set, the event stays set forever;
-    there is no ``clear()`` method.
+    Once set via :meth:`set`, the event remains set permanently. Subsequent calls to
+    :meth:`wait` return immediately.
     """
 
     def __init__(self) -> None:
@@ -492,17 +430,12 @@ class Event:
         )
 
     def is_set(self) -> bool:
-        """Return ``True`` if the event has been set."""
+        """Return True if the event has been set."""
         with self._lock:
             return self._flag
 
     def set(self) -> None:
-        """Set the event and wake **all** current waiters.
-
-        This method is synchronous and safe to call from any thread.
-        Once set, the event cannot be cleared — subsequent ``wait()``
-        calls return immediately.
-        """
+        """Set the event and wake all pending waiters across any event loops."""
         with self._lock:
             self._flag = True
             waiters = list(self._waiters.items())
@@ -512,18 +445,10 @@ class Event:
             try:
                 loop.call_soon_threadsafe(event.set)
             except RuntimeError:
-                # WHY: a waiter whose loop was closed can never wake — skip
-                # it instead of aborting the whole wakeup loop, which would
-                # leave every live-loop waiter sleeping forever (R5 FIX-E).
                 pass
 
     async def wait(self) -> None:
-        """Wait until the event has been set.
-
-        If the event was already set prior to this call, return
-        immediately.  Otherwise, block asynchronously until
-        :meth:`set` is called.
-        """
+        """Wait until the event is set. Returns immediately if already set."""
         loop = asyncio.get_running_loop()
 
         with self._lock:
@@ -540,21 +465,18 @@ class Event:
 
 
 # ============================================================================
-# Condition — async condition variable atop gsyncio.Lock
+# Condition — async condition variable atop multiloop.Lock
 # ============================================================================
 
 
 class Condition:
     """An async condition variable backed by a cross-thread-safe :class:`Lock`.
 
-    A :class:`Condition` provides ``wait()``, ``notify()``, and
-    ``notify_all()`` on top of a :class:`Lock`.  Waiters release the lock
-    while blocked and re-acquire it before ``wait()`` returns — even if the
-    waiting task is cancelled.
+    Waiters release the underlying lock while suspended and re-acquire it before :meth:`wait`
+    returns. The notification protocol does NOT require holding the lock, preventing notifier-sleeper
+    deadlocks and thundering herd contention.
 
-    The internal waiter queue is protected by a separate
-    :class:`threading.Lock`, making the condition safe for use across
-    multiple event-loop threads.
+    :param lock: Optional underlying :class:`Lock` instance. If omitted, creates a new Lock.
     """
 
     def __init__(self, lock: Lock | None = None) -> None:
@@ -592,17 +514,9 @@ class Condition:
     async def wait(self) -> None:
         """Wait until notified.
 
-        The **underlying lock must be held** when this method is called.
-        It is released while waiting and re-acquired before returning.
-        If the waiting task is cancelled, it is removed from the waiter
-        queue and the lock is re-acquired under a cancellation shield.
-
-        Usage::
-
-            async with cond:
-                while not predicate():
-                    await cond.wait()
-                # predicate is true and lock is still held here
+        The **underlying lock must be held** when calling this method. It is released
+        during wait and re-acquired before returning. If the task is cancelled, the lock
+        is re-acquired under a cancellation shield before propagating the cancellation.
         """
         try:
             task = asyncio.current_task()
@@ -624,28 +538,25 @@ class Condition:
         try:
             await event.wait()
         except BaseException:
-            # WHY: notify() may already have popped and woken this waiter —
-            # the notification is then lost (W11).  Forward it to the next
-            # FIFO waiter so notify(n) semantics are preserved; a cancelled
-            # successor forwards again via its own cancel handler.
             was_present = self._discard_waiter(event)
             if not was_present:
                 self._forward_notify()
             await self._reacquire_lock()
             raise
         else:
-            await self._reacquire_lock()
+            try:
+                await self._reacquire_lock()
+            except BaseException:
+                self._forward_notify()
+                raise
 
     async def wait_for(self, predicate: Callable[[], Any]) -> Any:
-        """Wait until a predicate becomes true.
+        """Wait until a predicate returns a truthy value.
 
         The **underlying lock must be held** when calling this method.
-        The predicate is evaluated repeatedly until it returns a truthy value.
-        Supports both synchronous callables and async coroutine functions.
 
-        :param predicate: A callable or coroutine function returning a boolean/truthy value.
-        :returns: The truthy result returned by the predicate.
-        :raises RuntimeError: If called without holding the underlying lock.
+        :param predicate: Synchronous or asynchronous callable returning a boolean or truthy value.
+        :returns: The truthy value returned by ``predicate``.
         """
         while True:
             result = predicate()
@@ -656,33 +567,20 @@ class Condition:
             await self.wait()
 
     def notify(self, n: int = 1) -> None:
-        """Wake up to *n* waiters (default: 1).
+        """Wake up to `n` waiters (default: 1). Safe to call without holding the lock.
 
-        This method is synchronous and safe to call from any thread.
-        The underlying lock does **not** need to be held — this follows
-        trio / threading.Condition semantics where notifying outside
-        the lock is valid (and often preferred to avoid the "thundering
-        herd" scheduling issue).
+        :param n: Maximum number of waiting tasks to wake.
         """
-        # WHY: notify() must not require the underlying lock. wait() releases the
-        # lock before parking, so a lock-gated notify could deadlock, and holding
-        # the lock would let producers batch notifications and starve waiters.
         if n <= 0:
             return
         for waiter_loop, event in self._pop_waiters(n):
             try:
                 waiter_loop.call_soon_threadsafe(event.set)
             except RuntimeError:
-                # WHY: dead loop — this notification would be lost anyway;
-                # skip rather than abort notifying the remaining waiters
-                # (R5 FIX-E).
                 pass
 
     def notify_all(self) -> None:
-        """Wake up **all** current waiters.
-
-        This method is synchronous and safe to call from any thread.
-        """
+        """Wake up all currently waiting tasks."""
         with self._waiters_lock:
             n = len(self._waiters)
         self.notify(n)
@@ -690,7 +588,6 @@ class Condition:
     # -- internals ----------------------------------------------------------
 
     def _pop_waiters(self, n: int) -> list[tuple[asyncio.AbstractEventLoop, asyncio.Event]]:
-        """Pop up to *n* waiters under the internal lock."""
         with self._waiters_lock:
             count = min(n, len(self._waiters))
             popped: list[tuple[asyncio.AbstractEventLoop, asyncio.Event]] = []
@@ -700,17 +597,10 @@ class Condition:
             return popped
 
     def _discard_waiter(self, event: asyncio.Event) -> bool:
-        """Remove *event* from the waiter deque if still present.
-
-        Returns ``True`` if the entry was still queued (i.e. this waiter was
-        cancelled while waiting), ``False`` if notify() had already popped it
-        — in which case the notification must be forwarded.
-        """
         with self._waiters_lock:
             return self._waiters.pop(event, None) is not None
 
     def _forward_notify(self) -> None:
-        """Pass a lost notification to the next FIFO waiter (caller holds nothing)."""
         with self._waiters_lock:
             while self._waiters:
                 next_event, next_loop = self._waiters.popitem(last=False)
@@ -718,22 +608,9 @@ class Condition:
                     next_loop.call_soon_threadsafe(next_event.set)
                     return
                 except RuntimeError:
-                    # WHY: dead loop — keep forwarding to the next live
-                    # waiter; the notification dies only when no live waiter
-                    # remains (R5 FIX-E).
                     continue
 
     async def _reacquire_lock(self) -> None:
-        """Re-acquire the underlying lock, retrying through cancellations.
-
-        Canonical ``asyncio.Condition.wait`` pattern (bpo-34094 family): a
-        cancellation delivered while re-acquiring must not abort the
-        re-acquisition — the caller's eventual ``release()`` would then
-        raise on a lock it no longer owns, masking the cancellation.  Each
-        swallowed CancelledError leaves ``Lock`` in a clean state (its
-        cancel path discards the waiter entry), so retrying is safe; the
-        cancellation is re-raised once the lock is held again.
-        """
         cancelled = False
         while True:
             try:
@@ -753,9 +630,8 @@ class Condition:
 class BarrierWaitResult:
     """Result object returned by :meth:`Barrier.wait`.
 
-    Attributes:
-        parties: Total number of parties in this barrier round.
-        index: Zero-based arrival index (0 to parties - 1) of the calling task.
+    :param parties: Total number of parties in this barrier round.
+    :param index: Zero-based arrival index (0 to parties - 1) of the calling task.
     """
 
     __slots__ = ("index", "parties")
@@ -766,7 +642,7 @@ class BarrierWaitResult:
 
     @property
     def is_leader(self) -> bool:
-        """Return ``True`` if this task was selected as leader (index == 0)."""
+        """Return True if this task was selected as leader (arrival index 0)."""
         return self.index == 0
 
     def __repr__(self) -> str:
@@ -774,16 +650,13 @@ class BarrierWaitResult:
 
 
 class Barrier:
-    """An async barrier that synchronizes *N* parties.
+    """An async barrier that synchronizes *N* parties across event loops.
 
-    Each :meth:`wait` call blocks until *parties* tasks have called
-    :meth:`wait`, at which point all of them resume simultaneously and
-    receive a :class:`BarrierWaitResult`.  The barrier resets
-    automatically after each round, so it can be reused.
+    Each :meth:`wait` call blocks until *parties* tasks have arrived, at which point all
+    are released simultaneously and receive a :class:`BarrierWaitResult`. Automatically resets
+    for the next generation upon round completion.
 
-    Calling :meth:`abort` breaks the current round: all waiting tasks
-    raise a :exc:`RuntimeError`.
-    Calling :meth:`reset` resets the barrier to its initial un-aborted state.
+    :param parties: Number of parties required to pass the barrier. Must be >= 1.
     """
 
     def __init__(self, parties: int) -> None:
@@ -805,7 +678,7 @@ class Barrier:
 
     @property
     def broken(self) -> bool:
-        """Return ``True`` if the barrier is in a broken or aborted state."""
+        """Return True if the barrier is in a broken or aborted state."""
         with self._mutex:
             return self._broken or self._aborted
 
@@ -818,10 +691,7 @@ class Barrier:
     async def wait(self) -> BarrierWaitResult:
         """Wait at the barrier until *parties* tasks have arrived.
 
-        Returns a :class:`BarrierWaitResult` with ``parties`` set to the
-        barrier's party count and ``index`` set to the task's arrival index.
-
-        :raises RuntimeError: if the barrier is broken, aborted, or reset.
+        :raises RuntimeError: If the barrier is broken, aborted, or reset.
         """
         loop = asyncio.get_running_loop()
         event = asyncio.Event()
@@ -839,8 +709,6 @@ class Barrier:
                     try:
                         l.call_soon_threadsafe(e.set)
                     except RuntimeError:
-                        # WHY: dead loop — the party is gone; waking the
-                        # remaining live parties must not abort (R5 FIX-E).
                         pass
                 self._waiters.clear()
                 self._generation += 1
@@ -852,9 +720,6 @@ class Barrier:
             await event.wait()
         except BaseException:
             with self._mutex:
-                # Automatic Broken state: if a waiting party is cancelled in the
-                # current round before it finishes, mark the barrier broken and
-                # wake all remaining waiting parties with an error to prevent deadlock.
                 if generation == self._generation:
                     self._broken = True
                     broken_waiters = list(self._waiters.items())
@@ -871,18 +736,14 @@ class Barrier:
         with self._mutex:
             if self._aborted and generation == self._generation:
                 raise RuntimeError("barrier has been aborted")
-            if box[0] == -1 or (self._broken and generation < self._generation):
+            if box[0] == -1:
                 raise RuntimeError("barrier broken by concurrent cancellation")
             if box[0] is None:
                 raise RuntimeError("barrier was reset while waiting")
             return BarrierWaitResult(parties=self._parties, index=box[0])
 
     def abort(self) -> None:
-        """Abort the barrier, raising :exc:`RuntimeError` in all waiting tasks.
-
-        The barrier is permanently broken after an abort until :meth:`reset` is called.
-        Subsequent calls to :meth:`wait` will raise immediately.
-        """
+        """Abort the barrier, waking all waiting tasks with a :exc:`RuntimeError`."""
         with self._mutex:
             self._aborted = True
             self._broken = True
@@ -893,15 +754,10 @@ class Barrier:
             try:
                 loop.call_soon_threadsafe(event.set)
             except RuntimeError:
-                # WHY: dead loop — skip rather than abort the abort (R5 FIX-E).
                 pass
 
     def reset(self) -> None:
-        """Reset the barrier to its initial un-aborted empty state.
-
-        Any tasks currently waiting at the barrier are woken and will raise
-        :exc:`RuntimeError`.
-        """
+        """Reset the barrier to its initial un-broken state, waking existing waiters with an error."""
         with self._mutex:
             waiters = list(self._waiters.items())
             self._waiters.clear()

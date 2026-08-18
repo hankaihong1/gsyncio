@@ -12,7 +12,7 @@ Older versions are not supported and will not receive security fixes.
 
 ## Reporting a Vulnerability
 
-If you discover a security vulnerability in gsyncio, please report it privately so it can be addressed before public disclosure.
+If you discover a security vulnerability in multiloop, please report it privately so it can be addressed before public disclosure.
 
 **How to report:**
 
@@ -50,9 +50,9 @@ We ask that you do not publicly disclose the vulnerability until we have release
 
 ## Security Updates
 
-Security fixes are released as patch releases for all supported versions listed above. Please keep gsyncio up to date to receive security fixes.
+Security fixes are released as patch releases for all supported versions listed above. Please keep multiloop up to date to receive security fixes.
 
 ## Project Repository
 
-- **Repository**: https://github.com/hankaihong1/gsyncio
+- **Repository**: https://github.com/hankaihong1/multiloop
 - **License**: MIT

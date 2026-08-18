@@ -1,4 +1,4 @@
-# gsyncio Concurrency Correctness Guide
+# multiloop Concurrency Correctness Guide
 
 **[中文版 (Chinese)](CONCURRENCY_ZH.md)**
 
@@ -12,7 +12,7 @@
 
 ## 1. Concurrency Model Overview (who locks what, who waits for what)
 
-All gsyncio synchronization primitives follow the same skeleton: a
+All multiloop synchronization primitives follow the same skeleton: a
 **`threading.Lock` on the Python side protects the waiter structures, while
 the Rust side carries the data plane with atomics + flume**. Cross-thread
 wakeups always go through `loop.call_soon_threadsafe(...)` — asyncio objects
@@ -20,24 +20,24 @@ are never touched directly from another thread.
 
 ### 1.0 Physical Concurrency Axioms (Axiomatic Assumptions)
 
-gsyncio borrows the clean, developer-friendly API surface of AnyIO and Trio, but **fundamentally diverges from their single-threaded runtime assumptions**. In single-threaded cooperative engines (AnyIO/Trio), coroutine execution between `await` points is strictly sequential and non-preemptive; data structures require no OS mutexes and primitives act merely as coroutine scheduling throttles.
+multiloop borrows the clean, developer-friendly API surface of AnyIO and Trio, but **fundamentally diverges from their single-threaded runtime assumptions**. In single-threaded cooperative engines (AnyIO/Trio), coroutine execution between `await` points is strictly sequential and non-preemptive; data structures require no OS mutexes and primitives act merely as coroutine scheduling throttles.
 
-In contrast, gsyncio operates under **Python 3.14t (free-threaded / no-GIL) true multi-core physical parallelism** across multiple OS threads and isolated event loops. Correctness cannot rely on single-threaded heuristics; it rests on seven formal physical concurrency axioms:
+In contrast, multiloop operates under **Python 3.14t (free-threaded / no-GIL) true multi-core physical parallelism** across multiple OS threads and isolated event loops. Correctness cannot rely on single-threaded heuristics; it rests on seven formal physical concurrency axioms:
 
 0. **Paradigm Divergence from AnyIO/Trio (API Lending vs. Multi-Threaded Physics)**: AnyIO/Trio APIs (`TaskGroup`, `CancelScope`, `CapacityLimiter`, `Event`, etc.) are adopted strictly as an ergonomic interface layer. All underlying semantics are redesigned from first principles for multi-thread / multi-loop execution, requiring formal state-machine proofs, token conservation laws, and OS-level mutex synchronization.
 1. **Python 3.14t Free-Threaded True Parallelism**: Bytecode and object operations execute concurrently across CPU cores without a GIL. Any composite state transitions (e.g. counter updates + waiter notifications) must be enclosed within a single OS mutex (`threading.Lock` / `parking_lot::Mutex`) to prevent state tearing.
-2. **Cross-Thread EventLoop Isolation**: `asyncio.Task`, `Future`, and `Event` are strictly bound to a single thread and its event loop. Cross-thread notifications must strictly go through `loop.call_soon_threadsafe(...)` or Rust `FastChannel`.
+2. **Cross-Thread EventLoop Isolation**: `asyncio.Task`, `Future`, and `Event` are strictly bound to a single thread and its event loop. Cross-thread notifications must strictly go through `loop.call_soon_threadsafe(...)` or Rust `Channel`.
 3. **ContextVar Thread/Task Locality**: `contextvars.ContextVar` is strictly local to the active OS thread and task. Cross-thread cancellation (`scope.cancel()`) must never read or modify `ContextVar` state; it relies exclusively on thread-safe locks and `call_soon_threadsafe`.
 4. **Native asyncio Cancellation & Single-Ledger Symmetric Accounting**: Built upon Python 3.11+/3.14t native `task.cancelling()` / `task.uncancel()`. A scope only compensates (`task.uncancel()`) for cancellations it explicitly injected (`_injected == True`), preventing accidental absorption of foreign cancellations. Shielding is a snapshot-and-restore mechanism.
 5. **Data Plane vs Wait Plane Separation**: Data transfer is carried out lock-free in Rust (`flume` + 64-byte-padded atomic counters), while async waiters are tracked under Python `threading.Lock` using the double-check lock pattern.
-6. **Structured Concurrency Physical Scope**: `TaskGroup` is physically scoped to a single `asyncio.AbstractEventLoop`. Multi-loop concurrency is coordinated via `EventLoopThreadPool`, `FastChannel`, and `AsyncContext`.
+6. **Structured Concurrency Physical Scope**: `TaskGroup` is physically scoped to a single `asyncio.AbstractEventLoop`. Multi-loop concurrency is coordinated via `EventLoopThreadPool`, `Channel`, and `AsyncContext`.
 
-### 1.1 Channels (FastChannel / AsyncChannel)
+### 1.1 Channels (Channel)
 
 | Component | Lock / primitive | Waiter structure | Key invariant |
 |---|---|---|---|
-| Rust `FastChannel` | flume channel (bounded/unbounded) + `AtomicBool is_closed` | none | `try_send` returning `false` means only "full"; **closed ⇒ errors once drained** — a send racing `close()` may still enqueue (the flume side is closed lazily), so a "closed" channel can briefly accept then drain, after which every operation errors (`src/lib.rs:387-418`; R4 decision: tolerant vs Go's panic-on-send-after-close) |
-| Python `_BaseChannel` | `threading.Lock` (`_lock`) | `_getters` / `_putters` deques of `(loop, future)` | waiter registration and wakeup must happen under `_lock` (`src/gsyncio/_channel_base.py:75-78`) |
+| Rust `Channel` | flume channel (bounded/unbounded) + `AtomicBool is_closed` | none | `try_send` returning `false` means only "full"; **closed ⇒ errors once drained** — a send racing `close()` may still enqueue (the flume side is closed lazily), so a "closed" channel can briefly accept then drain, after which every operation errors (`src/lib.rs:387-418`; R4 decision: tolerant vs Go's panic-on-send-after-close) |
+| Python `_BaseChannel` | `threading.Lock` (`_lock`) | `_getters` / `_putters` deques of `(loop, future)` | waiter registration and wakeup must happen under `_lock` (`src/multiloop/_channel_base.py:75-78`) |
 | Wakeup protocol | — | — | `_wake_all` consumes from the deque **left side**: one wakeup pops one entry, stale futures are dropped naturally (`_channel_base.py:29-50`) |
 
 **Data plane and wait plane are separated**: flume carries data (lock-free),
@@ -59,7 +59,7 @@ lock → await → unregister under the lock on cancellation」
 | Primitive | Guarding lock | Waiter structure | Key invariant |
 |---|---|---|---|
 | `Event` | `threading.Lock` | `list[(loop, asyncio.Event)]` | **sticky** (trio semantics, no clear); `set()` swaps the list out under the lock, then wakes each waiter via `call_soon_threadsafe` outside the lock (`_sync.py:385-398`) |
-| `Condition` | `_waiters_lock` (waiter queue) + underlying `Lock` | `deque[(loop, asyncio.Event)]` | `notify()` does **not** require the underlying lock (`_sync.py:507-522`); `wait()` releases the lock → waits → **re-acquires under a shield** (`_sync.py:472-505`) |
+| `Condition` | `_waiters_lock` (waiter queue) + underlying `Lock` | `deque[(loop, asyncio.Event)]` | `notify()` does **not** require the underlying lock (`_sync.py:507-522`); `wait()` releases the lock → waits → **re-acquires under a shield with cancellation notification forwarding** (`_sync.py:624-646`) |
 
 ### 1.4 Barriers & Group Sync
 
@@ -108,7 +108,7 @@ lock** before registering the future; registration and `_wakeup_next` both
 happen under `_lock`.
 **Examples**: `_wait_and_send` (`_channel_base.py:136-177`),
 `_recv_impl` (`primitives.py:165-197`) — the "Double-check lock in
-FastChannel" design decision in AGENTS.md.
+Channel" design decision in AGENTS.md.
 
 ### Pattern 3: lock re-acquisition on the cancellation path (missing shield → deadlock)
 
@@ -157,10 +157,10 @@ the cancellation handler compares the generation before deciding to remove.
 
 **Barrier Broken note**: the generation guard protects *next-round* entries, and a cancelled party automatically transitions the barrier into a Broken state, waking all current round parties with an error to eliminate deadlocks.
 
-**Known limitation (FIX-15)**: the cancellation-handler removal in
+**Known limitation**: the cancellation-handler removal in
 `Barrier`/`Condition`/`Semaphore` is O(n) per waiter (list/dict rebuild), so
 a cancellation storm on N parked waiters costs O(n²) — measured 5000
-waiters ≈ 560 ms (R2 probe E2).  Acceptable for realistic party counts;
+waiters ≈ 560 ms. Acceptable for realistic party counts;
 documented so nobody "optimises" it into a wrong-round bug.
 
 ### Pattern 6: register-after-done race
@@ -184,7 +184,7 @@ directly from another thread → `RuntimeError` or silent loss.
 **Correct approach**: cross-thread, always use
 `loop.call_soon_threadsafe(fut.set_result, ...)` or
 `call_soon_threadsafe(event.set)`; communicate between threads with
-`FastChannel`, never raw asyncio primitives.
+`Channel`, never raw asyncio primitives.
 **Examples**: `_wake_all` (`_channel_base.py:41-48`), `Event.set`
 (`_sync.py:397-398`), `Lock.release` (`_sync.py:96`).
 
@@ -239,21 +239,21 @@ while True:
 ```
 - **Correct approach**: Shuffle or alternate channel argument order if statistical fairness is required across ready channels.
 
-**3. `Barrier` party timeout without `abort()`**:
-- **Trap**: `Barrier` does not have an automatic broken state on single-party cancellation (FIX-12). If one party times out and leaves, the remaining `parties - 1` parties block forever.
+**3. `Barrier` party timeout and automatic broken state**:
+- **Trap**: When a waiting party is cancelled or times out, `Barrier` automatically transitions to the Broken state and wakes all remaining waiting parties with a `RuntimeError`. Subsequent `wait()` calls will continue to raise until `barrier.reset()` is called.
 - **Negative example**:
 ```python
 try:
     await asyncio.wait_for(barrier.wait(), timeout=1.0)
 except TimeoutError:
-    pass  # Leaves other parties hung forever!
+    pass  # Leaves barrier broken; future waits will immediately fail!
 ```
 - **Correct approach**:
 ```python
 try:
     await asyncio.wait_for(barrier.wait(), timeout=1.0)
 except TimeoutError:
-    barrier.abort()
+    barrier.reset()  # Reset barrier generation to allow future rounds
     raise
 ```
 
@@ -292,8 +292,8 @@ if any item is not satisfied, think it through before touching anything.**
       Section 4: does the RAII guard keep the count safe? Is the memory
       ordering sufficient?
 - [ ] Is the new behavior stress-tested with `pytest-repeat --count=50`
-      (never a single run)? Is the test marked `@pytest.mark.free_threading`
-      (3.14t-specific stress)?
+      on the **specific target test file/function** (never across the whole suite)?
+      Is the test marked `@pytest.mark.free_threading` (3.14t-specific stress)?
 - [ ] Found a bug? Did you write a **minimal reproduction test** (deterministic
       data, stable FAIL) before fixing? (mandatory process, Section 5.5)
 
@@ -306,7 +306,7 @@ if any item is not satisfied, think it through before touching anything.**
 | Component | Thread boundary | Note |
 |---|---|---|
 | `NativeWorkerPool` | any thread may `push_global`/`push_local`; `pop_work` only on worker threads | close: drop senders first, then set the flag (`lib.rs:219-225`) |
-| `FastChannel` | any thread may send/recv | flume itself is lock-free; `is_closed` is a flag store/load (Release/Acquire) |
+| `Channel` | any thread may send/recv | flume itself is lock-free; `is_closed` is a flag store/load (Release/Acquire) |
 | `RawAsyncWaitGroup` | any thread may add/done/register | counter AcqRel; waiter list under parking_lot Mutex |
 
 ### 4.2 The soft poller gate (`num_polling`)

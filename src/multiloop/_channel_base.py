@@ -1,4 +1,6 @@
-"""Shared base class for FastChannel (AsyncChannel removed in FIX-8a)."""
+"""Shared channel base class and cross-thread waiter queues for Channel."""
+
+from __future__ import annotations
 
 import asyncio
 import collections
@@ -6,11 +8,12 @@ import threading
 from collections.abc import AsyncIterator, Callable
 from typing import Any
 
-from gsyncio.exceptions import ChannelClosedError
+from multiloop.exceptions import ChannelClosedError
 
 _Waiter = tuple[asyncio.AbstractEventLoop, asyncio.Future[Any]]
-
 _CHANNEL_CLOSED_MSG = "Channel is closed"
+
+__all__ = ["_CHANNEL_CLOSED_MSG", "_BaseChannel", "_discard_waiter", "_set_soon", "_wake_all"]
 
 
 def _set_soon(
@@ -18,12 +21,11 @@ def _set_soon(
     fut: asyncio.Future[Any],
     exc: BaseException | None = None,
 ) -> None:
-    """Complete *fut* on its owning loop, tolerating a raced cancellation.
+    """Complete a waiter future on its owning event loop, safely tolerating concurrent cancellation.
 
-    WHY: the old guard wrapped call_soon_threadsafe itself, where an
-    InvalidStateError (waiter cancelled between pop and delivery) surfaced
-    asynchronously in the loop exception handler (W21).  Moving the guard
-    inside the scheduled callback contains it.
+    :param loop: The event loop owning ``fut``.
+    :param fut: The future to fulfill or fail.
+    :param exc: Optional exception to deliver. If None, fulfills with None.
     """
 
     def _do() -> None:
@@ -33,15 +35,11 @@ def _set_soon(
             else:
                 fut.set_result(None)
         except asyncio.InvalidStateError:
-            # The waiter was cancelled after the pop — its cancel handler
-            # already cleaned up; nothing to deliver.
             pass
 
     try:
         loop.call_soon_threadsafe(_do)
     except RuntimeError:
-        # WHY: the waiter's loop was closed — it can never be woken.  Skip
-        # it instead of aborting the caller's wakeup loop (R5 FIX-E).
         pass
 
 
@@ -54,13 +52,11 @@ def _wake_all(
     exc: BaseException | None = None,
     count: int | None = None,
 ) -> None:
-    """Wake pending waiter futures on their owning event loops.
+    """Wake pending waiter futures on their respective owning event loops.
 
-    Each non-done waiter is completed with ``set_result(None)``, or with
-    ``set_exception(exc)`` when ``exc`` is given. Waking stops after ``count``
-    non-done futures when ``count`` is not ``None``. When ``waiters`` is an
-    OrderedDict or deque, entries are consumed from it (done entries are discarded)
-    so stale futures don't accumulate; a plain list is left intact.
+    :param waiters: Queue or dictionary of waiter futures mapped to their event loops.
+    :param exc: Optional exception to deliver instead of successful resolution.
+    :param count: Maximum number of active waiters to wake (wake all if None).
     """
     if isinstance(waiters, collections.OrderedDict):
         woken = 0
@@ -92,13 +88,12 @@ def _discard_waiter(
     ),
     fut: asyncio.Future[Any],
 ) -> bool:
-    """Remove the waiter entry for ``fut`` from ``waiters`` (if still present).
+    """Remove a waiter future from the waiter queue if still present.
 
-    Returns ``True`` when the entry was still queued, ``False`` when it had
-    already been popped by a wakeup — the discrimination the cancellation
-    path needs to decide whether the wakeup must be forwarded (R10 P1: a
-    popped entry means the data/slot side already changed, and the
-    notification would otherwise die with the cancelled waiter).
+    :param waiters: The collection of active waiters.
+    :param fut: The future to discard.
+    :returns: ``True`` if the future was queued and removed; ``False`` if it had
+              already been popped by a concurrent wakeup.
     """
     if isinstance(waiters, collections.OrderedDict):
         return waiters.pop(fut, None) is not None
@@ -109,8 +104,8 @@ def _discard_waiter(
     return was_present
 
 
-class _BaseChannel:  # pyright: ignore[reportUnusedClass]
-    """Base class providing shared waiter deque management for channels."""
+class _BaseChannel:
+    """Base class providing shared waiter management and synchronization for async channels."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -120,10 +115,6 @@ class _BaseChannel:  # pyright: ignore[reportUnusedClass]
         self._putters_dict: collections.OrderedDict[
             asyncio.Future[Any], asyncio.AbstractEventLoop
         ] = collections.OrderedDict()
-        # WHY: select_channel needs "channel became non-empty" signals that do
-        # NOT consume the item (only the select winner may consume).  Notifier
-        # events are one-shot: _wakeup_notifiers pops them, so a woken notifier
-        # must re-register (its caller holds the new event).
         self._notifiers_dict: collections.OrderedDict[
             tuple[asyncio.AbstractEventLoop, asyncio.Event | asyncio.Future[Any]], None
         ] = collections.OrderedDict()
@@ -155,14 +146,17 @@ class _BaseChannel:  # pyright: ignore[reportUnusedClass]
             | collections.deque[_Waiter]
         ),
     ) -> None:
-        """Wake the first non-done future in the waiter deque/dict."""
+        """Wake the first pending non-done future in the waiter queue.
+
+        :param waiters: The queue or dict of registered waiters.
+        """
         _wake_all(waiters, count=1)
 
     def _wakeup_notifiers(self, all_notifiers: bool = False) -> None:
-        """Wake registered notifiers or select watchers (caller must hold ``_lock``).
+        """Wake registered select watchers. Caller MUST hold ``_lock``.
 
-        When all_notifiers is False (single item enqueued), wakes at most one valid
-        notifier to prevent thundering herd. When True (channel close), wakes all.
+        :param all_notifiers: If True (channel closed), wakes all watchers;
+                              if False (item arrived), wakes at most one to prevent thundering herd.
         """
         while self._notifiers:
             entry, _ = self._notifiers.popitem(last=False)
@@ -182,10 +176,6 @@ class _BaseChannel:  # pyright: ignore[reportUnusedClass]
                     if not f.done():
                         f.set_result(ch)
                     else:
-                        # WHY: in multi-event-loop execution, target.done() was False when
-                        # popped under _lock, but another channel in select_channel won the
-                        # race before this callback ran on its loop. Forward the wakeup signal
-                        # to the next pending notifier so the buffered item is not starved (R10).
                         with ch._lock:
                             ch._wakeup_notifiers(all_notifiers=False)
 
@@ -205,8 +195,10 @@ class _BaseChannel:  # pyright: ignore[reportUnusedClass]
     ) -> Any | None:
         """Register a single-arbiter select watcher.
 
-        Returns a token if successfully registered and empty, or None if the channel
-        already has an item (caller should try_recv immediately).
+        :param loop: The event loop on which the select arbiter runs.
+        :param arbiter_fut: The arbiter future awaiting ready channel signal.
+        :returns: A token tuple if successfully registered on an empty channel,
+                  or None if the channel already has an item available.
         """
         with self._lock:
             if self.is_closed and self.qsize() == 0:
@@ -218,28 +210,22 @@ class _BaseChannel:  # pyright: ignore[reportUnusedClass]
             return token
 
     def _unregister_select_watcher(self, token: Any) -> None:
-        """Unregister a select watcher token."""
+        """Unregister a select watcher token.
+
+        :param token: The registration token returned by :meth:`_register_select_watcher`.
+        """
         if token is None:
             return
         with self._lock:
             self._notifiers.pop(token, None)
 
     async def recv(self, timeout: float | None = None) -> Any:
-        """Receive an item from the channel.
+        """Receive an item from the channel, suspending if empty until an item arrives.
 
-        If the channel is empty, this method suspends until an item arrives.
-
-        :param timeout:
-            Optional timeout in seconds to wait.
-        :type timeout: float or None
-
+        :param timeout: Optional maximum seconds to wait.
         :returns: The received item.
-
-        :raises ChannelClosedError:
-            If the channel is closed and empty.
-        :raises TimeoutError:
-            If the operation times out.
-
+        :raises ChannelClosedError: If the channel is closed and all buffered items have been consumed.
+        :raises TimeoutError: If timeout expires before an item is received.
         """
         if timeout is not None:
             return await asyncio.wait_for(self._recv_impl(), timeout=timeout)
@@ -250,11 +236,19 @@ class _BaseChannel:  # pyright: ignore[reportUnusedClass]
         raise NotImplementedError
 
     def try_send(self, item: Any) -> bool:
-        """Non-blocking send. Returns True if sent, False if channel full."""
+        """Non-blocking send.
+
+        :param item: The item to enqueue.
+        :returns: True if enqueued, False if channel is full.
+        """
         raise NotImplementedError
 
     def try_recv(self) -> Any:
-        """Non-blocking recv. Returns item or raises WouldBlock."""
+        """Non-blocking receive.
+
+        :returns: The dequeued item.
+        :raises WouldBlock: If channel is empty.
+        """
         raise NotImplementedError
 
     def qsize(self) -> int:
@@ -263,18 +257,17 @@ class _BaseChannel:  # pyright: ignore[reportUnusedClass]
 
     @property
     def is_closed(self) -> bool:
-        """Whether the channel is closed (implemented by subclasses)."""
+        """Whether the channel has been closed."""
         raise NotImplementedError
 
     def _close_waiters(self) -> None:
-        """Wake all pending getters and putters with ChannelClosedError.
+        """Wake all pending getters, putters, and notifiers with ChannelClosedError.
 
         Caller must hold ``self._lock``.
         """
         exc = ChannelClosedError(_CHANNEL_CLOSED_MSG)
         _wake_all(self._getters, exc=exc)
         _wake_all(self._putters, exc=exc)
-        # Notifiers and select watchers wake too (all of them on close)
         self._wakeup_notifiers(all_notifiers=True)
 
     def _discard_waiter(
@@ -285,21 +278,19 @@ class _BaseChannel:  # pyright: ignore[reportUnusedClass]
         ),
         fut: asyncio.Future[Any],
     ) -> bool:
-        """Remove the waiter entry for ``fut`` from ``waiters`` (if still present)."""
+        """Remove a waiter future from the queue.
+
+        :param waiters: The collection of active waiters.
+        :param fut: The future to remove.
+        :returns: True if found and removed, False otherwise.
+        """
         return _discard_waiter(waiters, fut)
 
     async def _wait_and_send(self, item: Any, try_fn: Callable[[Any], bool]) -> None:
-        """Send ``item``, suspending until a slot frees, using ``try_fn``.
+        """Send ``item``, suspending until buffer capacity frees up.
 
-        ``try_fn(item)`` is invoked while ``self._lock`` is held and must
-        attempt to enqueue ``item``, returning ``True`` on success or ``False``
-        when the channel is full. It may raise ``ChannelClosedError`` (or a
-        ``RuntimeError``, which is translated) when the channel is closed.
-
-        The double-check under the lock closes the Lost-Wakeup race: a fast
-        send attempt can win against a draining receiver and then park on a
-        future nobody will resolve. Re-checking before queueing the future
-        means only a genuinely full channel sleeps.
+        :param item: The item to send.
+        :param try_fn: Non-blocking try_send function to invoke.
         """
         loop = asyncio.get_running_loop()
         while True:
@@ -314,8 +305,6 @@ class _BaseChannel:  # pyright: ignore[reportUnusedClass]
             except RuntimeError as e:
                 raise ChannelClosedError(_CHANNEL_CLOSED_MSG) from e
 
-            # Double-check under lock before queueing future to prevent the
-            # Lost-Wakeup race (see docstring above).
             with self._lock:
                 try:
                     if try_fn(item):
@@ -336,13 +325,6 @@ class _BaseChannel:  # pyright: ignore[reportUnusedClass]
                 with self._lock:
                     was_present = self._discard_waiter(self._putters, fut)
                     if not was_present:
-                        # WHY (R10 P1): a receiver already popped our entry
-                        # and handed us the freed slot — but we were
-                        # cancelled before retrying the send.  The slot must
-                        # not idle: forward the wakeup to the next putter,
-                        # which retries its send.  A cancelled successor
-                        # forwards again via its own handler (chain
-                        # forwarding, same as Lock/Semaphore/Condition).
                         self._wakeup_next(self._putters)
                 raise
 

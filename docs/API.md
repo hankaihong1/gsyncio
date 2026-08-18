@@ -1,8 +1,8 @@
-# gsyncio API Reference
+# multiloop API Reference
 
 **[中文版 (Chinese)](API_ZH.md)**
 
-Complete API documentation for `gsyncio`: a multi-event-loop engine and concurrency toolkit for Python 3.14t (free-threaded / no-GIL).
+Complete API documentation for `multiloop`: a multi-event-loop engine and concurrency toolkit for Python 3.14t (free-threaded / no-GIL).
 
 ---
 
@@ -24,7 +24,7 @@ Complete API documentation for `gsyncio`: a multi-event-loop engine and concurre
   - [`get_logger`](#get_logger)
   - [`set_log_level`](#set_log_level)
 - [Golang-Style Channels & Multiplexing](#golang-style-channels--multiplexing)
-  - [`FastChannel`](#fastchannel)
+  - [`Channel`](#channel)
   - [`select_channel`](#select_channel)
 - [Task Management](#task-management)
   - [`TaskGroup`](#taskgroup)
@@ -44,9 +44,9 @@ Complete API documentation for `gsyncio`: a multi-event-loop engine and concurre
   - [`AsyncRWMutex`](#asyncrwmutex)
 - [Networking & ASGI Workers](#networking--asgi-workers)
   - [`ConnectionPinningServer`](#connectionpinningserver)
-  - [`GsyncioASGIWorker`](#gsyncioasgiworker)
+  - [`MultiloopASGIWorker`](#multiloopasgiworker)
 - [Exceptions](#exceptions)
-  - [`GsyncioError`](#gsyncioerror)
+  - [`MultiloopError`](#multilooperror)
   - [`ChannelClosedError`](#channelclosederror)
   - [`ThreadPoolClosedError`](#threadpoolclosederror)
   - [`TimeoutError`](#timeouterror)
@@ -56,13 +56,13 @@ Complete API documentation for `gsyncio`: a multi-event-loop engine and concurre
 
 ## Quick Examples
 
-Copy-paste runnable snippets. Each example is self-contained: it imports `gsyncio`, defines an `async def main()`, and runs it with `asyncio.run(main())`. Simulated work uses `asyncio.sleep`.
+Copy-paste runnable snippets. Each example is self-contained: it imports `multiloop`, defines an `async def main()`, and runs it with `asyncio.run(main())`. Simulated work uses `asyncio.sleep`.
 
 ### 1. `EventLoopThreadPool` + `submit`
 
 ```python
 import asyncio
-import gsyncio
+import multiloop
 
 
 async def heavy_task(x: int) -> int:
@@ -71,7 +71,7 @@ async def heavy_task(x: int) -> int:
 
 
 async def main():
-    async with gsyncio.EventLoopThreadPool(num_threads=2) as pool:
+    async with multiloop.EventLoopThreadPool(num_threads=2) as pool:
         fut1 = pool.submit(heavy_task, 21)
         fut2 = pool.submit(heavy_task, 21, pin_to=0)  # pinned to worker 0
         results = await asyncio.gather(fut1, fut2)
@@ -82,15 +82,15 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-### 2. `FastChannel` send/recv
+### 2. `Channel` send/recv
 
 ```python
 import asyncio
-import gsyncio
+import multiloop
 
 
 async def main():
-    ch = gsyncio.FastChannel()
+    ch = multiloop.Channel()
 
     async def producer():
         for i in range(3):
@@ -110,12 +110,12 @@ if __name__ == "__main__":
 
 ```python
 import asyncio
-import gsyncio
+import multiloop
 
 
 async def main():
-    ch1 = gsyncio.FastChannel()
-    ch2 = gsyncio.FastChannel()
+    ch1 = multiloop.Channel()
+    ch2 = multiloop.Channel()
 
     async def feeder():
         await asyncio.sleep(0.01)
@@ -123,7 +123,7 @@ async def main():
         ch2.close()
 
     asyncio.create_task(feeder())
-    selected, val = await gsyncio.select_channel(ch1, ch2, timeout=2.0)
+    selected, val = await multiloop.select_channel(ch1, ch2, timeout=2.0)
     print(f"selected: {val}")  # ("data from ch2") from ch2
 
 
@@ -135,12 +135,12 @@ if __name__ == "__main__":
 
 ```python
 import asyncio
-import gsyncio
+import multiloop
 
 
 async def main():
-    async with gsyncio.EventLoopThreadPool(num_threads=2) as pool:
-        ctx = gsyncio.AsyncContext()
+    async with multiloop.EventLoopThreadPool(num_threads=2) as pool:
+        ctx = multiloop.AsyncContext()
 
         async def slow_work():
             try:
@@ -162,17 +162,17 @@ if __name__ == "__main__":
 
 ```python
 import asyncio
-import gsyncio
+import multiloop
 
 
-async def worker(wg: gsyncio.AsyncWaitGroup, name: str):
+async def worker(wg: multiloop.AsyncWaitGroup, name: str):
     await asyncio.sleep(0.01)
     print(f"{name} done")
     wg.done()
 
 
 async def main():
-    wg = gsyncio.AsyncWaitGroup()
+    wg = multiloop.AsyncWaitGroup()
     wg.add(2)
     asyncio.create_task(worker(wg, "a"))
     asyncio.create_task(worker(wg, "b"))
@@ -188,7 +188,7 @@ if __name__ == "__main__":
 
 ```python
 import asyncio
-import gsyncio
+import multiloop
 
 
 async def init_db() -> str:
@@ -197,7 +197,7 @@ async def init_db() -> str:
 
 
 async def main():
-    once = gsyncio.AsyncOnce()
+    once = multiloop.AsyncOnce()
     r1 = await once.do(init_db)
     r2 = await once.do(init_db)  # skipped: runs once
     print(r1)  # "db ready"
@@ -212,11 +212,11 @@ if __name__ == "__main__":
 
 ```python
 import asyncio
-import gsyncio
+import multiloop
 
 
 async def main():
-    rw = gsyncio.AsyncRWMutex()
+    rw = multiloop.AsyncRWMutex()
     data = {"value": 0}
 
     async with rw.reader():  # concurrent readers allowed
@@ -237,11 +237,11 @@ if __name__ == "__main__":
 
 ```python
 import asyncio
-import gsyncio
+import multiloop
 
 
 async def main():
-    lock = gsyncio.Lock()
+    lock = multiloop.Lock()
     counter = 0
 
     async def inc():
@@ -262,7 +262,7 @@ if __name__ == "__main__":
 
 ```python
 import asyncio
-import gsyncio
+import multiloop
 
 
 async def worker(name: str) -> str:
@@ -271,7 +271,7 @@ async def worker(name: str) -> str:
 
 
 async def main():
-    async with gsyncio.TaskGroup() as tg:
+    async with multiloop.TaskGroup() as tg:
         h1 = tg.start_soon(worker, "a")
         h2 = tg.start_soon(worker, "b")
     # Both tasks are guaranteed finished here.
@@ -286,7 +286,7 @@ if __name__ == "__main__":
 
 ```python
 import asyncio
-import gsyncio
+import multiloop
 
 
 async def slow():
@@ -296,13 +296,13 @@ async def slow():
 async def main():
     # fail_after raises TimeoutError when the deadline expires.
     try:
-        async with gsyncio.fail_after(0.05):
+        async with multiloop.fail_after(0.05):
             await slow()
-    except gsyncio.TimeoutError:
+    except multiloop.TimeoutError:
         print("timed out with error")
 
     # move_on_after exits silently when the deadline expires.
-    async with gsyncio.move_on_after(0.05) as scope:
+    async with multiloop.move_on_after(0.05) as scope:
         await slow()
     if scope.cancelled_caught:
         print("timed out silently")
@@ -342,10 +342,10 @@ Returns `True` if the pool is actively running worker loops.
 ##### `async start()` -> `None`
 Starts all worker threads and their work-stealing queue dispatchers.
 
-##### `async close()` -> `None`
+##### `async close(timeout: float | None = None)` -> `None`
 Gracefully stops all worker loops, drains pending tasks, and joins worker threads.
 
-Drain is bounded: `close()` waits up to ~5 seconds for in-flight tasks to finish, then force-stops every worker loop — tasks still running at that point are cancelled and are not guaranteed to complete.
+Drain timeout is configurable: `close()` waits up to `timeout` seconds (defaults to ~5.0 seconds when `None`) for in-flight tasks to finish, then force-stops every worker loop — tasks still running after the timeout are cancelled and are not guaranteed to complete.
 
 ##### `async abort()` -> `None`
 Forcefully stops all worker loops without draining pending tasks. Queued but unexecuted work is discarded.
@@ -504,7 +504,7 @@ async with fail_after(10):
 def get_logger(name: str | None = None) -> logging.LoggerAdapter[Any]
 ```
 
-Returns a structured logger adapter for the `gsyncio` namespace. The adapter wraps the `"gsyncio"` logger (or the `"gsyncio.<name>"` sub-logger when `name` is given, which propagates to the root `"gsyncio"` logger and inherits its level) and injects `task_id` and `span` structured fields into every emitted record.
+Returns a structured logger adapter for the `multiloop` namespace. The adapter wraps the `"multiloop"` logger (or the `"multiloop.<name>"` sub-logger when `name` is given, which propagates to the root `"multiloop"` logger and inherits its level) and injects `task_id` and `span` structured fields into every emitted record.
 
 - **`name`** (*str | None*): Optional sub-logger name (e.g. `"pool"`).
 
@@ -519,7 +519,7 @@ log.info("pool started", extra={"span": "boot"})
 def set_log_level(level: int) -> None
 ```
 
-Sets the gsyncio logger's minimum log level. `level` is a `logging` level constant (e.g. `logging.INFO` or `logging.DEBUG`).
+Sets the multiloop logger's minimum log level. `level` is a `logging` level constant (e.g. `logging.INFO` or `logging.DEBUG`).
 
 ```python
 import logging
@@ -531,14 +531,14 @@ set_log_level(logging.DEBUG)
 
 ## Golang-Style Channels & Multiplexing
 
-### `FastChannel`
+### `Channel`
 
 High-performance cross-thread channel backed by Rust (`flume` crate) with a double-check lock pattern for zero lost-wakeup signal races.
 
 #### Constructor
 
 ```text
-FastChannel(maxsize: int = 0)
+Channel(maxsize: int = 0)
 ```
 
 - **`maxsize`** (*int*): Channel capacity limit. `0` for unbounded channel.
@@ -548,6 +548,11 @@ FastChannel(maxsize: int = 0)
 ##### `async send(item: Any)` -> `None`
 Sends an item into the channel. Suspends if the channel is full until space is available.
 - **Raises**: `ChannelClosedError` if the channel is closed.
+
+##### `send_sync(item: Any, timeout: float | None = None)` -> `None`
+Synchronous blocking send, designed for worker threads executing synchronous tasks.
+- **`timeout`** (*float | None*): Maximum blocking time in seconds.
+- **Raises**: `ChannelClosedError` if the channel is closed, `TimeoutError` if timeout expires.
 
 ##### `async recv(timeout: float | None = None)` -> `Any`
 Receives an item from the channel. Suspends if empty until an item is available.
@@ -564,8 +569,6 @@ Non-blocking receive.
 
 ##### `qsize()` -> `int`
 Returns the number of items currently buffered in the channel.
-
-
 
 ##### `close()` -> `None`
 Closes the channel. All pending senders/receivers are woken up with `ChannelClosedError`.
@@ -588,13 +591,13 @@ async def select_channel(
 ) -> Any
 ```
 
-Selects the first ready channel from multiple `FastChannel` instances (Go `select`-style).
+Selects the first ready channel from multiple `Channel` instances (Go `select`-style).
 
 - **Returns**: `(selected_channel, value)`.
 - **`default`**: When provided, `select_channel` is non-blocking: it tries each channel with `try_recv()` and returns `(channel, value)` for the first ready channel, or `default` if none is ready.
 - **Raises**: `ValueError` if no channels are given, `TimeoutError` if `timeout` is reached before any channel becomes ready, `ChannelClosedError` if **every** channel is closed and empty (a closed-empty channel can never become ready, so waiting would hang forever).
 
-**Closed-channel semantics** (U5-FIX-19):
+**Closed-channel semantics**:
 - A closed channel that still holds buffered items reports ready and yields its data — closing never destroys buffered values.
 - A closed-and-empty channel is silently ignored while any other channel is still open (select keeps waiting for the open one).
 - When **all** channels are closed and empty, `select_channel` raises `ChannelClosedError` instead of hanging.
@@ -704,7 +707,7 @@ async with lock:
 - **`locked`** -> `bool`: `True` if the lock is held.
 - **`owner`** -> `asyncio.Task | None`: The task currently holding the lock, if any.
 
-> **Diagnostic properties** (`locked`/`owner`/`Semaphore.value`/`qsize`/`Event.is_set`/`TaskHandle.status`) are consistent snapshots taken under the relevant internal lock — they are **not** atomic across each other and not a substitute for the actual acquire/wait operations under concurrency (FIX-14).
+> **Diagnostic properties** (`locked`/`owner`/`Semaphore.value`/`qsize`/`Event.is_set`/`TaskHandle.status`) are consistent snapshots taken under the relevant internal lock — they are **not** atomic across each other and not a substitute for the actual acquire/wait operations under concurrency.
 - **`acquire()`**: Acquires the lock, suspending until it is free.
 - **`release()`**: Releases the lock. Must be called by the owner.
 
@@ -862,21 +865,48 @@ async with ConnectionPinningServer(pool, host="127.0.0.1", port=8080) as server:
 
 ---
 
-### `GsyncioASGIWorker`
+### `MultiloopASGIWorker`
 
-Mounts FastAPI / Starlette / ASGI 3.0 applications directly onto `EventLoopThreadPool`.
+Mounts FastAPI / Starlette / ASGI 3.0 applications directly onto `EventLoopThreadPool`. Supports HTTP/1.1 chunked streaming, RFC 6455 Full-Duplex WebSockets, and RFC 9113 HTTP/2.0 binary frame multiplexing over single TCP connections.
 
 ```python
 from fastapi import FastAPI
-from gsyncio import EventLoopThreadPool, GsyncioASGIWorker
+from multiloop import EventLoopThreadPool, MultiloopASGIWorker
 
 app = FastAPI()
 
 
 async def main():
     async with EventLoopThreadPool(num_threads=4) as pool:
-        async with GsyncioASGIWorker(app, pool, port=8000):
-            print("FastAPI running on multi-threaded gsyncio pool...")
+        async with MultiloopASGIWorker(app, pool, port=8000):
+            print(
+                "FastAPI (HTTP/1.1, HTTP/2, WebSocket) running on multi-threaded multiloop pool..."
+            )
+            await asyncio.sleep(3600)
+```
+
+---
+
+### `MultiloopWSGIWorker`
+
+Mounts synchronous Django / Flask / WSGI 1.0.1 (PEP 3333) applications onto `EventLoopThreadPool`.
+
+```python
+from flask import Flask
+from multiloop import EventLoopThreadPool, MultiloopWSGIWorker
+
+app = Flask(__name__)
+
+
+@app.route("/")
+def index():
+    return "Hello from Flask on multiloop!"
+
+
+async def main():
+    async with EventLoopThreadPool(num_threads=4) as pool:
+        async with MultiloopWSGIWorker(app, pool, port=8000):
+            print("Flask WSGI running on multi-threaded multiloop pool...")
             await asyncio.sleep(3600)
 ```
 
@@ -884,24 +914,24 @@ async def main():
 
 ## Exceptions
 
-- **`GsyncioError`**: Base exception for all `gsyncio` errors.
+- **`MultiloopError`**: Base exception for all `multiloop` errors.
 
-### `GsyncioError`
+### `MultiloopError`
 
-Base exception for all `gsyncio` errors.
+Base exception for all `multiloop` errors.
 
 ### `ChannelClosedError`
 
-`ChannelClosedError(GsyncioError)` — raised when operating on a closed channel.
+`ChannelClosedError(MultiloopError)` — raised when operating on a closed channel.
 
 ### `ThreadPoolClosedError`
 
-`ThreadPoolClosedError(GsyncioError, RuntimeError)` — raised when submitting tasks to a closed thread pool.
+`ThreadPoolClosedError(MultiloopError, RuntimeError)` — raised when submitting tasks to a closed thread pool.
 
 ### `TimeoutError`
 
-`TimeoutError(GsyncioError)` — raised when a concurrency operation times out.
+`TimeoutError(MultiloopError)` — raised when a concurrency operation times out.
 
 ### `WouldBlock`
 
-`WouldBlock(GsyncioError)` — raised when a non-blocking operation (e.g. `try_recv()`) cannot proceed immediately.
+`WouldBlock(MultiloopError)` — raised when a non-blocking operation (e.g. `try_recv()`) cannot proceed immediately.

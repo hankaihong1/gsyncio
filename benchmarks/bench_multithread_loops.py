@@ -2,7 +2,7 @@ import asyncio
 import os
 import time
 
-from gsyncio.pool import EventLoopThreadPool
+from multiloop.pool import EventLoopThreadPool
 
 
 def cpu_intensive_work(iterations: int = 150000):
