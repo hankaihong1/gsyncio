@@ -497,6 +497,7 @@ async def test_asgi_http2_slow_streaming_body_no_loop_freeze() -> None:
         await writer.drain()
 
         resp_data = bytearray()
+        stream_ended = False
         for _ in range(50):
             raw = await asyncio.wait_for(reader.read(4096), timeout=2.0)
             if not raw:
@@ -506,8 +507,12 @@ async def test_asgi_http2_slow_streaming_body_no_loop_freeze() -> None:
                 if isinstance(event, h2.events.DataReceived):
                     resp_data.extend(event.data)
                 elif isinstance(event, h2.events.StreamEnded):
-                    break
-            if resp_data:
+                    stream_ended = True
+            to_send = client_conn.data_to_send()
+            if to_send:
+                writer.write(to_send)
+                await writer.drain()
+            if stream_ended:
                 break
 
         stop_heartbeat.set()
