@@ -124,7 +124,7 @@ impl tokio::io::AsyncWrite for PrefixedStream {
 #[pyo3(signature = (fd, initial_bytes, app, loop_obj, client_host, client_port, server_host, server_port, done_cb=None))]
 pub fn serve_h2_connection(
     _py: Python<'_>,
-    fd: i32,
+    fd: i64,
     initial_bytes: Vec<u8>,
     app: Py<PyAny>,
     loop_obj: Py<PyAny>,
@@ -134,9 +134,23 @@ pub fn serve_h2_connection(
     server_port: u16,
     done_cb: Option<Py<PyAny>>,
 ) -> PyResult<()> {
-    use std::os::fd::FromRawFd;
+    #[cfg(unix)]
+    let std_stream = unsafe {
+        use std::os::fd::FromRawFd;
+        std::net::TcpStream::from_raw_fd(fd as std::os::fd::RawFd)
+    };
 
-    let std_stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
+    #[cfg(windows)]
+    let std_stream = unsafe {
+        use std::os::windows::io::FromRawSocket;
+        std::net::TcpStream::from_raw_socket(fd as std::os::windows::io::RawSocket)
+    };
+
+    #[cfg(not(any(unix, windows)))]
+    return Err(pyo3::exceptions::PyNotImplementedError::new_err(
+        "serve_h2_connection is not supported on this platform",
+    ));
+
     std_stream.set_nonblocking(true)?;
     let rt = get_h2_runtime();
     let app_arc = Arc::new(app);
