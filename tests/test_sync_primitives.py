@@ -1,11 +1,11 @@
-"""Tests for gsyncio.Semaphore and gsyncio.CapacityLimiter."""
+"""Tests for multiloop.Semaphore and multiloop.CapacityLimiter."""
 
 import asyncio
 import threading
 
 import pytest
 
-from gsyncio import (
+from multiloop import (
     AsyncContext,
     AsyncWaitGroup,
     CapacityLimiter,
@@ -13,7 +13,7 @@ from gsyncio import (
     Lock,
     Semaphore,
 )
-from gsyncio.testing import wait_all_tasks_blocked
+from multiloop.testing import wait_all_tasks_blocked
 
 # ---------------------------------------------------------------------------
 # Semaphore tests
@@ -224,13 +224,13 @@ async def test_capacity_limiter_concurrent_total_tokens():
 
 
 # ---------------------------------------------------------------------------
-# R1 FIX-3 / R2 FIX-11 regression tests — release bound + limiter accounting
+# Regression tests
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_semaphore_release_beyond_max_raises():
-    """R1-FIX-3: over-release raises ValueError (asyncio.Semaphore parity);
+    """over-release raises ValueError (asyncio.Semaphore parity);
     pre-fix the value silently exceeded max_value."""
     sem = Semaphore(2)  # starts full — releasing without acquiring is over-release
     with pytest.raises(ValueError):
@@ -242,7 +242,7 @@ async def test_semaphore_release_beyond_max_raises():
 
 
 def test_semaphore_zero_ok():
-    """R2-FIX-11: Semaphore(0) is legal (asyncio parity) — a closed gate."""
+    """Semaphore(0) is legal (asyncio parity) — a closed gate."""
     sem = Semaphore(0)
     assert sem.value == 0
     with pytest.raises(ValueError):
@@ -251,7 +251,7 @@ def test_semaphore_zero_ok():
 
 @pytest.mark.asyncio
 async def test_semaphore_zero_acquire_blocks():
-    """R2-FIX-11: acquiring a zero-capacity semaphore blocks."""
+    """acquiring a zero-capacity semaphore blocks."""
     sem = Semaphore(0)
     with pytest.raises(asyncio.TimeoutError):
         await asyncio.wait_for(sem.acquire(), timeout=0.2)
@@ -259,7 +259,7 @@ async def test_semaphore_zero_acquire_blocks():
 
 @pytest.mark.asyncio
 async def test_limiter_shrink_below_borrowed_accounting():
-    """R1-FIX-3 (probe R1-B): shrinking below the borrowed count must report
+    """shrinking below the borrowed count must report
     the REAL borrowed count, not a value derived from the semaphore value."""
     limiter = CapacityLimiter(5)
     for _ in range(3):
@@ -304,7 +304,7 @@ def test_limiter_overrelease_keeps_borrowed():
 
 @pytest.mark.asyncio
 async def test_limiter_fractional_lt_one():
-    """R2-FIX-11 (probe R2-C): total_tokens in (0,1) is a capacity-0 gate —
+    """total_tokens in (0,1) is a capacity-0 gate —
     pre-fix it crashed with ValueError from Semaphore(int(0.5)) == Semaphore(0)."""
     limiter = CapacityLimiter(0.5)
     assert limiter.total_tokens == 0.5

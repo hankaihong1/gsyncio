@@ -6,10 +6,10 @@ Run: uv run python examples/02_waitgroup_once.py
 
 import asyncio
 
-import gsyncio
+import multiloop
 
 
-async def worker(name: str, wg: gsyncio.AsyncWaitGroup) -> None:
+async def worker(name: str, wg: multiloop.AsyncWaitGroup) -> None:
     try:
         await asyncio.sleep(0.02)
         print(f"  worker {name} done")
@@ -19,8 +19,8 @@ async def worker(name: str, wg: gsyncio.AsyncWaitGroup) -> None:
 
 async def main() -> None:
     # 1. WaitGroup: add() counts, done() decrements, wait() blocks until zero
-    wg = gsyncio.AsyncWaitGroup()
-    async with gsyncio.EventLoopThreadPool(num_threads=4) as pool:
+    wg = multiloop.AsyncWaitGroup()
+    async with multiloop.EventLoopThreadPool(num_threads=4) as pool:
         for i in range(5):
             wg.add()
             pool.submit(worker, f"task-{i}", wg)
@@ -29,7 +29,7 @@ async def main() -> None:
 
     # 2. AsyncOnce: concurrent callers still run init exactly once, sharing
     #    the result
-    once = gsyncio.AsyncOnce()
+    once = multiloop.AsyncOnce()
 
     async def init() -> str:
         await asyncio.sleep(0.02)  # simulate an expensive initialization
@@ -41,7 +41,7 @@ async def main() -> None:
 
     # 3. Exceptions are cached too: the first failure is re-raised to every
     #    later caller
-    once_fail = gsyncio.AsyncOnce()
+    once_fail = multiloop.AsyncOnce()
 
     def boom() -> None:
         raise ValueError("init failed")

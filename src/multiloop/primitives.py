@@ -1,4 +1,10 @@
-"""Concurrency primitives and synchronization tools."""
+"""Go-style concurrency primitives and high-performance channels for multiloop.
+
+Exposes :class:`Channel`, :func:`select_channel`, :class:`AsyncWaitGroup`,
+and :class:`AsyncOnce`.
+"""
+
+from __future__ import annotations
 
 import asyncio
 import builtins
@@ -9,18 +15,25 @@ from collections.abc import AsyncGenerator, Callable, Coroutine, Generator
 from contextlib import asynccontextmanager
 from typing import Any, Protocol
 
-from gsyncio._channel_base import (
+from multiloop._channel_base import (
     _CHANNEL_CLOSED_MSG,
     _BaseChannel,
     _discard_waiter,
     _wake_all,
 )
-from gsyncio._rust import _try_import_rust_class
-from gsyncio.exceptions import ChannelClosedError, TimeoutError, WouldBlock
+from multiloop._rust import _try_import_rust_class
+from multiloop.exceptions import ChannelClosedError, TimeoutError, WouldBlock
+
+__all__ = [
+    "AsyncOnce",
+    "AsyncWaitGroup",
+    "Channel",
+    "select_channel",
+]
 
 
-class _FastChannelProtocol(Protocol):
-    """Protocol for the Rust FastChannel class."""
+class _ChannelProtocol(Protocol):
+    """Protocol for the native Rust Channel class."""
 
     def __init__(self, maxsize: int) -> None: ...
     def try_send(self, item: Any) -> bool: ...
@@ -31,7 +44,7 @@ class _FastChannelProtocol(Protocol):
 
 
 class _RawAsyncChannelProtocol(Protocol):
-    """Protocol for the Rust RawAsyncChannel class."""
+    """Protocol for the native Rust RawAsyncChannel class."""
 
     def __init__(
         self,
@@ -58,7 +71,7 @@ class _RawAsyncChannelProtocol(Protocol):
 
 
 class _WaitGroupProtocol(Protocol):
-    """Protocol for the Rust RawAsyncWaitGroup class."""
+    """Protocol for the native Rust RawAsyncWaitGroup class."""
 
     def __init__(self) -> None: ...
     def add(self, delta: int) -> Any: ...
@@ -67,32 +80,54 @@ class _WaitGroupProtocol(Protocol):
     def unregister_waiter(self, fut: Any) -> bool: ...
 
 
-_RustFastChannel: type[_FastChannelProtocol] | None = _try_import_rust_class(
-    "gsyncio._gsyncio_core", "FastChannel"
+_RustChannel: type[_ChannelProtocol] | None = _try_import_rust_class(
+    "multiloop._multiloop_core", "Channel"
 )
 _RustRawAsyncChannel: type[_RawAsyncChannelProtocol] | None = _try_import_rust_class(
-    "gsyncio._gsyncio_core", "RawAsyncChannel"
+    "multiloop._multiloop_core", "RawAsyncChannel"
 )
 _RawAsyncWaitGroup: type[_WaitGroupProtocol] | None = _try_import_rust_class(
-    "gsyncio._gsyncio_core", "RawAsyncWaitGroup"
+    "multiloop._multiloop_core", "RawAsyncWaitGroup"
 )
 
 
-def _wake_fut(fut: asyncio.Future[Any], exc: BaseException | None = None) -> None:
-    """Complete *fut* on its owning loop, tolerating raced cancellations."""
+def _wake_fut(
+    fut: asyncio.Future[Any],
+    val: Any = None,
+    is_exc: bool = False,
+    has_val: bool = True,
+) -> None:
+    """Complete a future on its owning loop safely, tolerating concurrent cancellations.
+
+    :param fut: The future to fulfill or fail.
+    :param val: The value or exception to set on the future.
+    :param is_exc: Whether ``val`` represents an exception.
+    :param has_val: Whether ``val`` carries an actual payload value.
+    """
     try:
-        if exc is not None:
+        if is_exc:
+            exc = val
             if not isinstance(exc, ChannelClosedError) and "closed" in str(exc).lower():
                 exc = ChannelClosedError(_CHANNEL_CLOSED_MSG)
             fut.set_exception(exc)
         else:
-            fut.set_result(None)
+            fut.set_result(val)
     except (asyncio.InvalidStateError, RuntimeError):
-        pass
+        if has_val and not is_exc:
+            ch: Any = getattr(fut, "_ch", None)
+            if ch is not None and not getattr(ch, "is_closed", False):
+                try:
+                    ch.try_send(val)
+                except Exception:
+                    pass
 
 
 def _select_wake(arbiter_fut: asyncio.Future[Any], ch: Any) -> None:
-    """Wake select arbiter future, or forward wakeup if already fulfilled."""
+    """Wake a select arbiter future, forwarding the notification if the arbiter was already fulfilled.
+
+    :param arbiter_fut: The select arbiter future awaiting ready channel signal.
+    :param ch: The ready channel instance.
+    """
     try:
         if not arbiter_fut.done():
             arbiter_fut.set_result(ch)
@@ -113,17 +148,13 @@ class _LenShim:
         return int(self._len_fn())
 
 
-class FastChannel(_BaseChannel):
-    """High-performance cross-thread safe Channel backed by Rust RawAsyncChannel.
+class Channel(_BaseChannel):
+    """High-performance cross-thread channel backed by native Rust state machines.
 
-    This channel eliminates Python-level lock contention by delegating buffer
-    queueing, waiting state machines, double-checked locks, and cross-thread wakeups
-    directly to the Rust core runtime.
+    Eliminates Python-level lock contention by delegating buffer queueing, FIFO waiting
+    state machines, double-checked locking, and cross-thread wakeups directly to the Rust core.
 
-    :param maxsize:
-        Maximum number of items the channel can hold. Defaults to 0 (unbounded).
-    :type maxsize: int
-
+    :param maxsize: Maximum buffer capacity. 0 indicates an unbounded channel.
     """
 
     def __init__(self, maxsize: int = 0) -> None:
@@ -131,20 +162,15 @@ class FastChannel(_BaseChannel):
         if _RustRawAsyncChannel is not None:
             self._inner: Any = _RustRawAsyncChannel(self._maxsize, _wake_fut, _select_wake)
             self._use_raw = True
-        elif _RustFastChannel is not None:
+        elif _RustChannel is not None:
             super().__init__()
-            self._inner = _RustFastChannel(self._maxsize)
+            self._inner = _RustChannel(self._maxsize)
             self._use_raw = False
         else:
-            raise RuntimeError("_gsyncio_core Rust extension is not compiled.")
+            raise RuntimeError("_multiloop_core Rust extension is not compiled.")
 
     def close(self) -> None:
-        """Close the channel.
-
-        All pending senders and receivers will be woken up and fail with
-        :class:`ChannelClosedError`.
-
-        """
+        """Close the channel, waking all pending senders and receivers with ChannelClosedError."""
         if self._use_raw:
             self._inner.close()
         else:
@@ -153,28 +179,19 @@ class FastChannel(_BaseChannel):
                 self._close_waiters()
 
     def __repr__(self) -> str:
-        return f"<FastChannel is_closed={self.is_closed}>"
+        return f"<Channel is_closed={self.is_closed}>"
 
     @property
     def is_closed(self) -> bool:
-        """Return whether the channel is closed.
-
-        :returns: ``True`` if closed, ``False`` otherwise.
-        :rtype: :class:`bool`
-
-        """
+        """Return True if the channel is closed."""
         return bool(self._inner.is_closed())
 
     def try_send(self, item: Any) -> bool:
-        """Non-blocking send. Returns True if item was enqueued, False if full.
+        """Non-blocking send. Return True if the item was enqueued, False if full.
 
-        :param item: The object to send.
-
-        :returns: ``True`` if the item was sent, ``False`` if the channel is full.
-        :rtype: :class:`bool`
-
+        :param item: The item to enqueue into the channel.
+        :returns: ``True`` if sent immediately, ``False`` if the buffer was full.
         :raises ChannelClosedError: If the channel is closed.
-
         """
         if self._use_raw:
             try:
@@ -195,13 +212,11 @@ class FastChannel(_BaseChannel):
             raise ChannelClosedError(_CHANNEL_CLOSED_MSG) from e
 
     def try_recv(self) -> Any:
-        """Non-blocking recv. Returns an item or raises :class:`WouldBlock`.
+        """Non-blocking receive. Return the item or raise WouldBlock.
 
-        :returns: The received item.
-
+        :returns: The dequeued item.
         :raises WouldBlock: If the channel is empty.
-        :raises ChannelClosedError: If the channel is closed and empty.
-
+        :raises ChannelClosedError: If the channel is closed and completely drained.
         """
         if self._use_raw:
             try:
@@ -212,9 +227,6 @@ class FastChannel(_BaseChannel):
                 return item
             raise WouldBlock("Channel is empty")
         try:
-            # WHY: the native boundary returns (has_item, item) — a bare
-            # Option<Py<PyAny>> cannot distinguish a None payload from an
-            # empty channel (BUG-2).
             has_item, item = self._inner.try_recv()
         except RuntimeError as e:
             raise ChannelClosedError(_CHANNEL_CLOSED_MSG) from e
@@ -225,27 +237,22 @@ class FastChannel(_BaseChannel):
         raise WouldBlock("Channel is empty")
 
     def qsize(self) -> int:
-        """Return the number of items currently buffered in the channel.
-
-        :returns: Number of buffered items.
-        :rtype: :class:`int`
-
-        """
+        """Return the current number of buffered items."""
         return int(self._inner.qsize())
 
     @property
     def maxsize(self) -> int:
-        """Maximum number of items allowed in the channel (0 means unbounded)."""
+        """Maximum allowed items in the channel buffer (0 = unbounded)."""
         return self._maxsize
 
     def empty(self) -> bool:
-        """Return ``True`` if the channel is currently empty, ``False`` otherwise."""
+        """Return True if the channel buffer is currently empty."""
         if self._use_raw:
             return bool(self._inner.empty())
         return self.qsize() == 0
 
     def full(self) -> bool:
-        """Return ``True`` if the channel is currently full, ``False`` otherwise."""
+        """Return True if the channel buffer is currently full."""
         if self._use_raw:
             return bool(self._inner.full())
         if self._maxsize <= 0:
@@ -253,16 +260,10 @@ class FastChannel(_BaseChannel):
         return self.qsize() >= self._maxsize
 
     async def send(self, item: Any) -> None:
-        """Send an item into the channel.
+        """Send an item, suspending if the buffer is full until capacity is available.
 
-        If the channel is full, this method suspends until a slot becomes available.
-
-        :param item:
-            The object to send.
-
-        :raises ChannelClosedError:
-            If the channel is closed.
-
+        :param item: The item to send.
+        :raises ChannelClosedError: If the channel is closed.
         """
         if self._use_raw:
             loop = asyncio.get_running_loop()
@@ -288,6 +289,22 @@ class FastChannel(_BaseChannel):
         else:
             await self._wait_and_send(item, self._inner.try_send)
 
+    def send_sync(self, item: Any, timeout: float | None = None) -> None:
+        """Synchronously send an item into the channel from a worker or background OS thread.
+
+        :param item: The item to send.
+        :param timeout: Maximum seconds to block before raising TimeoutError.
+        :raises TimeoutError: If timeout expired before buffer space became available.
+        :raises ChannelClosedError: If the channel is closed.
+        """
+        deadline = (time.monotonic() + timeout) if timeout is not None else None
+        while True:
+            if self.try_send(item):
+                return
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError("send_sync timed out")
+            time.sleep(0.001)
+
     async def _recv_impl(self) -> Any:
         if self._use_raw:
             loop = asyncio.get_running_loop()
@@ -300,6 +317,7 @@ class FastChannel(_BaseChannel):
                     raise ChannelClosedError(_CHANNEL_CLOSED_MSG) from e
 
                 fut: asyncio.Future[Any] = loop.create_future()
+                fut._ch = self  # type: ignore[attr-defined]
                 try:
                     has_item, item = self._inner.register_getter(loop, fut)
                     if has_item:
@@ -308,7 +326,7 @@ class FastChannel(_BaseChannel):
                     raise ChannelClosedError(_CHANNEL_CLOSED_MSG) from e
 
                 try:
-                    await fut
+                    return await fut
                 except BaseException:
                     self._inner.unregister_getter(fut)
                     raise
@@ -324,7 +342,6 @@ class FastChannel(_BaseChannel):
                 except RuntimeError as e:
                     raise ChannelClosedError(_CHANNEL_CLOSED_MSG) from e
 
-                # Double-check inside lock before queueing future to prevent Lost-Wakeup race
                 with self._lock:
                     try:
                         has_item, item = self._inner.try_recv()
@@ -403,33 +420,16 @@ async def select_channel(
     default: Any = _UNSET,
     _deadline: float | None = None,
 ) -> Any:
-    """Select the first ready channel from multiple channel instances.
+    """Select and receive from the first ready channel among multiple channels (Go select style).
 
-    :param channels:
-        One or more :class:`FastChannel` instances to poll.
-
-    :param timeout:
-        Optional maximum time in seconds to wait for a channel to become ready.
-    :type timeout: float or None
-
-    :param default:
-        Optional sentinel value. When provided, ``select_channel`` returns
-        immediately (non-blocking): it tries each channel with
-        :meth:`~FastChannel.try_recv` and returns ``(channel, value)`` for
-        the first ready channel, or ``default`` if no channel is ready.
-
-    :returns:
-        When ``default`` is not provided: ``(selected_channel, received_value)``.
-        When ``default`` is provided and a channel is ready:
-        ``(selected_channel, received_value)``.
-        When ``default`` is provided and no channel is ready: ``default``.
-    :rtype: :class:`tuple` or any
-
-    :raises ValueError:
-        If no channels are provided.
-    :raises TimeoutError:
-        If the timeout expires before any channel becomes ready.
-
+    :param channels: One or more :class:`Channel` instances to monitor.
+    :param timeout: Maximum seconds to wait.
+    :param default: Optional non-blocking default fallback value.
+    :param _deadline: Internal monotonic deadline timestamp for recursive iterations.
+    :returns: A tuple ``(channel, received_value)``, or ``default`` if non-blocking and empty.
+    :raises ValueError: If no channels are passed.
+    :raises TimeoutError: If the operation times out.
+    :raises ChannelClosedError: If all monitored channels are closed and drained.
     """
     if not channels:
         raise ValueError("select_channel requires at least one channel")
@@ -440,7 +440,7 @@ async def select_channel(
 
     num_channels = len(channels)
     while True:
-        # Phase 1: Fast Probe (try_recv) with uniform lock-free pseudo-random start
+        # Phase 1: Fast Probe (try_recv) with randomized start index for anti-barging fairness
         start_idx = (time.perf_counter_ns() ^ id(loop)) % num_channels if num_channels > 1 else 0
         for i in range(num_channels):
             ch = channels[(start_idx + i) % num_channels]
@@ -464,7 +464,7 @@ async def select_channel(
         elif timeout is not None and timeout <= 0:
             raise TimeoutError("select_channel timed out")
 
-        # Phase 2: Single-Future Multi-Registration Arbiter
+        # Phase 2: Single-Arbiter Registration
         arbiter_fut: asyncio.Future[Any] = loop.create_future()
         registered_channels: list[tuple[Any, Any]] = []
 
@@ -494,7 +494,6 @@ async def select_channel(
             try:
                 return ready_ch, ready_ch.try_recv()
             except (WouldBlock, ChannelClosedError):
-                # Item consumed by concurrent reader or closed, retry arbitration iteratively
                 continue
         except (builtins.TimeoutError, TimeoutError):
             raise TimeoutError("select_channel timed out") from None
@@ -569,53 +568,41 @@ class _TrackedCoroutine(Coroutine[Any, Any, Any]):
 
 
 class AsyncWaitGroup:
-    """Cross-thread WaitGroup for coordinating multiple asynchronous tasks.
+    """Cross-thread WaitGroup for coordinating multiple asynchronous tasks (Go sync.WaitGroup style).
 
-    Allows one or more tasks to wait until a set of operations being performed
-    in other tasks completes (Go `sync.WaitGroup` style).
-
+    Coordinates a collection of parallel tasks across one or multiple event-loop threads.
     """
 
     def __init__(self) -> None:
         if _RawAsyncWaitGroup is None:
-            raise RuntimeError("_gsyncio_core Rust extension is not compiled.")
+            raise RuntimeError("_multiloop_core Rust extension is not compiled.")
         self._inner = _RawAsyncWaitGroup()
 
     def __repr__(self) -> str:
         return "<AsyncWaitGroup>"
 
     def add(self, delta: int = 1) -> None:
-        """Adjust the internal counter by ``delta`` (Go ``sync.WaitGroup`` semantics).
+        """Adjust the internal task counter by ``delta``.
 
-        Negative deltas are allowed but must not drive the counter below zero.
-
-        :param delta:
-            Amount to add to the counter. Defaults to 1.
-        :type delta: int
-
-        :raises RuntimeError:
-            If the counter would go negative.
-
+        :param delta: Integer delta to add (can be negative, but counter must not drop below zero).
+        :raises RuntimeError: If delta would drive the counter below zero.
         """
         waiters = self._inner.add(delta)
         if waiters:
             _wake_all(waiters)
 
     def done(self) -> None:
-        """Decrement the counter by 1. Wakes waiters if counter reaches 0."""
+        """Decrement the task counter by 1. Wakes all waiters if the counter reaches 0.
+
+        :raises RuntimeError: If done() is called when the counter is already zero.
+        """
         waiters = self._inner.done()
         if waiters:
             _wake_all(waiters)
 
     @asynccontextmanager
     async def holding(self) -> AsyncGenerator[None]:
-        """Asynchronous context manager that increments counter on enter and decrements on exit.
-
-        Guarantees structured RAII tracking without counter leaks::
-
-            async with wg.holding():
-                await do_work()
-        """
+        """RAII async context manager that increments counter on enter and decrements on exit."""
         self.add(1)
         try:
             yield
@@ -623,11 +610,10 @@ class AsyncWaitGroup:
             self.done()
 
     def wrap(self, fn: Callable[..., Any]) -> Callable[..., Any]:
-        """Wrap a callable to increment the counter upon invocation and decrement on finish.
+        """Wrap a callable to automatically track execution inside the waitgroup.
 
-        Usage with :meth:`TaskGroup.start_soon`::
-
-            tg.start_soon(wg.wrap(worker), "arg1")
+        :param fn: Synchronous or asynchronous callable to wrap.
+        :returns: Wrapped callable that decrements counter upon completion.
         """
 
         async def _wrapped(*args: Any, **kwargs: Any) -> Any:
@@ -643,26 +629,16 @@ class AsyncWaitGroup:
         return _wrapped
 
     def track(self, coro: Any) -> Any:
-        """Wrap a coroutine or callable, incrementing the counter immediately
-        (happens-before) and decrementing it when execution finishes (in ``finally``).
+        """Wrap a coroutine or callable with leak-safe happens-before tracking.
 
-        If the returned coroutine is discarded or closed without ever being awaited,
-        the internal counter is safely decremented to prevent counter leak.
-
-        :param coro: A coroutine object, Future, or callable to wrap and track.
-        :returns: An awaitable that decrements the counter upon completion.
+        :param coro: Coroutine object or callable to track.
+        :returns: Tracked coroutine object that decrements counter upon completion.
         """
         self.add(1)
         return _TrackedCoroutine(coro, self)
 
     async def wait(self) -> None:
-        """Suspend execution until the WaitGroup counter becomes 0.
-
-        .. note::
-            If the waiting task is cancelled, its entry is removed from the
-            Rust waiter list immediately (R5 FIX-D) — a cancelled wait never
-            accumulates stale entries.
-        """
+        """Suspend execution until the counter reaches zero."""
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[Any] = loop.create_future()
         already_done = self._inner.register_waiter((loop, fut))
@@ -671,22 +647,15 @@ class AsyncWaitGroup:
         try:
             await fut
         except BaseException:
-            # WHY: an entry left behind by a cancelled wait would sit in the
-            # Rust waiter list until the counter next reaches zero —
-            # unbounded growth on long-lived groups.  The unregister is a
-            # no-op when done() already handed the entry over (its waker
-            # skips done futures), so there is no lost-wakeup (R5 FIX-D).
             self._inner.unregister_waiter(fut)
             raise
 
 
 class AsyncOnce:
-    """Thread-safe single execution primitive across multiple event loops.
+    """Thread-safe single execution primitive across multiple event loops (Go sync.Once style).
 
-    Ensures that a given initialization function is executed exactly once
-    regardless of how many threads or coroutines attempt to execute it
-    concurrently (Go `sync.Once` style).
-
+    Guarantees that an initialization routine runs exactly once, even when invoked concurrently
+    by many coroutines across different OS threads.
     """
 
     def __init__(self) -> None:
@@ -705,18 +674,10 @@ class AsyncOnce:
     async def do(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         """Execute `fn` if and only if it has never been executed before.
 
-        .. warning::
-            Do not call :meth:`do` (directly or indirectly) from inside
-            ``fn`` — the leader task waits for its own completion, which is
-            a deadlock (the same limitation as Go's ``sync.Once``; R3-FIX-22
-            probe).  Spawn a separate task if ``fn`` needs the once result.
-
-        :param fn:
-            The function or coroutine function to execute.
-        :type fn: callable
-
+        :param fn: Target callable or coroutine function.
+        :param args: Positional arguments passed to `fn`.
+        :param kwargs: Keyword arguments passed to `fn`.
         :returns: The result returned by `fn`.
-
         """
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[Any] | None = None
@@ -738,7 +699,7 @@ class AsyncOnce:
                 self._waiters[fut] = loop
 
         if not is_leader:
-            assert fut is not None  # assigned above when is_leader is False
+            assert fut is not None
             try:
                 await fut
             finally:
@@ -748,7 +709,6 @@ class AsyncOnce:
                 raise self._exc
             return self._result
 
-        # Leader executes fn
         try:
             res = fn(*args, **kwargs)
             if asyncio.iscoroutine(res) or asyncio.isfuture(res):
@@ -756,15 +716,6 @@ class AsyncOnce:
             self._result = res
         except BaseException as e:
             if isinstance(e, asyncio.CancelledError):
-                # R7-D: a cancelled leader is not a function failure — convert
-                # the CancelledError at the boundary into a stable exception.
-                # Storing the CE in _exc would make later unrelated callers
-                # raise it (this file, :474), and a user-level CancelledError
-                # marks its task as cancelled (probe R7-BD).  The leader itself
-                # still re-raises the original CE; followers and new callers
-                # get a RuntimeError.  Note: `RuntimeError(...) from e` is a
-                # SyntaxError in assignment context (`from` is only valid in
-                # raise statements) — keep the chain via __cause__.
                 self._exc = RuntimeError("AsyncOnce execution was cancelled")
                 self._exc.__cause__ = e
             else:

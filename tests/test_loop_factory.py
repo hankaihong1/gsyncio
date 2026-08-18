@@ -2,7 +2,7 @@ import asyncio
 
 import pytest
 
-from gsyncio import EventLoopThreadPool
+from multiloop import EventLoopThreadPool
 
 
 @pytest.mark.asyncio

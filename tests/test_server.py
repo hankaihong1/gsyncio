@@ -7,9 +7,9 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 import pytest
 
-from gsyncio.asgi import GsyncioASGIWorker
-from gsyncio.pool import EventLoopThreadPool
-from gsyncio.server import ConnectionPinningServer
+from multiloop.asgi import MultiloopASGIWorker
+from multiloop.pool import EventLoopThreadPool
+from multiloop.server import ConnectionPinningServer
 
 
 @pytest.mark.asyncio
@@ -71,7 +71,7 @@ async def test_server_lifecycle_close():
 
 
 # Define a simple compliant ASGI 3.0 async app (simulating FastAPI/Starlette).
-# WHY: module-level helper shared by the two GsyncioASGIWorker tests below.
+# WHY: module-level helper shared by the two MultiloopASGIWorker tests below.
 async def mock_fastapi_app(scope, receive, send):
     if scope["type"] != "http":
         return
@@ -108,10 +108,10 @@ async def mock_fastapi_app(scope, receive, send):
 
 
 @pytest.mark.asyncio
-async def test_gsyncio_asgi_worker_get_and_post():
-    """Test that GsyncioASGIWorker can successfully proxy an ASGI/FastAPI application"""
+async def test_multiloop_asgi_worker_get_and_post():
+    """Test that MultiloopASGIWorker can successfully proxy an ASGI/FastAPI application"""
     async with EventLoopThreadPool(num_threads=2) as pool:
-        worker = GsyncioASGIWorker(app=mock_fastapi_app, pool=pool, host="127.0.0.1", port=0)
+        worker = MultiloopASGIWorker(app=mock_fastapi_app, pool=pool, host="127.0.0.1", port=0)
         await worker.start()
         port = worker.port
 
@@ -137,7 +137,7 @@ async def test_gsyncio_asgi_worker_get_and_post():
 async def test_asgi_lifecycle_close():
     """Lifecycle: start() and close() are symmetric and repeatable."""
     async with EventLoopThreadPool(num_threads=2) as pool:
-        worker = GsyncioASGIWorker(app=mock_fastapi_app, pool=pool, host="127.0.0.1", port=0)
+        worker = MultiloopASGIWorker(app=mock_fastapi_app, pool=pool, host="127.0.0.1", port=0)
         await worker.start()
         assert worker.is_running
 
@@ -168,13 +168,13 @@ async def test_server_dummy_handler():
 
 @pytest.mark.asyncio
 async def test_asgi_worker_malformed_http():
-    """Verify GsyncioASGIWorker fault tolerance for malformed HTTP requests and exceptions"""
+    """Verify MultiloopASGIWorker fault tolerance for malformed HTTP requests and exceptions"""
     async with EventLoopThreadPool(num_threads=2) as pool:
 
         async def err_app(scope, receive, send):
             raise RuntimeError("Application Error")
 
-        async with GsyncioASGIWorker(err_app, pool, port=0) as worker:
+        async with MultiloopASGIWorker(err_app, pool, port=0) as worker:
             assert worker.is_running
             port = worker.port
             reader, writer = await asyncio.open_connection("127.0.0.1", port)
@@ -190,7 +190,7 @@ async def test_asgi_worker_malformed_http():
 
 @pytest.mark.asyncio
 async def test_asgi_post_request_body():
-    """Verify GsyncioASGIWorker reads Content-Length request body"""
+    """Verify MultiloopASGIWorker reads Content-Length request body"""
     async with EventLoopThreadPool(num_threads=2) as pool:
 
         async def echo_app(scope, receive, send):
@@ -205,7 +205,7 @@ async def test_asgi_post_request_body():
             )
             await send({"type": "http.response.body", "body": body})
 
-        async with GsyncioASGIWorker(echo_app, pool, port=0) as worker:
+        async with MultiloopASGIWorker(echo_app, pool, port=0) as worker:
             reader, writer = await asyncio.open_connection("127.0.0.1", worker.port)
             req = b"POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 11\r\n\r\nHello World"
             writer.write(req)
@@ -233,11 +233,11 @@ async def test_server_and_asgi_context_manager():
         async with ConnectionPinningServer(pool, port=0) as server:
             assert server.port > 0
 
-        # Test GsyncioASGIWorker async with
+        # Test MultiloopASGIWorker async with
         async def dummy_app(scope, receive, send):
             pass
 
-        async with GsyncioASGIWorker(dummy_app, pool, port=0) as worker:
+        async with MultiloopASGIWorker(dummy_app, pool, port=0) as worker:
             assert worker.port > 0
 
 
@@ -263,12 +263,12 @@ async def test_vulnerability_server_abrupt_disconnect():
         await server.close()
 
 
-# ── U7 FIX-17 + FIX-23: start idempotence + handler exception hygiene ──────
+# ───────────────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
 async def test_server_start_idempotent():
-    """R2-FIX-17: calling start() twice must be a no-op — no second
+    """calling start() twice must be a no-op — no second
     acceptor, port unchanged (pre-fix: a second bind grabbed a fresh
     ephemeral port and orphaned the first acceptor set)."""
     async with EventLoopThreadPool(num_threads=2) as pool:
@@ -285,7 +285,7 @@ async def test_server_start_idempotent():
 
 @pytest.mark.asyncio
 async def test_server_handler_exception_no_noise(capsys):
-    """R3-FIX-23: a handler raising a non-OSError (ValueError) must not
+    """a handler raising a non-OSError (ValueError) must not
     surface as 'Task exception was never retrieved' noise — the failure is
     intentional and consumed by the done-callback."""
     async with EventLoopThreadPool(num_threads=1) as pool:
@@ -333,7 +333,7 @@ async def test_server_handshake_failure_no_fd_leak() -> None:
 
 @pytest.mark.asyncio
 async def test_asgi_path_query_string_separation() -> None:
-    """GsyncioASGIWorker must separate path and query_string according to ASGI 3.0."""
+    """MultiloopASGIWorker must separate path and query_string according to ASGI 3.0."""
     received_scope: dict[str, Any] = {}
 
     async def app(scope: Any, receive: Any, send: Any) -> None:
@@ -342,7 +342,7 @@ async def test_asgi_path_query_string_separation() -> None:
         await send({"type": "http.response.body", "body": b"ok", "more_body": False})
 
     async with EventLoopThreadPool(num_threads=2) as pool:
-        worker = GsyncioASGIWorker(app=app, pool=pool, host="127.0.0.1", port=0)
+        worker = MultiloopASGIWorker(app=app, pool=pool, host="127.0.0.1", port=0)
         await worker.start()
         reader, writer = await asyncio.open_connection("127.0.0.1", worker.port)
         writer.write(b"GET /api/v1/items?search=rust&limit=20 HTTP/1.1\r\nHost: localhost\r\n\r\n")
@@ -359,7 +359,7 @@ async def test_asgi_path_query_string_separation() -> None:
 
 @pytest.mark.asyncio
 async def test_asgi_streaming_chunked_response() -> None:
-    """GsyncioASGIWorker supports chunked streaming responses."""
+    """MultiloopASGIWorker supports chunked streaming responses."""
 
     async def streaming_app(scope: Any, receive: Any, send: Any) -> None:
         await send({"type": "http.response.start", "status": 200, "headers": []})
@@ -367,7 +367,7 @@ async def test_asgi_streaming_chunked_response() -> None:
         await send({"type": "http.response.body", "body": b"chunk2", "more_body": False})
 
     async with EventLoopThreadPool(num_threads=2) as pool:
-        worker = GsyncioASGIWorker(app=streaming_app, pool=pool, host="127.0.0.1", port=0)
+        worker = MultiloopASGIWorker(app=streaming_app, pool=pool, host="127.0.0.1", port=0)
         await worker.start()
         reader, writer = await asyncio.open_connection("127.0.0.1", worker.port)
         writer.write(b"GET /stream HTTP/1.1\r\nHost: localhost\r\n\r\n")
@@ -385,7 +385,7 @@ async def test_asgi_streaming_chunked_response() -> None:
 
 @pytest.mark.asyncio
 async def test_asgi_streaming_chunked_request_body() -> None:
-    """GsyncioASGIWorker supports chunked streaming request bodies in receive()."""
+    """MultiloopASGIWorker supports chunked streaming request bodies in receive()."""
     received_chunks: list[bytes] = []
 
     async def echo_chunked_app(scope: Any, receive: Any, send: Any) -> None:
@@ -406,7 +406,7 @@ async def test_asgi_streaming_chunked_request_body() -> None:
         await send({"type": "http.response.body", "body": total})
 
     async with EventLoopThreadPool(num_threads=2) as pool:
-        worker = GsyncioASGIWorker(app=echo_chunked_app, pool=pool, host="127.0.0.1", port=0)
+        worker = MultiloopASGIWorker(app=echo_chunked_app, pool=pool, host="127.0.0.1", port=0)
         await worker.start()
         reader, writer = await asyncio.open_connection("127.0.0.1", worker.port)
 

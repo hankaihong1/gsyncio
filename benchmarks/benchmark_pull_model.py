@@ -1,7 +1,7 @@
 import asyncio
 import time
 
-from gsyncio import EventLoopThreadPool
+from multiloop import EventLoopThreadPool
 
 
 # Simulate a CPU-bound computation task
@@ -45,10 +45,10 @@ async def run_benchmark():
         futs = [pool.submit(cpu_coro, calc_iterations) for _ in range(num_tasks)]
         await asyncio.gather(*futs)
         t1 = time.perf_counter()
-        gsyncio_fine_time = t1 - t0
-        speedup_fine = single_cpu_time / gsyncio_fine_time if gsyncio_fine_time > 0 else 1.0
+        multiloop_fine_time = t1 - t0
+        speedup_fine = single_cpu_time / multiloop_fine_time if multiloop_fine_time > 0 else 1.0
         print(
-            f"   2️⃣ gsyncio 4-Worker Pool: {gsyncio_fine_time:.4f} s (Speedup: {speedup_fine:.2f}x)"
+            f"   2️⃣ multiloop 4-Worker Pool: {multiloop_fine_time:.4f} s (Speedup: {speedup_fine:.2f}x)"
         )
 
     # -------------------------------------------------------------
@@ -63,11 +63,11 @@ async def run_benchmark():
         futs = [pool.submit(batched_cpu_coro, 10, calc_iterations) for _ in range(4)]
         await asyncio.gather(*futs)
         t1 = time.perf_counter()
-        gsyncio_batch_time = t1 - t0
-        speedup_batch = single_cpu_time / gsyncio_batch_time if gsyncio_batch_time > 0 else 1.0
+        multiloop_batch_time = t1 - t0
+        speedup_batch = single_cpu_time / multiloop_batch_time if multiloop_batch_time > 0 else 1.0
 
         print(f"   1️⃣ Single EventLoop Baseline: {single_cpu_time:.4f} s")
-        print(f"   2️⃣ gsyncio 4-Worker Batched Pool: {gsyncio_batch_time:.4f} s")
+        print(f"   2️⃣ multiloop 4-Worker Batched Pool: {multiloop_batch_time:.4f} s")
         print(
             f"   🔥 Batched Multi-Core Speedup: {speedup_batch:.2f}x Faster! (Near Theoretical Limit for 4 Cores)"
         )

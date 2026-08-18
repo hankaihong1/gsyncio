@@ -1,4 +1,4 @@
-# Contributing to gsyncio
+# Contributing to multiloop
 
 First off, thank you for taking the time to contribute! 🎉
 
@@ -22,14 +22,14 @@ we expect all contributors to uphold it.
 
 ## Development Setup
 
-`gsyncio` is a Python 3.14t (free-threaded / no-GIL) library with a Rust core
+`multiloop` is a Python 3.14t (free-threaded / no-GIL) library with a Rust core
 built with PyO3 and maturin. All tooling is managed through **`uv`** — please do
 not use `pip`.
 
 ### Prerequisites
 
 - **Python** `>= 3.14` (free-threaded build recommended)
-- **Rust** toolchain (stable) — needed to compile the `_gsyncio_core` extension
+- **Rust** toolchain (stable) — needed to compile the `_multiloop_core` extension
 - **`uv`** — the package/project manager used throughout this repo
 
 ### Install dev dependencies
@@ -46,8 +46,8 @@ This installs the dev dependency group from `pyproject.toml`, including
 
 ## Building the Rust Extension
 
-The core engine (`_gsyncio_core`) is a Rust cdylib (PyO3 + `flume` + `parking_lot`)
-that must be compiled before Python code can import `gsyncio`.
+The core engine (`_multiloop_core`) is a Rust cdylib (PyO3 + `flume` + `parking_lot`)
+that must be compiled before Python code can import `multiloop`.
 
 Build it with the release profile:
 
@@ -84,7 +84,7 @@ uv run pytest tests/test_channels.py::test_send_recv
 uv run pytest tests/test_pool.py -p no:cacheprovider --count=50
 ```
 
-> Because `gsyncio` is a concurrency library, `pytest-repeat` (`--count=N`) is
+> Because `multiloop` is a concurrency library, `pytest-repeat` (`--count=N`) is
 > your friend for stress-testing channels, pools, and wait groups.
 
 ### Quick Start (5 minutes to first run)
@@ -143,7 +143,7 @@ uv run ruff format .
 ### Python type checking (mypy, strict)
 
 ```bash
-uv run mypy src/gsyncio
+uv run mypy src/multiloop
 ```
 
 `mypy` runs with `strict = true` and `disallow_untyped_defs = true` (see
@@ -167,7 +167,7 @@ Before opening a PR, make sure the following all pass:
 uv run maturin develop --release   # builds the Rust core
 cargo clippy -- -D warnings
 cargo fmt --check
-uv run mypy src/gsyncio
+uv run mypy src/multiloop
 uv run ruff check .
 uv run ruff format .
 uv run pytest

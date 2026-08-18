@@ -1,11 +1,11 @@
-"""Shared fixtures for gsyncio tests."""
+"""Shared fixtures for multiloop tests."""
 
 import pytest
 
-from gsyncio.testing import rust_available, wait_all_tasks_blocked
+from multiloop.testing import rust_available, wait_all_tasks_blocked
 
 skip_if_no_rust = pytest.mark.skipif(
-    not rust_available(), reason="_gsyncio_core rust extension not available"
+    not rust_available(), reason="_multiloop_core rust extension not available"
 )
 
 

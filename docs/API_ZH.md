@@ -1,8 +1,8 @@
-# gsyncio API 参考（中文版）
+# multiloop API 参考（中文版）
 
 **[English](API.md)**
 
-`gsyncio` 的完整 API 文档：为 Python 3.14t（free-threaded / 无 GIL）打造的
+`multiloop` 的完整 API 文档：为 Python 3.14t（free-threaded / 无 GIL）打造的
 多事件循环引擎与并发工具包。
 
 ---
@@ -25,7 +25,7 @@
   - [`get_logger`](#get_logger)
   - [`set_log_level`](#set_log_level)
 - [Golang 风格通道与多路复用](#golang-风格通道与多路复用-golang-style-channels--multiplexing)
-  - [`FastChannel`](#fastchannel)
+  - [`Channel`](#channel)
   - [`select_channel`](#select_channel)
 - [任务管理](#任务管理-task-management)
   - [`TaskGroup`](#taskgroup)
@@ -45,9 +45,9 @@
   - [`AsyncRWMutex`](#asyncrwmutex)
 - [网络与 ASGI Worker](#网络与-asgi-worker-networking--asgi-workers)
   - [`ConnectionPinningServer`](#connectionpinningserver)
-  - [`GsyncioASGIWorker`](#gsyncioasgiworker)
+  - [`MultiloopASGIWorker`](#multiloopasgiworker)
 - [异常](#异常-exceptions)
-  - [`GsyncioError`](#gsyncioerror)
+  - [`MultiloopError`](#multilooperror)
   - [`ChannelClosedError`](#channelclosederror)
   - [`ThreadPoolClosedError`](#threadpoolclosederror)
   - [`TimeoutError`](#timeouterror)
@@ -57,7 +57,7 @@
 
 ## 快速示例 (Quick Examples)
 
-可直接复制运行的代码片段。每个示例都是自包含的：导入 `gsyncio`，定义
+可直接复制运行的代码片段。每个示例都是自包含的：导入 `multiloop`，定义
 `async def main()`，用 `asyncio.run(main())` 执行。模拟工作用
 `asyncio.sleep`。
 
@@ -65,7 +65,7 @@
 
 ```python
 import asyncio
-import gsyncio
+import multiloop
 
 
 async def heavy_task(x: int) -> int:
@@ -74,7 +74,7 @@ async def heavy_task(x: int) -> int:
 
 
 async def main():
-    async with gsyncio.EventLoopThreadPool(num_threads=2) as pool:
+    async with multiloop.EventLoopThreadPool(num_threads=2) as pool:
         fut1 = pool.submit(heavy_task, 21)
         fut2 = pool.submit(heavy_task, 21, pin_to=0)  # pinned to worker 0
         results = await asyncio.gather(fut1, fut2)
@@ -85,15 +85,15 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-### 2. `FastChannel` send/recv
+### 2. `Channel` send/recv
 
 ```python
 import asyncio
-import gsyncio
+import multiloop
 
 
 async def main():
-    ch = gsyncio.FastChannel()
+    ch = multiloop.Channel()
 
     async def producer():
         for i in range(3):
@@ -113,12 +113,12 @@ if __name__ == "__main__":
 
 ```python
 import asyncio
-import gsyncio
+import multiloop
 
 
 async def main():
-    ch1 = gsyncio.FastChannel()
-    ch2 = gsyncio.FastChannel()
+    ch1 = multiloop.Channel()
+    ch2 = multiloop.Channel()
 
     async def feeder():
         await asyncio.sleep(0.01)
@@ -126,7 +126,7 @@ async def main():
         ch2.close()
 
     asyncio.create_task(feeder())
-    selected, val = await gsyncio.select_channel(ch1, ch2, timeout=2.0)
+    selected, val = await multiloop.select_channel(ch1, ch2, timeout=2.0)
     print(f"selected: {val}")  # ("data from ch2") from ch2
 
 
@@ -138,12 +138,12 @@ if __name__ == "__main__":
 
 ```python
 import asyncio
-import gsyncio
+import multiloop
 
 
 async def main():
-    async with gsyncio.EventLoopThreadPool(num_threads=2) as pool:
-        ctx = gsyncio.AsyncContext()
+    async with multiloop.EventLoopThreadPool(num_threads=2) as pool:
+        ctx = multiloop.AsyncContext()
 
         async def slow_work():
             try:
@@ -165,17 +165,17 @@ if __name__ == "__main__":
 
 ```python
 import asyncio
-import gsyncio
+import multiloop
 
 
-async def worker(wg: gsyncio.AsyncWaitGroup, name: str):
+async def worker(wg: multiloop.AsyncWaitGroup, name: str):
     await asyncio.sleep(0.01)
     print(f"{name} done")
     wg.done()
 
 
 async def main():
-    wg = gsyncio.AsyncWaitGroup()
+    wg = multiloop.AsyncWaitGroup()
     wg.add(2)
     asyncio.create_task(worker(wg, "a"))
     asyncio.create_task(worker(wg, "b"))
@@ -191,7 +191,7 @@ if __name__ == "__main__":
 
 ```python
 import asyncio
-import gsyncio
+import multiloop
 
 
 async def init_db() -> str:
@@ -200,7 +200,7 @@ async def init_db() -> str:
 
 
 async def main():
-    once = gsyncio.AsyncOnce()
+    once = multiloop.AsyncOnce()
     r1 = await once.do(init_db)
     r2 = await once.do(init_db)  # skipped: runs once
     print(r1)  # "db ready"
@@ -215,11 +215,11 @@ if __name__ == "__main__":
 
 ```python
 import asyncio
-import gsyncio
+import multiloop
 
 
 async def main():
-    rw = gsyncio.AsyncRWMutex()
+    rw = multiloop.AsyncRWMutex()
     data = {"value": 0}
 
     async with rw.reader():  # concurrent readers allowed
@@ -240,11 +240,11 @@ if __name__ == "__main__":
 
 ```python
 import asyncio
-import gsyncio
+import multiloop
 
 
 async def main():
-    lock = gsyncio.Lock()
+    lock = multiloop.Lock()
     counter = 0
 
     async def inc():
@@ -265,7 +265,7 @@ if __name__ == "__main__":
 
 ```python
 import asyncio
-import gsyncio
+import multiloop
 
 
 async def worker(name: str) -> str:
@@ -274,7 +274,7 @@ async def worker(name: str) -> str:
 
 
 async def main():
-    async with gsyncio.TaskGroup() as tg:
+    async with multiloop.TaskGroup() as tg:
         h1 = tg.start_soon(worker, "a")
         h2 = tg.start_soon(worker, "b")
     # Both tasks are guaranteed finished here.
@@ -289,7 +289,7 @@ if __name__ == "__main__":
 
 ```python
 import asyncio
-import gsyncio
+import multiloop
 
 
 async def slow():
@@ -299,13 +299,13 @@ async def slow():
 async def main():
     # fail_after raises TimeoutError when the deadline expires.
     try:
-        async with gsyncio.fail_after(0.05):
+        async with multiloop.fail_after(0.05):
             await slow()
-    except gsyncio.TimeoutError:
+    except multiloop.TimeoutError:
         print("timed out with error")
 
     # move_on_after exits silently when the deadline expires.
-    async with gsyncio.move_on_after(0.05) as scope:
+    async with multiloop.move_on_after(0.05) as scope:
         await slow()
     if scope.cancelled_caught:
         print("timed out silently")
@@ -350,10 +350,10 @@ EventLoopThreadPool(
 ##### `async start()` -> `None`
 启动所有 worker 线程及其工作窃取队列分发器。
 
-##### `async close()` -> `None`
+##### `async close(timeout: float | None = None)` -> `None`
 优雅停止所有 worker 循环：排空待处理任务、join 所有 worker 线程。
 
-排空有上限：`close()` 最多等待约 5 秒让进行中的任务完成，之后强制停止所有 worker 循环——届时仍在运行的任务会被取消，不保证完成。
+排空超时可配置：`close()` 最多等待 `timeout` 秒（传入 `None` 时默认为 5.0 秒）让进行中的任务完成，超时后强制停止所有 worker 循环——届时仍在运行的任务会被取消，不保证完成。
 
 ##### `async abort()` -> `None`
 强制停止所有 worker 循环，**不**排空待处理任务。已排队未执行的工作被丢弃。
@@ -530,8 +530,8 @@ async with fail_after(10):
 def get_logger(name: str | None = None) -> logging.LoggerAdapter[Any]
 ```
 
-返回 `gsyncio` 命名空间的结构化日志适配器。适配器包装 `"gsyncio"`
-logger（给定 `name` 时为 `"gsyncio.<name>"` 子 logger，向根 `"gsyncio"`
+返回 `multiloop` 命名空间的结构化日志适配器。适配器包装 `"multiloop"`
+logger（给定 `name` 时为 `"multiloop.<name>"` 子 logger，向根 `"multiloop"`
 logger 传播并继承其级别），并向每条日志记录注入 `task_id` 与 `span`
 结构化字段。
 
@@ -548,7 +548,7 @@ log.info("pool started", extra={"span": "boot"})
 def set_log_level(level: int) -> None
 ```
 
-设置 gsyncio logger 的最低日志级别。`level` 是 `logging` 级别常量
+设置 multiloop logger 的最低日志级别。`level` 是 `logging` 级别常量
 （如 `logging.INFO` 或 `logging.DEBUG`）。
 
 ```python
@@ -561,7 +561,7 @@ set_log_level(logging.DEBUG)
 
 ## Golang 风格通道与多路复用 (Golang-Style Channels & Multiplexing)
 
-### `FastChannel`
+### `Channel`
 
 由 Rust（`flume` crate）支撑的高性能跨线程通道，使用 double-check lock
 模式实现零丢失唤醒信号竞争。
@@ -569,7 +569,7 @@ set_log_level(logging.DEBUG)
 #### 构造函数
 
 ```text
-FastChannel(maxsize: int = 0)
+Channel(maxsize: int = 0)
 ```
 
 - **`maxsize`** (*int*)：通道容量上限。`0` 表示无界通道。
@@ -579,6 +579,11 @@ FastChannel(maxsize: int = 0)
 ##### `async send(item: Any)` -> `None`
 向通道发送一个元素。通道满时挂起直到有空间。
 - **抛出**：通道已关闭时抛 `ChannelClosedError`。
+
+##### `send_sync(item: Any, timeout: float | None = None)` -> `None`
+同步阻塞发送，专为在同步工作线程中向通道投递数据设计。
+- **`timeout`** (*float | None*)：最长阻塞超时时间（秒）。
+- **抛出**：通道已关闭时抛 `ChannelClosedError`，超时抛 `TimeoutError`。
 
 ##### `async recv(timeout: float | None = None)` -> `Any`
 从通道接收一个元素。为空时挂起直到有元素。
@@ -595,8 +600,6 @@ FastChannel(maxsize: int = 0)
 
 ##### `qsize()` -> `int`
 返回当前缓冲在通道中的元素数量。
-
-
 
 ##### `close()` -> `None`
 关闭通道。所有挂起的发送者/接收者以 `ChannelClosedError` 被唤醒。
@@ -619,7 +622,7 @@ async def select_channel(
 ) -> Any
 ```
 
-从多个 `FastChannel` 中选择第一个就绪的通道（Go
+从多个 `Channel` 中选择第一个就绪的通道（Go
 `select` 风格）。
 
 - **返回**：`(selected_channel, value)`。
@@ -630,7 +633,7 @@ async def select_channel(
   `TimeoutError`，**所有**通道都已关闭且为空时抛 `ChannelClosedError`
   （关闭且为空的通道永远不会就绪，等待会永久挂起）。
 
-**关闭语义**（U5-FIX-19）：
+**关闭语义**：
 - 已关闭但仍缓冲着数据的通道照常报告就绪并返回数据——关闭不会销毁
   缓冲值。
 - 只要还有通道开着，关闭且为空的通道会被静默忽略（select 继续等待
@@ -754,7 +757,7 @@ async with lock:
 - **`locked`** -> `bool`：锁是否被持有。
 - **`owner`** -> `asyncio.Task | None`：当前持有锁的任务（如有）。
 
-> **诊断属性**（`locked`/`owner`/`Semaphore.value`/`qsize`/`Event.is_set`/`TaskHandle.status`）是各自内部锁下的一致快照——彼此之间**不是**原子的，也不能替代并发下的真实 acquire/wait 操作（FIX-14）。
+> **诊断属性**（`locked`/`owner`/`Semaphore.value`/`qsize`/`Event.is_set`/`TaskHandle.status`）是各自内部锁下的一致快照——彼此之间**不是**原子的，也不能替代并发下的真实 acquire/wait 操作。
 - **`acquire()`**：获取锁，挂起直到空闲。
 - **`release()`**：释放锁。必须由持有者调用。
 
@@ -916,21 +919,48 @@ async with ConnectionPinningServer(pool, host="127.0.0.1", port=8080) as server:
 
 ---
 
-### `GsyncioASGIWorker`
+### `MultiloopASGIWorker`
 
-把 FastAPI / Starlette / ASGI 3.0 应用直接挂载到 `EventLoopThreadPool` 上。
+把 FastAPI / Starlette / ASGI 3.0 应用直接挂载到 `EventLoopThreadPool` 上。完整支持 HTTP/1.1 分块流式传输、RFC 6455 全双工 WebSocket 以及 RFC 9113 HTTP/2.0 单连接二进制分帧并发多路复用。
 
 ```python
 from fastapi import FastAPI
-from gsyncio import EventLoopThreadPool, GsyncioASGIWorker
+from multiloop import EventLoopThreadPool, MultiloopASGIWorker
 
 app = FastAPI()
 
 
 async def main():
     async with EventLoopThreadPool(num_threads=4) as pool:
-        async with GsyncioASGIWorker(app, pool, port=8000):
-            print("FastAPI running on multi-threaded gsyncio pool...")
+        async with MultiloopASGIWorker(app, pool, port=8000):
+            print(
+                "FastAPI (HTTP/1.1, HTTP/2, WebSocket) running on multi-threaded multiloop pool..."
+            )
+            await asyncio.sleep(3600)
+```
+
+---
+
+### `MultiloopWSGIWorker`
+
+把同步 Django / Flask / WSGI 1.0.1 (PEP 3333) 应用挂载到 `EventLoopThreadPool` 上。
+
+```python
+from flask import Flask
+from multiloop import EventLoopThreadPool, MultiloopWSGIWorker
+
+app = Flask(__name__)
+
+
+@app.route("/")
+def index():
+    return "Hello from Flask on multiloop!"
+
+
+async def main():
+    async with EventLoopThreadPool(num_threads=4) as pool:
+        async with MultiloopWSGIWorker(app, pool, port=8000):
+            print("Flask WSGI running on multi-threaded multiloop pool...")
             await asyncio.sleep(3600)
 ```
 
@@ -938,26 +968,26 @@ async def main():
 
 ## 异常 (Exceptions)
 
-- **`GsyncioError`**：所有 `gsyncio` 错误的基类。
+- **`MultiloopError`**：所有 `multiloop` 错误的基类。
 
-### `GsyncioError`
+### `MultiloopError`
 
-所有 `gsyncio` 错误的基类。
+所有 `multiloop` 错误的基类。
 
 ### `ChannelClosedError`
 
-`ChannelClosedError(GsyncioError)` —— 对已关闭通道进行操作时抛出。
+`ChannelClosedError(MultiloopError)` —— 对已关闭通道进行操作时抛出。
 
 ### `ThreadPoolClosedError`
 
-`ThreadPoolClosedError(GsyncioError, RuntimeError)` —— 向已关闭的线程池
+`ThreadPoolClosedError(MultiloopError, RuntimeError)` —— 向已关闭的线程池
 提交任务时抛出。
 
 ### `TimeoutError`
 
-`TimeoutError(GsyncioError)` —— 并发操作超时时抛出。
+`TimeoutError(MultiloopError)` —— 并发操作超时时抛出。
 
 ### `WouldBlock`
 
-`WouldBlock(GsyncioError)` —— 非阻塞操作（如 `try_recv()`）无法立即继续
+`WouldBlock(MultiloopError)` —— 非阻塞操作（如 `try_recv()`）无法立即继续
 时抛出。

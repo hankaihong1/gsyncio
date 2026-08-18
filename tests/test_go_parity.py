@@ -3,7 +3,7 @@ import threading
 
 import pytest
 
-from gsyncio import (
+from multiloop import (
     AsyncOnce,
     AsyncRWMutex,
     AsyncWaitGroup,
@@ -175,13 +175,13 @@ async def test_race_wait_group_high_concurrency():
 
 
 # ---------------------------------------------------------------------------
-# FIX-D (R5 audit): cancelled AsyncWaitGroup.wait() must unregister
+# Regression test: cancelled AsyncWaitGroup.wait() must unregister
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_waitgroup_cancelled_wait_unregisters() -> None:
-    """FIX-D: a cancelled ``wait()`` must remove its entry from the Rust
+    """a cancelled ``wait()`` must remove its entry from the Rust
     waiter list — pre-fix every cancelled wait left a stale entry that only
     a later done()-to-zero drained (unbounded growth on long-lived groups)."""
     wg = AsyncWaitGroup()
@@ -208,7 +208,7 @@ async def test_once_cancelled_leader_does_not_poison_later_callers() -> None:
     RuntimeError instead of a CancelledError.
 
     Pre-fix: _exc stored the CancelledError, so an unrelated later caller's
-    do() raised it — a user-level CE marks its task as cancelled (probe R7-BD).
+    do() raised it — a user-level CE marks its task as cancelled.
     """
     once = AsyncOnce()
     started = asyncio.Event()

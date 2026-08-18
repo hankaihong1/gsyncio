@@ -1,4 +1,4 @@
-"""Stress tests for gsyncio running on Python 3.14t (free-threaded, no GIL).
+"""Stress tests for multiloop running on Python 3.14t (free-threaded, no GIL).
 
 These tests exercise cross-thread safety paths that are unique to the
 free-threaded build where multiple OS threads can truly execute Python
@@ -28,10 +28,10 @@ pytestmark = [
     pytest.mark.free_threading,
 ]
 
-pytest.importorskip("gsyncio")
+pytest.importorskip("multiloop")
 
-from gsyncio import Barrier, CancelScope, CapacityLimiter, EventLoopThreadPool  # noqa: E402
-from gsyncio.testing import wait_all_tasks_blocked  # noqa: E402
+from multiloop import Barrier, CancelScope, CapacityLimiter, EventLoopThreadPool  # noqa: E402
+from multiloop.testing import wait_all_tasks_blocked  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # CancelScope — cross-thread cancel + read under pressure

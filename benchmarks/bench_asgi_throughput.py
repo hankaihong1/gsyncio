@@ -9,8 +9,8 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from urllib.request import urlopen
 
-from gsyncio.asgi import GsyncioASGIWorker
-from gsyncio.pool import EventLoopThreadPool
+from multiloop.asgi import MultiloopASGIWorker
+from multiloop.pool import EventLoopThreadPool
 
 thread_counter = Counter()
 
@@ -160,14 +160,14 @@ async def main():
     concurrency = 50
 
     print("=" * 70)
-    print("🚀 FastAPI / ASGI App + Gsyncio Multithreaded Worker Benchmark")
+    print("🚀 FastAPI / ASGI App + Multiloop Multithreaded Worker Benchmark")
     print("Target: Python 3.14t Free-Threaded Multithreaded ASGI Engine")
     print(f"Requests: {total_requests} | Client Concurrency: {concurrency}")
     print("=" * 70)
 
     # 1. Single Thread Worker
     async with EventLoopThreadPool(num_threads=1) as pool:
-        worker = GsyncioASGIWorker(app=fastapi_demo_app, pool=pool, port=0)
+        worker = MultiloopASGIWorker(app=fastapi_demo_app, pool=pool, port=0)
         await worker.start()
 
         print("\n[1/2] Benchmarking FastAPI App on Single Thread Worker...")
@@ -180,10 +180,10 @@ async def main():
 
     # 2. Multi-Thread Worker (4 Loops)
     async with EventLoopThreadPool(num_threads=4) as pool:
-        worker = GsyncioASGIWorker(app=fastapi_demo_app, pool=pool, port=0)
+        worker = MultiloopASGIWorker(app=fastapi_demo_app, pool=pool, port=0)
         await worker.start()
 
-        print("\n[2/2] Benchmarking FastAPI App on 4-Thread Gsyncio ASGI Worker Pool...")
+        print("\n[2/2] Benchmarking FastAPI App on 4-Thread Multiloop ASGI Worker Pool...")
         thread_counter.clear()
         elapsed_4, qps_4, succ_4 = await benchmark_client(worker.port, total_requests, concurrency)
         print(
@@ -200,7 +200,7 @@ async def main():
     print("📊 FastAPI Multi-Thread Acceleration Summary:")
     print(f"  - Single-Thread ASGI QPS : {qps_1:8.2f} req/s")
     print(
-        f"  - 4-Thread Gsyncio Worker QPS: {qps_4:8.2f} req/s ({qps_4 / qps_1:.2f}x Acceleration)"
+        f"  - 4-Thread Multiloop Worker QPS: {qps_4:8.2f} req/s ({qps_4 / qps_1:.2f}x Acceleration)"
     )
     print("=" * 70)
 

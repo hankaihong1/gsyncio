@@ -23,8 +23,8 @@ bench:
 lint:
 	uv run ruff check .
 	uv run ruff format --check .
-	uv run mypy --strict src/gsyncio
-	uv run pyright src/gsyncio
+	uv run mypy --strict src/multiloop
+	uv run pyright src/multiloop
 	cargo clippy -- -D warnings
 	cargo fmt --check
 

@@ -1,6 +1,6 @@
-# gsyncio: Multi-Event-Loop Engine & Concurrency Toolkit for Python 3.14t
+# multiloop: Multi-Event-Loop Engine & Concurrency Toolkit for Python 3.14t
 
-[![CI](https://img.shields.io/github/actions/workflow/status/hankaihong1/gsyncio/ci.yml)](https://github.com/hankaihong1/gsyncio/actions/workflows/ci.yml)
+[![CI](https://img.shields.io/github/actions/workflow/status/hankaihong1/multiloop/ci.yml)](https://github.com/hankaihong1/multiloop/actions/workflows/ci.yml)
 [![Python 3.14](https://img.shields.io/badge/Python-3.14-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -23,7 +23,7 @@
 
 ## Introduction
 
-`gsyncio` is a high-performance multi-event-loop thread pool and Go-level
+`multiloop` is a high-performance multi-event-loop thread pool and Go-level
 concurrency primitive toolkit designed exclusively for **Python 3.14t
 (Free-Threaded / no-GIL)**. It features an `asyncssh`-style top-level API
 facade, supporting both zero-config top-level function access and explicit
@@ -36,18 +36,18 @@ thread pool management.
 ### Prerequisites
 
 - **Python 3.14+**: Free-Threaded (no-GIL) build, e.g. `3.14t`.
-- **Rust stable toolchain**: to compile the `_gsyncio_core` C extension from source.
+- **Rust stable toolchain**: to compile the `_multiloop_core` C extension from source.
 
 ### Install with pip
 
 ```bash
-pip install gsyncio
+pip install multiloop
 ```
 
 ### Install with uv
 
 ```bash
-uv add gsyncio
+uv add multiloop
 ```
 
 ### Build from source
@@ -68,19 +68,19 @@ maturin develop --release
 graph TD
     UserApp[User Application / FastAPI / ASGI 3.0] -->|pool.submit| Scheduler[Round-Robin Scheduler]
     
-    subgraph gsyncio Core Engine
+    subgraph multiloop Core Engine
         Scheduler -->|Round-Robin Notify| W1[Worker Loop Thread 1]
         Scheduler -->|Round-Robin Notify| W2[Worker Loop Thread 2]
         Scheduler -->|Round-Robin Notify| W3[Worker Loop Thread 3]
         
-        W1 <-->|Atomic Metrics| RustCore[Rust C-Extension _gsyncio_core]
+        W1 <-->|Atomic Metrics| RustCore[Rust C-Extension _multiloop_core]
         W2 <-->|Atomic Metrics| RustCore
         W3 <-->|Atomic Metrics| RustCore
     end
     
     subgraph Golang Concurrency Toolkit
-        RustCore <--> FastChan[FastChannel / flume]
-        FastChan <--> Select[gsyncio.select_channel]
+        RustCore <--> FastChan[Channel / flume]
+        FastChan <--> Select[multiloop.select_channel]
         FastChan <--> Context[AsyncContext]
         RustCore <--> WaitGroup[AsyncWaitGroup]
     end
@@ -95,23 +95,27 @@ graph TD
 - 🎯 **Round-Robin Worker Distribution**: tasks are pushed into a shared
   lock-free queue; worker threads pull and execute via a work-stealing model,
   with wake-up notifications distributed round-robin across worker loops.
-- 🦀 **Rust Engine (`_gsyncio_core`)**: lock-free primitives and the C
+- 🦀 **Rust Engine (`_multiloop_core`)**: lock-free primitives and the C
   extension are written in Rust (PyO3 + `flume` + `parking_lot`), delivering
   zero busy-wait (0% CPU idle) and extreme channel throughput.
 - 🚀 **`asyncssh`-Style Top-Level API Facade**: minimal API surface such as
-  `gsyncio.select_channel(...)` and `gsyncio.EventLoopThreadPool`, with pool
+  `multiloop.select_channel(...)` and `multiloop.EventLoopThreadPool`, with pool
   lifecycle managed via `async with`.
 - 🦫 **Golang-Style Concurrency Primitives**:
-  - `FastChannel` (elegant iteration via `async for item in ch:`)
-  - `gsyncio.select_channel(*channels)` (multi-channel select/multiplex)
+  - `Channel` (elegant iteration via `async for item in ch:`)
+  - `multiloop.select_channel(*channels)` (multi-channel select/multiplex)
   - `AsyncContext` (cross-thread cascading task cancellation and timeout broadcast)
   - `AsyncWaitGroup` & `AsyncOnce` & `AsyncRWMutex` (read-write lock separation)
+- 🌐 **High-Performance Web Engines**:
+  - `MultiloopASGIWorker`: Mount FastAPI / Starlette / ASGI 3.0 with Lifespan & RFC 6455 WebSockets.
+  - `MultiloopWSGIWorker`: Run synchronous Django / Flask (PEP 3333) with lock-free streaming response channels.
+  - `multiloop run` CLI runner for zero-downtime serving and hot reloading.
 
 ---
 
 ## Current Status & Known Limits
 
-**gsyncio is an experimental project for free-threaded CPython (3.14t).** Its
+**multiloop is an experimental project for free-threaded CPython (3.14t).** Its
 concurrency core has been through ten systematic audit rounds (R6–R10), each
 ending with deterministic reproduction tests and stress verification
 (`pytest --count=50`) — [docs/CONCURRENCY.md](docs/CONCURRENCY.md) is the
@@ -120,7 +124,7 @@ releases. If you build on it, pin the version.
 
 ### Verified performance (M1 8GB, Python 3.14t)
 
-| Workload | Single loop | gsyncio 4-worker | Speedup |
+| Workload | Single loop | multiloop 4-worker | Speedup |
 |---|---|---|---|
 | CPU-bound dispatch (40 × 2M ops) | 2.96 s | 0.84 s | **3.5x** |
 | Mixed I/O + CPU (400 tasks, 2 ms sleep + 40k ops) | 511 QPS | 1259 QPS | **2.5x** |
@@ -149,7 +153,7 @@ pure-I/O HTTP serving, a single asyncio loop (or uvicorn) is the better tool.
 
 ```python
 import asyncio
-import gsyncio
+import multiloop
 
 
 async def heavy_task(x: int):
@@ -159,7 +163,7 @@ async def heavy_task(x: int):
 
 async def main():
     # async with manages the thread pool lifecycle automatically
-    async with gsyncio.EventLoopThreadPool() as pool:
+    async with multiloop.EventLoopThreadPool() as pool:
         # Submit an async coroutine (shared queue + work-stealing scheduler)
         fut1 = pool.submit(heavy_task, 21)
 
@@ -176,16 +180,16 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-### 2. Go-Style Channel Iteration and `gsyncio.select_channel`
+### 2. Go-Style Channel Iteration and `multiloop.select_channel`
 
 ```python
 import asyncio
-import gsyncio
+import multiloop
 
 
 async def main():
-    ch1 = gsyncio.FastChannel()
-    ch2 = gsyncio.FastChannel()
+    ch1 = multiloop.Channel()
+    ch2 = multiloop.Channel()
 
     async def producer():
         await ch1.send("Data from Channel 1")
@@ -194,7 +198,7 @@ async def main():
     asyncio.create_task(producer())
 
     # select_channel waits for the first channel that becomes ready
-    selected_ch, val = await gsyncio.select_channel(ch1, ch2)
+    selected_ch, val = await multiloop.select_channel(ch1, ch2)
     print(f"Received: {val}")
 
 
@@ -206,10 +210,10 @@ if __name__ == "__main__":
 
 ```python
 import asyncio
-import gsyncio
+import multiloop
 
 
-async def worker(name: str, wg: gsyncio.AsyncWaitGroup):
+async def worker(name: str, wg: multiloop.AsyncWaitGroup):
     try:
         await asyncio.sleep(0.02)  # simulated work
         print(f"worker {name} done")
@@ -218,10 +222,10 @@ async def worker(name: str, wg: gsyncio.AsyncWaitGroup):
 
 
 async def main():
-    wg = gsyncio.AsyncWaitGroup()
+    wg = multiloop.AsyncWaitGroup()
 
     # Dispatch 5 tasks across a 4-thread pool
-    async with gsyncio.EventLoopThreadPool(num_threads=4) as pool:
+    async with multiloop.EventLoopThreadPool(num_threads=4) as pool:
         for i in range(5):
             wg.add()  # increment the counter
             pool.submit(worker, f"task-{i}", wg)
@@ -239,7 +243,7 @@ if __name__ == "__main__":
 
 ```python
 import asyncio
-import gsyncio
+import multiloop
 
 
 async def fetch(name: str, delay: float):
@@ -250,8 +254,8 @@ async def fetch(name: str, delay: float):
 async def main():
     try:
         # fail_after sets an overall timeout (0.1 s) for the whole block
-        async with gsyncio.fail_after(0.1):
-            async with gsyncio.TaskGroup() as tg:
+        async with multiloop.fail_after(0.1):
+            async with multiloop.TaskGroup() as tg:
                 # start_soon spawns a child task immediately, returning a TaskHandle
                 h1 = tg.start_soon(fetch, "fast", 0.01)
                 h2 = tg.start_soon(fetch, "slow", 0.5)
@@ -273,15 +277,15 @@ More runnable examples: [`examples/`](examples/README.md)
 ## Live Demo
 
 Want to see it running without writing code?
-[gsyncio-fastapi-demo](https://github.com/hankaihong1/gsyncio-fastapi-demo) is
-a real FastAPI application served directly by `GsyncioASGIWorker` — no
+[multiloop-fastapi-demo](https://github.com/hankaihong1/multiloop-fastapi-demo) is
+a real FastAPI application served directly by `MultiloopASGIWorker` — no
 uvicorn involved. Its page doubles as a live dashboard: every 2 seconds it
 pulls real metrics from `EventLoopThreadPool.get_metrics()` and shows which
 of the 4 event-loop threads handled each request.
 
 ```bash
-git clone https://github.com/hankaihong1/gsyncio-fastapi-demo
-cd gsyncio-fastapi-demo
+git clone https://github.com/hankaihong1/multiloop-fastapi-demo
+cd multiloop-fastapi-demo
 uv sync
 uv run python app.py        # then open http://127.0.0.1:8000
 ```

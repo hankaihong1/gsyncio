@@ -1,9 +1,4 @@
-"""Module-level defaults and PoolOptions dataclass for gsyncio.
-
-Inspired by asyncssh's SSHClientConnectionOptions pattern —
-collect thread-pool configuration into a single dataclass so
-callers can compose, share, and override settings easily.
-"""
+"""Module-level defaults and PoolOptions configuration dataclass for multiloop."""
 
 from __future__ import annotations
 
@@ -14,28 +9,30 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     import asyncio
 
-# Module-level defaults (asyncssh style)
+__all__ = ["PoolOptions"]
+
+# Module-level defaults
 _DEFAULT_NUM_THREADS: int = 0  # 0 → auto-detect (os.cpu_count())
 _DEFAULT_LOOP_FACTORY: Callable[[], asyncio.AbstractEventLoop] | None = None
 
 
 @dataclass
 class PoolOptions:
-    """Configuration for an :class:`~gsyncio.EventLoopThreadPool`.
+    """Configuration options for an :class:`~multiloop.EventLoopThreadPool`.
 
-    Every field defaults to a well-known module-level constant so
-    callers can import and customise the defaults directly.
+    Encapsulates worker count and custom loop factories so callers can compose,
+    share, and inspect pool configurations cleanly.
 
     Examples::
 
-        # Full auto — use defaults
+        # Auto-detect CPUs
         pool = EventLoopThreadPool()
 
-        # Explicit options via dataclass
+        # Explicit options dataclass
         opts = PoolOptions(num_threads=8)
         pool = EventLoopThreadPool(options=opts)
 
-        # Override single fields via constructor kwargs
+        # Keyword arguments override
         pool = EventLoopThreadPool(num_threads=4)
     """
 
@@ -43,4 +40,4 @@ class PoolOptions:
     """Number of worker threads (0 = auto-detect via :func:`os.cpu_count`)."""
 
     loop_factory: Callable[[], asyncio.AbstractEventLoop] | None = _DEFAULT_LOOP_FACTORY
-    """Callable returning a new event loop (``None`` = best available)."""
+    """Callable returning a new event loop instance (``None`` = default asyncio event loop)."""

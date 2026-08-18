@@ -3,20 +3,20 @@ import threading
 
 import pytest
 
-from gsyncio import (
+from multiloop import (
     AsyncContext,
     AsyncOnce,
     AsyncRWMutex,
     AsyncWaitGroup,
+    Channel,
     ChannelClosedError,
-    FastChannel,
-    GsyncioError,
+    MultiloopError,
     create_pool,
     run_in_pool,
 )
-from gsyncio.exceptions import ThreadPoolClosedError
-from gsyncio.pool import EventLoopThreadPool, PoolOptions, _safe_complete
-from gsyncio.testing import wait_all_tasks_blocked
+from multiloop.exceptions import ThreadPoolClosedError
+from multiloop.pool import EventLoopThreadPool, PoolOptions, _safe_complete
+from multiloop.testing import wait_all_tasks_blocked
 
 
 @pytest.mark.asyncio
@@ -300,13 +300,13 @@ async def test_pool_close_cancels_submitted_slow_tasks():
 
 
 # ---------------------------------------------------------------------------
-# FIX-7 regression tests (BUG-7 restart, TS-1 _get_loop after close) — 2026-08-10
+# Regression tests
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_restart_after_close_raises() -> None:
-    """BUG-7: start() after close() must fail loudly instead of silently
+    """start() after close() must fail loudly instead of silently
     accepting tasks that can never run."""
     pool = EventLoopThreadPool(num_threads=1)
     await pool.start()
@@ -456,8 +456,8 @@ async def test_repr_implementations():
         assert "EventLoopThreadPool" in repr_pool
         assert "threads=2" in repr_pool
 
-    ch = FastChannel()
-    assert "FastChannel" in repr(ch)
+    ch = Channel()
+    assert "Channel" in repr(ch)
 
     ctx = AsyncContext()
     assert "AsyncContext" in repr(ctx)
@@ -487,9 +487,9 @@ async def test_pool_closed_submission():
 
 @pytest.mark.asyncio
 async def test_exception_hierarchy():
-    """Verify engineering standard 1: all gsyncio custom exceptions inherit from GsyncioError"""
-    assert issubclass(ChannelClosedError, GsyncioError)
-    assert issubclass(ThreadPoolClosedError, GsyncioError)
+    """Verify engineering standard 1: all multiloop custom exceptions inherit from MultiloopError"""
+    assert issubclass(ChannelClosedError, MultiloopError)
+    assert issubclass(ThreadPoolClosedError, MultiloopError)
 
 
 @pytest.mark.asyncio
@@ -550,10 +550,10 @@ async def test_vulnerability_submit_coroutine_object():
 
 @pytest.mark.asyncio
 async def test_context_futures_cleaned():
-    """R3-FIX-21 (probe R3-D): completed AsyncContext submissions must be
+    """completed AsyncContext submissions must be
     dropped from _futures — pre-fix 500/500 stayed behind, so cancel() kept
     walking stale futures forever."""
-    from gsyncio import AsyncContext
+    from multiloop import AsyncContext
 
     ctx = AsyncContext()
     async with EventLoopThreadPool(num_threads=2) as pool:
@@ -567,12 +567,12 @@ async def test_context_futures_cleaned():
     assert len(ctx._futures) == 0  # type: ignore[attr-defined]
 
 
-# ── U6 FIX-13 + FIX-24: abort completes futures + contextvars propagation ──
+# ───────────────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
 async def test_abort_completes_all_futures():
-    """R2-FIX-13 (probe F13b): abort() must complete every outstanding
+    """abort() must complete every outstanding
     future — pre-fix 2911/5000 hung forever because queued-but-unexecuted
     tasks were discarded with nobody completing their futures."""
     async with EventLoopThreadPool(num_threads=2) as pool:
@@ -601,7 +601,7 @@ async def test_abort_completes_all_futures():
 
 @pytest.mark.asyncio
 async def test_abort_delivery_no_invalid_state(capsys):
-    """R2-FIX-13 revision B: abort racing a worker's own delivery must not
+    """revision B: abort racing a worker's own delivery must not
     surface InvalidStateError noise (the guard lives inside the scheduled
     callback, like _channel_base._set_soon)."""
     pool = EventLoopThreadPool(num_threads=1)
@@ -623,7 +623,7 @@ async def test_abort_delivery_no_invalid_state(capsys):
 
 @pytest.mark.asyncio
 async def test_submit_propagates_contextvars():
-    """R4-FIX-24 (probe R4-A): the caller's contextvars must reach the worker
+    """the caller's contextvars must reach the worker
     task — pre-fix the worker read 'missing' instead of the caller's value."""
     import contextvars
 
@@ -644,7 +644,7 @@ async def test_submit_propagates_contextvars():
 
 @pytest.mark.asyncio
 async def test_submit_no_ctx_backward_compat():
-    """FIX-24: without a caller-set ContextVar the default path is unchanged
+    """without a caller-set ContextVar the default path is unchanged
     (the worker sees the variable's default, not a corrupted context)."""
     import contextvars
 
@@ -658,18 +658,15 @@ async def test_submit_no_ctx_backward_compat():
     assert res == "missing"
 
 
-# ---------------------------------------------------------------------------
-# FIX-A / FIX-B / FIX-H (R5 audit): future-completion contracts
-# ---------------------------------------------------------------------------
+# ── Future completion contracts ────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
 async def test_pool_cancel_scope_completes_future():
-    """FIX-A: ``pool.submit(coro, cancel_scope=s)`` + ``s.cancel()`` must
-    complete the caller's future with CancelledError — pre-fix the future
-    stayed pending forever (worker returned silently on the scope-cancel
-    branch)."""
-    from gsyncio._cancel import CancelScope
+    """``pool.submit(coro, cancel_scope=s)`` + ``s.cancel()`` must
+    complete the caller's future with CancelledError.
+    """
+    from multiloop._cancel import CancelScope
 
     async with EventLoopThreadPool(num_threads=2) as pool:
         scope = CancelScope()
@@ -686,11 +683,7 @@ async def test_pool_cancel_scope_completes_future():
 
 @pytest.mark.asyncio
 async def test_pool_close_completes_all_burst_futures():
-    """FIX-B contract lock: burst submit + immediate ``close()`` must
-    complete every future.  Pre-fix a task popped by the drain but never
-    stepped (loop.stop raced create_task) was cancelled at its outermost
-    await and its future stayed pending forever; close() now also completes
-    any leftover ``_outstanding`` futures as a safety net."""
+    """Burst submit + immediate ``close()`` must complete every future."""
     pool = EventLoopThreadPool(num_threads=2)
     await pool.start()
 
@@ -710,7 +703,7 @@ async def test_pool_close_completes_all_burst_futures():
 
 @pytest.mark.asyncio
 async def test_pool_submit_push_failure_discards_future():
-    """FIX-H: a failed native push must not leave the future registered in
+    """a failed native push must not leave the future registered in
     ``_outstanding`` (repeated failures would grow the set forever)."""
     pool = EventLoopThreadPool(num_threads=1)
     await pool.start()

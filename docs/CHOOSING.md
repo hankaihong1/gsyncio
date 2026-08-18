@@ -1,4 +1,4 @@
-# gsyncio Primitive Selection Guide (CHOOSING.md)
+# multiloop Primitive Selection Guide (CHOOSING.md)
 
 **[中文版 (Chinese)](CHOOSING_ZH.md)**
 
@@ -7,7 +7,7 @@
 > parameters: [API.md](API.md). Concurrency semantics:
 > [CONCURRENCY.md](CONCURRENCY.md).
 >
-> **Architecture Note**: While gsyncio borrows the ergonomic API surface of AnyIO/Trio (`TaskGroup`, `CancelScope`, `CapacityLimiter`, etc.), all primitives execute under **Python 3.14t multi-threaded multi-event-loop physical parallelism** with OS mutexes and formal token conservation, rather than single-threaded cooperative assumptions. See [CONCURRENCY.md](CONCURRENCY.md).
+> **Architecture Note**: While multiloop borrows the ergonomic API surface of AnyIO/Trio (`TaskGroup`, `CancelScope`, `CapacityLimiter`, etc.), all primitives execute under **Python 3.14t multi-threaded multi-event-loop physical parallelism** with OS mutexes and formal token conservation, rather than single-threaded cooperative assumptions. See [CONCURRENCY.md](CONCURRENCY.md).
 
 ---
 
@@ -19,11 +19,11 @@
 | Explicitly create a pool object (deferred start / custom options) | `create_pool(num_threads=..., **PoolOptions)` | More controllable than `run_in_pool`; returns a reusable pool |
 | Submit a batch of tasks and collect results together | `pool.submit_group()` (with `group.start_soon()`) | Batch dispatch + batch wait; children auto-cancelled on pool close |
 | Pin a task to a fixed worker (stateful connection affinity) | `pool.submit(..., pin_to=N)` | Dedicated local queue, deterministic routing |
-| Communicate between tasks (Go channel style) | `FastChannel` | Rust flume lock-free channel, fastest cross-thread |
+| Communicate between tasks (Go channel style) | `Channel` | Rust flume lock-free channel, fastest cross-thread |
 | Race multiple channels and take the first ready one (Go select) | `select_channel(*channels)` | First ready channel wins |
 | Expose only send / only receive halves | `SendChannel` / `ReceiveChannel` (`ch.split()`) | Interface-level misuse prevention |
-| Iterate a data stream elegantly (until close) | `AsyncChannel` or `FastChannel` (`async for item in ch:`) | Iteration protocol + auto termination on close |
-| Just want a ready-made channel (asyncssh zero-config) | `FastChannel()` | Direct construction, no pool needed |
+| Iterate a data stream elegantly (until close) | `Channel` (`async for item in ch:`) | Iteration protocol + auto termination on close |
+| Just want a ready-made channel (asyncssh zero-config) | `Channel()` | Direct construction, no pool needed |
 | Mutually exclusive access to a shared resource | `Lock` | Fair FIFO, safe across loops/threads |
 | Limit concurrency (N permits) | `Semaphore` | Fixed permit pool, FIFO waiting |
 | Dynamically resize the concurrency cap | `CapacityLimiter` | `total_tokens` resizable at runtime |
@@ -40,7 +40,8 @@
 | Periodically check cancellation in a long loop | `checkpoint()` | Cancellation checkpoint inside sync code |
 | Query the tightest effective deadline | `current_effective_deadline()` | Shield truncates outer deadlines |
 | Cross-thread cascading cancellation / timeout broadcast | `AsyncContext` | Tree-propagated cancellation |
-| Run an ASGI service (FastAPI etc.) | `GsyncioASGIWorker` | Multi-event-loop workers |
+| Run an ASGI service (FastAPI, Starlette, WebSockets) | `MultiloopASGIWorker` | Multi-event-loop ASGI 3.0 worker with Lifespan & WebSocket support |
+| Run a synchronous WSGI service (Django, Flask, PEP 3333) | `MultiloopWSGIWorker` | Synchronous runner with lock-free channel response streaming |
 | Pin long-lived connections to a fixed worker | `ConnectionPinningServer` | Connection affinity, state never migrates |
 | Logging / adjust log level | `get_logger()` / `set_log_level()` | Unified logging outlet |
 
@@ -52,7 +53,7 @@
   through a global lock-free queue with work stealing; the `pin_to=` argument
   uses a dedicated local queue. The pool is an **async context manager**:
   `async with EventLoopThreadPool(num_threads=4) as pool:`.
-- **`FastChannel`** — data plane in Rust (flume), wait plane in Python
+- **`Channel`** — data plane in Rust (flume), wait plane in Python
   (double-check lock). Bounded (`maxsize=N`) or unbounded (default). Safe to
   send/recv cross-thread.
 - **`select_channel`** — one reader per channel; the first to deliver wins
@@ -78,9 +79,9 @@
   `async with rw.writer():` exclusive write; see [API.md](API.md) for the
   corresponding entry.
 - **Exceptions** — `ChannelClosedError` (channel closed),
-  `ThreadPoolClosedError` (pool closed), `TimeoutError` (gsyncio's own
+  `ThreadPoolClosedError` (pool closed), `TimeoutError` (multiloop's own
   timeout, not the builtin), `WouldBlock` (non-blocking op has no data),
-  base class `GsyncioError`.
+  base class `MultiloopError`.
 
 ---
 
@@ -88,22 +89,22 @@
 
 ```python
 import asyncio
-import gsyncio
+import multiloop
 
 
 async def main():
     # Pool: submit + await result
-    async with gsyncio.EventLoopThreadPool(num_threads=4) as pool:
+    async with multiloop.EventLoopThreadPool(num_threads=4) as pool:
         fut = pool.submit(asyncio.sleep, 0.01)
         await fut
 
     # Channel: cross-task communication
-    ch = gsyncio.FastChannel()
+    ch = multiloop.Channel()
     await ch.send(42)
     print(await ch.recv())  # 42
 
     # Wait for a group
-    wg = gsyncio.AsyncWaitGroup()
+    wg = multiloop.AsyncWaitGroup()
     wg.add(1)
     wg.done()
     await wg.wait()

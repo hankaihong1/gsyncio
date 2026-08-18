@@ -2,7 +2,7 @@
 
 Two responsibilities:
 
-1. Every public symbol in ``gsyncio.__all__`` must have a ``### `X``` entry in
+1. Every public symbol in ``multiloop.__all__`` must have a ``### `X``` entry in
    docs/API.md — prevents "new API without docs" drift.
 2. All python code blocks in README / docs / examples must pass ``ast.parse``
    — prevents stale example syntax.  Syntax-level check only, no execution
@@ -16,7 +16,7 @@ import pathlib
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
-# API.md entry headings look like: ### `FastChannel` (the Quick Examples
+# API.md entry headings look like: ### `Channel` (the Quick Examples
 # section uses a "### 1. `X`" prefix)
 _API_SYMBOL_RE = r"^###\s+(?:\d+\.\s+)?`([A-Za-z_]\w*)`"
 
@@ -39,10 +39,10 @@ def _extract_python_blocks(path: pathlib.Path) -> list[str]:
 def test_all_public_symbols_documented() -> None:
     """Every symbol in __all__ must have a docs/API.md entry (__version__ is
     exempt — it is a build constant, not an API symbol)."""
-    import gsyncio
+    import multiloop
 
     documented = _extract_api_symbols(ROOT / "docs" / "API.md")
-    missing = sorted(set(gsyncio.__all__) - documented - {"__version__"})
+    missing = sorted(set(multiloop.__all__) - documented - {"__version__"})
     assert not missing, f"docs/API.md is missing documentation entries for: {missing}"
 
 
