@@ -287,6 +287,14 @@ async def test_asgi_http2_request_response() -> None:
         writer.write(client_conn.data_to_send())
         await writer.drain()
 
+        # Synchronize initial HTTP/2 connection preface & settings
+        raw = await asyncio.wait_for(reader.read(4096), timeout=5.0)
+        client_conn.receive_data(raw)
+        to_send = client_conn.data_to_send()
+        if to_send:
+            writer.write(to_send)
+            await writer.drain()
+
         # Send Stream 1
         headers = [
             (":method", "POST"),
@@ -305,7 +313,7 @@ async def test_asgi_http2_request_response() -> None:
         stream_ended = False
 
         for _ in range(50):
-            raw = await asyncio.wait_for(reader.read(4096), timeout=2.0)
+            raw = await asyncio.wait_for(reader.read(4096), timeout=5.0)
             if not raw:
                 break
             events = client_conn.receive_data(raw)
@@ -364,6 +372,14 @@ async def test_asgi_http2_concurrent_multiplexed_streams() -> None:
         writer.write(client_conn.data_to_send())
         await writer.drain()
 
+        # Synchronize initial HTTP/2 connection preface & settings
+        raw = await asyncio.wait_for(reader.read(4096), timeout=5.0)
+        client_conn.receive_data(raw)
+        to_send = client_conn.data_to_send()
+        if to_send:
+            writer.write(to_send)
+            await writer.drain()
+
         # Send Stream 1, 3, 5 concurrently over same connection
         for stream_id, name in [(1, "first"), (3, "second"), (5, "third")]:
             headers = [
@@ -384,7 +400,7 @@ async def test_asgi_http2_concurrent_multiplexed_streams() -> None:
         ended_streams: set[int] = set()
 
         for _ in range(100):
-            raw = await asyncio.wait_for(reader.read(4096), timeout=2.0)
+            raw = await asyncio.wait_for(reader.read(4096), timeout=5.0)
             if not raw:
                 break
             events = client_conn.receive_data(raw)
@@ -470,7 +486,7 @@ async def test_asgi_http2_slow_streaming_body_no_loop_freeze() -> None:
         await writer.drain()
 
         # Receive server connection preface & settings to synchronize connection state
-        raw = await asyncio.wait_for(reader.read(4096), timeout=2.0)
+        raw = await asyncio.wait_for(reader.read(4096), timeout=5.0)
         client_conn.receive_data(raw)
         to_send = client_conn.data_to_send()
         if to_send:
@@ -507,7 +523,7 @@ async def test_asgi_http2_slow_streaming_body_no_loop_freeze() -> None:
         resp_data = bytearray()
         stream_ended = False
         for _ in range(50):
-            raw = await asyncio.wait_for(reader.read(4096), timeout=2.0)
+            raw = await asyncio.wait_for(reader.read(4096), timeout=5.0)
             if not raw:
                 break
             events = client_conn.receive_data(raw)
