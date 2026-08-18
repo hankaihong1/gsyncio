@@ -7,6 +7,7 @@ import base64
 import hashlib
 import os
 import struct
+import sys
 import types
 from collections.abc import Callable
 from http import HTTPStatus
@@ -284,7 +285,25 @@ class MultiloopASGIWorker:
                         if _serve_h2_connection is not None:
                             sock = writer.get_extra_info("socket")
                             if sock is not None:
-                                fd = os.dup(sock.fileno())
+                                if sys.platform == "win32":
+                                    try:
+                                        import _winapi
+
+                                        cur_proc = _winapi.GetCurrentProcess()
+                                        fd = int(
+                                            _winapi.DuplicateHandle(
+                                                cur_proc,
+                                                sock.fileno(),
+                                                cur_proc,
+                                                0,
+                                                True,
+                                                _winapi.DUPLICATE_SAME_ACCESS,
+                                            )
+                                        )
+                                    except Exception:
+                                        fd = int(sock.fileno())
+                                else:
+                                    fd = os.dup(sock.fileno())
                                 transport = writer.transport
                                 if isinstance(transport, asyncio.ReadTransport):
                                     transport.pause_reading()
