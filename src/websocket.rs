@@ -43,7 +43,7 @@ pub struct FastWebSocketParser;
 #[pymethods]
 impl FastWebSocketParser {
     /// Parses the frame header from the byte slice.
-    /// Returns: Option<(opcode, fin, masked, payload_len, Option<Vec<u8>>, header_len)>
+    /// Returns: `Option<(opcode, fin, masked, payload_len, Option<Vec<u8>>, header_len)>`
     #[staticmethod]
     pub fn parse_frame_header(buf: &[u8]) -> Option<ParsedWebSocketFrameHeader> {
         if buf.len() < 2 {
