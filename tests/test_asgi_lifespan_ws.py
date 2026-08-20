@@ -549,3 +549,183 @@ async def test_asgi_http2_slow_streaming_body_no_loop_freeze() -> None:
         assert heartbeat_ticks >= 5, (
             f"Heartbeat ticks too low ({heartbeat_ticks}), loop was starved"
         )
+
+
+@pytest.mark.asyncio
+async def test_asgi_http11_keepalive_multiple_requests() -> None:
+    """Test that a single TCP socket can serve multiple sequential HTTP/1.1 requests (Keep-Alive)."""
+
+    async def echo_app(scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope["type"] != "http":
+            return
+        path = scope.get("path", "/")
+        body = f"hello from {path}".encode()
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [
+                    (b"content-type", b"text/plain"),
+                    (b"content-length", str(len(body)).encode("latin1")),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": body, "more_body": False})
+
+    async with EventLoopThreadPool(num_threads=2) as pool:
+        worker = MultiloopASGIWorker(app=echo_app, pool=pool, port=0)
+        async with worker:
+            port = worker.port
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+
+            for i in range(5):
+                req = f"GET /item_{i} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"
+                writer.write(req.encode("latin1"))
+                await writer.drain()
+
+                # Read HTTP response status
+                status_line = await asyncio.wait_for(reader.readline(), timeout=2.0)
+                assert b"200 OK" in status_line
+
+                # Read headers until \r\n
+                headers = {}
+                while True:
+                    line = await asyncio.wait_for(reader.readline(), timeout=2.0)
+                    if not line or line == b"\r\n":
+                        break
+                    k, v = line.decode("latin1").split(":", 1)
+                    headers[k.strip().lower()] = v.strip().lower()
+
+                cl = int(headers.get("content-length", "0"))
+                body = await asyncio.wait_for(reader.readexactly(cl), timeout=2.0)
+                assert body == f"hello from /item_{i}".encode()
+                # Connection should NOT be forced closed
+                assert headers.get("connection") != "close"
+
+            writer.close()
+            await writer.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_asgi_http11_explicit_connection_close() -> None:
+    """Test that Connection: close header cleanly terminates the Keep-Alive connection."""
+
+    async def simple_app(scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope["type"] != "http":
+            return
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"content-type", b"text/plain"), (b"content-length", b"2")],
+            }
+        )
+        await send({"type": "http.response.body", "body": b"ok", "more_body": False})
+
+    async with EventLoopThreadPool(num_threads=2) as pool:
+        worker = MultiloopASGIWorker(app=simple_app, pool=pool, port=0)
+        async with worker:
+            port = worker.port
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+
+            req = f"GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+            writer.write(req.encode("latin1"))
+            await writer.drain()
+
+            status_line = await asyncio.wait_for(reader.readline(), timeout=2.0)
+            assert b"200 OK" in status_line
+
+            headers = {}
+            while True:
+                line = await asyncio.wait_for(reader.readline(), timeout=2.0)
+                if not line or line == b"\r\n":
+                    break
+                k, v = line.decode("latin1").split(":", 1)
+                headers[k.strip().lower()] = v.strip().lower()
+
+            assert headers.get("connection") == "close"
+            body = await asyncio.wait_for(reader.read(1024), timeout=2.0)
+            assert body == b"ok"
+
+            # Server must have closed connection (EOF on read)
+            eof = await asyncio.wait_for(reader.read(1024), timeout=2.0)
+            assert eof == b""
+
+            writer.close()
+            await writer.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_asgi_http11_keepalive_post_and_get() -> None:
+    """Test sequential POST with body followed by GET on the same Keep-Alive socket."""
+
+    async def api_app(scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope["type"] != "http":
+            return
+        method = scope.get("method", "GET")
+        if method == "POST":
+            req_body = bytearray()
+            while True:
+                msg = await receive()
+                req_body.extend(msg.get("body", b""))
+                if not msg.get("more_body", False):
+                    break
+            resp = b"received:" + bytes(req_body)
+        else:
+            resp = b"get_success"
+
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [
+                    (b"content-type", b"text/plain"),
+                    (b"content-length", str(len(resp)).encode("latin1")),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": resp, "more_body": False})
+
+    async with EventLoopThreadPool(num_threads=2) as pool:
+        worker = MultiloopASGIWorker(app=api_app, pool=pool, port=0)
+        async with worker:
+            port = worker.port
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+
+            # Request 1: POST
+            post_body = b"sample_payload_123"
+            post_req = (
+                f"POST /api HTTP/1.1\r\n"
+                f"Host: 127.0.0.1:{port}\r\n"
+                f"Content-Length: {len(post_body)}\r\n\r\n"
+            ).encode("latin1") + post_body
+            writer.write(post_req)
+            await writer.drain()
+
+            status = await asyncio.wait_for(reader.readline(), timeout=2.0)
+            assert b"200 OK" in status
+            while True:
+                line = await asyncio.wait_for(reader.readline(), timeout=2.0)
+                if not line or line == b"\r\n":
+                    break
+            resp1 = await asyncio.wait_for(
+                reader.readexactly(len(b"received:" + post_body)), timeout=2.0
+            )
+            assert resp1 == b"received:sample_payload_123"
+
+            # Request 2: GET on the same socket
+            get_req = f"GET /api HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n".encode("latin1")
+            writer.write(get_req)
+            await writer.drain()
+
+            status2 = await asyncio.wait_for(reader.readline(), timeout=2.0)
+            assert b"200 OK" in status2
+            while True:
+                line = await asyncio.wait_for(reader.readline(), timeout=2.0)
+                if not line or line == b"\r\n":
+                    break
+            resp2 = await asyncio.wait_for(reader.readexactly(len(b"get_success")), timeout=2.0)
+            assert resp2 == b"get_success"
+
+            writer.close()
+            await writer.wait_closed()

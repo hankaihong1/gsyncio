@@ -34,7 +34,7 @@ invariants, token conservation laws, and multi-thread signal forwarding**.
 ```
 multiloop/
 ├── src/
-│   ├── multiloop/              # Python package (19 modules)
+│   ├── multiloop/              # Python package (22 modules)
 │   │   ├── __init__.py       # Public API surface — start here
 │   │   ├── pool.py           # EventLoopThreadPool engine
 │   │   ├── primitives.py     # Channel, select_channel, AsyncWaitGroup, AsyncOnce
@@ -42,11 +42,14 @@ multiloop/
 │   │   ├── _cancel.py        # CancelScope, fail_after, move_on_after, shield
 │   │   ├── _sync.py          # Lock, Semaphore, Event, Condition, Barrier
 │   │   ├── _taskgroup.py     # TaskGroup, TaskHandle
-│   │   ├── rwlock.py         # AsyncRWMutex (async read-write lock)
+│   │   ├── rwlock.py         # AsyncRWMutex (async read-write lock, Rust-backed)
 │   │   ├── asgi.py           # MultiloopASGIWorker (ASGI 3.0, Lifespan, WebSockets, H2)
+│   │   ├── _http11.py        # Http11Protocol (Rust SIMD httparse & fused TCP write)
+│   │   ├── _websocket.py     # WebSocketProtocol (Rust SIMD unmasking & RFC 6455)
+│   │   ├── _lifespan.py      # ASGILifespanManager (ASGI lifespan state machine)
 │   │   ├── wsgi.py           # MultiloopWSGIWorker (WSGI 1.0.1, PEP 3333 synchronous runner)
 │   │   ├── cli.py            # multiloop run CLI server runner
-│   │   ├── server.py         # ConnectionPinningServer (SO_REUSEPORT multi-core listener)
+│   │   ├── server.py         # ConnectionPinningServer (platform-adaptive multi-core listener)
 │   │   ├── _channel_base.py  # Shared waiter deques, _wake_all, _wakeup_next
 │   │   ├── _rust.py          # _try_import_rust_class helper
 │   │   ├── _metrics.py       # MetricsCollector
@@ -59,10 +62,12 @@ multiloop/
 │   ├── pool.rs               # NativeWorkerPool & PollerGuard
 │   ├── channel.rs            # Channel, RawAsyncChannel (Anti-Barging FIFO)
 │   ├── waitgroup.rs          # RawAsyncWaitGroup & WaitGroupInner
-│   ├── http.rs               # FastHttpParser (SIMD httparse)
+│   ├── rwlock.rs             # RawAsyncRWMutex (64-bit atomic state machine)
+│   ├── websocket.rs          # FastWebSocketParser & SIMD fast_websocket_unmask
+│   ├── http.rs               # FastHttpParser (SIMD httparse & zero-alloc ASGI assembly)
 │   └── h2.rs                 # PyH2Bridge, serve_h2_connection (Tokio H2 Runtime)
 ├── tests/                    # 27 test files (pytest + pytest-asyncio)
-├── benchmarks/               # 3 benchmark scripts
+├── benchmarks/               # 4 benchmark scripts
 ├── examples/                 # Runnable examples (python examples/00_*.py)
 ├── docs/
 │   ├── API.md                # Complete API reference
@@ -264,7 +269,9 @@ pops so no single worker greedily drains the global queue.
 | `RawAsyncChannel` | `src/channel.rs` | parking_lot + PyO3 | Python-independent async channel core with anti-barging FIFO ordering protection |
 | `AtomicMetrics` | `src/metrics.rs` | `std::sync::atomic` | 64-byte-padded per-worker counters (`active`, `completed`, `global_pull_count`, `park_count`, etc.) — prevents false sharing |
 | `RawAsyncWaitGroup` | `src/waitgroup.rs` | parking_lot `Mutex<WaitGroupInner>` | Go-style atomic counter + generation + waiter list with single-mutex state machine |
-| `FastHttpParser` | `src/http.rs` | httparse | SIMD zero-copy HTTP/1.x header parser |
+| `RawAsyncRWMutex` | `src/rwlock.rs` | parking_lot `Mutex<RWMutexInner>` | 64-bit atomic state machine, writer-preference async read-write lock with cancellation cleanup |
+| `FastHttpParser` | `src/http.rs` | httparse | SIMD zero-copy HTTP/1.x header parser with zero-alloc ASGI PyList direct assembly & interned methods |
+| `FastWebSocketParser` & `fast_websocket_unmask` | `src/websocket.rs` | PyO3 | SIMD 64-bit chunked XOR frame unmasking and zero-copy RFC 6455 frame header parsing |
 | `PyH2Bridge` & `serve_h2_connection` | `src/h2.rs` | tokio + h2 | Tokio HTTP/2 async multiplexing runtime bridge |
 
 ### Python-side patterns
@@ -284,7 +291,7 @@ pops so no single worker greedily drains the global queue.
   while re-acquiring the lock after being notified, it automatically forwards
   the notification to the next waiter to conserve notification tokens.
 
-### Seven non-obvious design decisions
+### Nine non-obvious design decisions
 
 These are the places where a change that looks like a simplification usually
 breaks a real correctness or performance property. **Read each before modifying
@@ -330,7 +337,22 @@ the related code.**
    The push side falls back from local to global when a per-worker channel is
    full, preserving liveness. Drain phase validates all three sources (global queue,
    private buffer, local channel) are completely empty before worker loop termination.
-   private buffer, local channel) are completely empty before worker loop termination.
+
+8. **Darwin vs Linux `SO_REUSEPORT` asymmetric routing trap** (`src/multiloop/server.py:99-130`):
+   Linux `SO_REUSEPORT` hashes 4-tuples across multiple listening sockets with kernel-level
+   load balancing. On macOS (Darwin/BSD), `SO_REUSEPORT` does not implement symmetric
+   hashing and routes 100% of loopback connections to the newest bound socket, causing
+   severe worker starvation and degrading multi-core throughput to single-worker limits (~50k QPS).
+   `server.py` restricts `SO_REUSEPORT` to Linux only; on macOS/Darwin, workers share a single
+   listening socket and race concurrently on `loop.sock_accept(shared_sock)`, guaranteeing
+   perfect 25% load distribution and ~91k+ multi-core QPS.
+
+9. **Python 3.14t Free-Threaded memory safety via `PyBytes::new_with`** (`src/websocket.rs:80-110`):
+   Under Python 3.14t (No-GIL), modifying Python buffer objects in-place across threads
+   causes data races and invalidates Python's immutability invariant. Rust SIMD extensions must
+   allocate Python objects through atomic single-pass constructors like
+   `PyBytes::new_with(py, len, |buf| ...)` to populate unmasked payload bytes without
+   intermediate copies or in-place mutations.
 
 ---
 

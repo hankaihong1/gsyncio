@@ -41,11 +41,13 @@ class ConnectionPinningServer:
         host: str = "127.0.0.1",
         port: int = 0,
         handler: Callable[[asyncio.StreamReader, asyncio.StreamWriter], Any] | None = None,
+        protocol_factory: Callable[[], asyncio.Protocol] | None = None,
     ) -> None:
         self.pool = pool
         self.host = host
         self.port = port
         self.handler = handler
+        self.protocol_factory = protocol_factory
         self._server_sockets: list[socket.socket] = []
         self._server_socket: socket.socket | None = None
         self._accept_tasks: list[concurrent.futures.Future[Any]] = []
@@ -69,16 +71,20 @@ class ConnectionPinningServer:
     async def start(
         self,
         handler: Callable[[asyncio.StreamReader, asyncio.StreamWriter], Any] | None = None,
+        protocol_factory: Callable[[], asyncio.Protocol] | None = None,
     ) -> None:
         """Start listening for incoming client connections (idempotent).
 
         :param handler: Optional handler coroutine function.
+        :param protocol_factory: Optional asyncio.Protocol factory.
         """
         with self._running_lock:
             if self._running:
                 return
         if handler is not None:
             self.handler = handler
+        if protocol_factory is not None:
+            self.protocol_factory = protocol_factory
 
         async def dummy_h(_r: asyncio.StreamReader, _w: asyncio.StreamWriter) -> None:
             pass
@@ -176,6 +182,10 @@ class ConnectionPinningServer:
             try:
                 client_sock, addr = await loop.sock_accept(shared_sock)
                 client_sock.setblocking(False)
+                try:
+                    client_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                except OSError:
+                    pass
                 conn_task = loop.create_task(
                     self._run_pinned_connection(client_sock, loop, handler, addr)
                 )
@@ -217,20 +227,32 @@ class ConnectionPinningServer:
         handler: Callable[..., Any],
         addr: tuple[str, int] | None = None,
     ) -> None:
-        reader = asyncio.StreamReader(loop=target_loop)
-        protocol = asyncio.StreamReaderProtocol(reader, loop=target_loop)
         transport: asyncio.BaseTransport | None = None
         sock_guard: socket.socket | None = client_sock
 
         try:
-            transport, _ = await target_loop.connect_accepted_socket(lambda: protocol, client_sock)
-            sock_guard = None
-            writer = asyncio.StreamWriter(transport, protocol, reader, target_loop)
-
-            if self._handler_accepts_addr and addr is not None:
-                await handler(reader, writer, addr)
+            if self.protocol_factory is not None:
+                proto = self.protocol_factory()
+                transport, _ = await target_loop.connect_accepted_socket(lambda: proto, client_sock)
+                sock_guard = None
+                wait_closed_fn = getattr(proto, "wait_closed", None)
+                if callable(wait_closed_fn):
+                    res = wait_closed_fn()
+                    if inspect.isawaitable(res):
+                        await res
             else:
-                await handler(reader, writer)
+                reader = asyncio.StreamReader(loop=target_loop)
+                protocol = asyncio.StreamReaderProtocol(reader, loop=target_loop)
+                transport, _ = await target_loop.connect_accepted_socket(
+                    lambda: protocol, client_sock
+                )
+                sock_guard = None
+                writer = asyncio.StreamWriter(transport, protocol, reader, target_loop)
+
+                if self._handler_accepts_addr and addr is not None:
+                    await handler(reader, writer, addr)
+                else:
+                    await handler(reader, writer)
         except (
             ConnectionResetError,
             BrokenPipeError,
