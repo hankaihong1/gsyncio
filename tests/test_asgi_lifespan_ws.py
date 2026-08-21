@@ -6,9 +6,6 @@ import asyncio
 import struct
 from typing import Any
 
-import h2.config
-import h2.connection
-import h2.events
 import pytest
 
 from multiloop.asgi import MultiloopASGIWorker
@@ -257,301 +254,6 @@ async def test_websocket_cross_loop_broadcast() -> None:
 
 
 @pytest.mark.asyncio
-async def test_asgi_http2_request_response() -> None:
-    """Verify native HTTP/2.0 request and response handling."""
-    received_scope: dict[str, Any] = {}
-
-    async def h2_app(scope: dict[str, Any], receive: Any, send: Any) -> None:
-        if scope["type"] == "http":
-            received_scope.update(scope)
-            msg = await receive()
-            body_in = msg.get("body", b"")
-            resp_body = b"http2_echo:" + body_in
-            await send(
-                {
-                    "type": "http.response.start",
-                    "status": 200,
-                    "headers": [(b"content-type", b"text/plain")],
-                }
-            )
-            await send({"type": "http.response.body", "body": resp_body, "more_body": False})
-
-    async with (
-        EventLoopThreadPool(num_threads=2) as pool,
-        MultiloopASGIWorker(h2_app, pool=pool, port=0) as worker,
-    ):
-        port = worker.port
-        reader, writer = await asyncio.open_connection("127.0.0.1", port)
-        client_conn = h2.connection.H2Connection(config=h2.config.H2Configuration(client_side=True))
-        client_conn.initiate_connection()
-        writer.write(client_conn.data_to_send())
-        await writer.drain()
-
-        # Synchronize initial HTTP/2 connection preface & settings
-        raw = await asyncio.wait_for(reader.read(4096), timeout=5.0)
-        client_conn.receive_data(raw)
-        to_send = client_conn.data_to_send()
-        if to_send:
-            writer.write(to_send)
-            await writer.drain()
-
-        # Send Stream 1
-        headers = [
-            (":method", "POST"),
-            (":authority", "localhost"),
-            (":scheme", "http"),
-            (":path", "/api/h2_test?user=alice"),
-            ("x-custom-h2", "valid"),
-        ]
-        client_conn.send_headers(stream_id=1, headers=headers)
-        client_conn.send_data(stream_id=1, data=b"hello_http2", end_stream=True)
-        writer.write(client_conn.data_to_send())
-        await writer.drain()
-
-        resp_status = 0
-        resp_data = b""
-        stream_ended = False
-
-        for _ in range(50):
-            raw = await asyncio.wait_for(reader.read(4096), timeout=5.0)
-            if not raw:
-                break
-            events = client_conn.receive_data(raw)
-            for event in events:
-                if isinstance(event, h2.events.ResponseReceived):
-                    resp_status = int(dict(event.headers).get(b":status", b"0"))
-                elif isinstance(event, h2.events.DataReceived):
-                    resp_data += event.data
-                elif isinstance(event, h2.events.StreamEnded):
-                    stream_ended = True
-            to_send = client_conn.data_to_send()
-            if to_send:
-                writer.write(to_send)
-                await writer.drain()
-            if stream_ended:
-                break
-
-        writer.close()
-        await writer.wait_closed()
-
-        assert resp_status == 200
-        assert resp_data == b"http2_echo:hello_http2"
-
-    assert received_scope["http_version"] == "2"
-    assert received_scope["path"] == "/api/h2_test"
-    assert received_scope["query_string"] == b"user=alice"
-
-
-@pytest.mark.asyncio
-async def test_asgi_http2_concurrent_multiplexed_streams() -> None:
-    """Verify concurrent stream multiplexing over a single HTTP/2 TCP connection."""
-
-    async def echo_app(scope: dict[str, Any], receive: Any, send: Any) -> None:
-        if scope["type"] == "http":
-            path = scope["path"]
-            msg = await receive()
-            body_in = msg.get("body", b"")
-            resp_body = f"echo:{path}:".encode("latin1") + body_in
-            await send(
-                {
-                    "type": "http.response.start",
-                    "status": 200,
-                    "headers": [(b"content-type", b"text/plain")],
-                }
-            )
-            await send({"type": "http.response.body", "body": resp_body, "more_body": False})
-
-    async with (
-        EventLoopThreadPool(num_threads=2) as pool,
-        MultiloopASGIWorker(echo_app, pool=pool, port=0) as worker,
-    ):
-        port = worker.port
-        reader, writer = await asyncio.open_connection("127.0.0.1", port)
-        client_conn = h2.connection.H2Connection(config=h2.config.H2Configuration(client_side=True))
-        client_conn.initiate_connection()
-        writer.write(client_conn.data_to_send())
-        await writer.drain()
-
-        # Synchronize initial HTTP/2 connection preface & settings
-        raw = await asyncio.wait_for(reader.read(4096), timeout=5.0)
-        client_conn.receive_data(raw)
-        to_send = client_conn.data_to_send()
-        if to_send:
-            writer.write(to_send)
-            await writer.drain()
-
-        # Send Stream 1, 3, 5 concurrently over same connection
-        for stream_id, name in [(1, "first"), (3, "second"), (5, "third")]:
-            headers = [
-                (":method", "POST"),
-                (":authority", "localhost"),
-                (":scheme", "http"),
-                (":path", f"/stream_{name}"),
-            ]
-            client_conn.send_headers(stream_id=stream_id, headers=headers)
-            client_conn.send_data(
-                stream_id=stream_id, data=f"data_{name}".encode(), end_stream=True
-            )
-
-        writer.write(client_conn.data_to_send())
-        await writer.drain()
-
-        stream_responses: dict[int, bytearray] = {1: bytearray(), 3: bytearray(), 5: bytearray()}
-        ended_streams: set[int] = set()
-
-        for _ in range(100):
-            raw = await asyncio.wait_for(reader.read(4096), timeout=5.0)
-            if not raw:
-                break
-            events = client_conn.receive_data(raw)
-            for event in events:
-                if isinstance(event, h2.events.DataReceived):
-                    stream_responses[event.stream_id].extend(event.data)
-                elif isinstance(event, h2.events.StreamEnded):
-                    ended_streams.add(event.stream_id)
-            to_send = client_conn.data_to_send()
-            if to_send:
-                writer.write(to_send)
-                await writer.drain()
-            if len(ended_streams) == 3:
-                break
-
-        writer.close()
-        await writer.wait_closed()
-
-        assert bytes(stream_responses[1]) == b"echo:/stream_first:data_first"
-        assert bytes(stream_responses[3]) == b"echo:/stream_second:data_second"
-        assert bytes(stream_responses[5]) == b"echo:/stream_third:data_third"
-
-
-@pytest.mark.asyncio
-async def test_asgi_http2_slow_streaming_body_no_loop_freeze() -> None:
-    """Verify that slow streaming request bodies do not freeze the event loop."""
-    heartbeat_ticks = 0
-    stop_heartbeat = asyncio.Event()
-
-    async def heartbeat_coro() -> None:
-        nonlocal heartbeat_ticks
-        while not stop_heartbeat.is_set():
-            await asyncio.sleep(0.01)
-            heartbeat_ticks += 1
-
-    async def stream_receiver_app(scope: dict[str, Any], receive: Any, send: Any) -> None:
-        if scope["type"] == "lifespan":
-            while True:
-                msg = await receive()
-                if msg["type"] == "lifespan.startup":
-                    await send({"type": "lifespan.startup.complete"})
-                elif msg["type"] == "lifespan.shutdown":
-                    await send({"type": "lifespan.shutdown.complete"})
-                    break
-            return
-
-        if scope["type"] == "http":
-            body_parts: list[bytes] = []
-            while True:
-                msg = await receive()
-                body_parts.append(msg.get("body", b""))
-                if not msg.get("more_body", False):
-                    break
-            total_body = b"".join(body_parts)
-            await send(
-                {
-                    "type": "http.response.start",
-                    "status": 200,
-                    "headers": [(b"content-type", b"text/plain")],
-                }
-            )
-            await send(
-                {
-                    "type": "http.response.body",
-                    "body": f"received:{len(total_body)}".encode(),
-                    "more_body": False,
-                }
-            )
-
-    async with (
-        EventLoopThreadPool(num_threads=1) as pool,
-        MultiloopASGIWorker(stream_receiver_app, pool=pool, port=0) as worker,
-    ):
-        port = worker.port
-        # Start heartbeat on the pool loop
-        pool_loop = pool._loops[0]
-        hb_fut = asyncio.run_coroutine_threadsafe(heartbeat_coro(), pool_loop)
-
-        reader, writer = await asyncio.open_connection("127.0.0.1", port)
-        client_conn = h2.connection.H2Connection(config=h2.config.H2Configuration(client_side=True))
-        client_conn.initiate_connection()
-        writer.write(client_conn.data_to_send())
-        await writer.drain()
-
-        # Receive server connection preface & settings to synchronize connection state
-        raw = await asyncio.wait_for(reader.read(4096), timeout=5.0)
-        client_conn.receive_data(raw)
-        to_send = client_conn.data_to_send()
-        if to_send:
-            writer.write(to_send)
-            await writer.drain()
-
-        # Send headers without ending stream
-        client_conn.send_headers(
-            stream_id=1,
-            headers=[
-                (":method", "POST"),
-                (":authority", "localhost"),
-                (":scheme", "http"),
-                (":path", "/slow_upload"),
-            ],
-            end_stream=False,
-        )
-        writer.write(client_conn.data_to_send())
-        await writer.drain()
-
-        # Simulate slow chunk arrival
-        for _ in range(3):
-            await asyncio.sleep(0.03)
-            client_conn.send_data(stream_id=1, data=b"chunk_data_", end_stream=False)
-            writer.write(client_conn.data_to_send())
-            await writer.drain()
-
-        # Final chunk ending stream
-        await asyncio.sleep(0.03)
-        client_conn.send_data(stream_id=1, data=b"final", end_stream=True)
-        writer.write(client_conn.data_to_send())
-        await writer.drain()
-
-        resp_data = bytearray()
-        stream_ended = False
-        for _ in range(50):
-            raw = await asyncio.wait_for(reader.read(4096), timeout=5.0)
-            if not raw:
-                break
-            events = client_conn.receive_data(raw)
-            for event in events:
-                if isinstance(event, h2.events.DataReceived):
-                    resp_data.extend(event.data)
-                elif isinstance(event, h2.events.StreamEnded):
-                    stream_ended = True
-            to_send = client_conn.data_to_send()
-            if to_send:
-                writer.write(to_send)
-                await writer.drain()
-            if stream_ended:
-                break
-
-        stop_heartbeat.set()
-        await asyncio.wrap_future(hb_fut)
-        writer.close()
-        await writer.wait_closed()
-
-        assert b"received:38" in resp_data
-        # Heartbeat must have ticked multiple times, confirming event loop was NOT blocked
-        assert heartbeat_ticks >= 5, (
-            f"Heartbeat ticks too low ({heartbeat_ticks}), loop was starved"
-        )
-
-
-@pytest.mark.asyncio
 async def test_asgi_http11_keepalive_multiple_requests() -> None:
     """Test that a single TCP socket can serve multiple sequential HTTP/1.1 requests (Keep-Alive)."""
 
@@ -729,3 +431,351 @@ async def test_asgi_http11_keepalive_post_and_get() -> None:
 
             writer.close()
             await writer.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_asgi_lifespan_state_propagation() -> None:
+    """Verify that lifespan scope['state'] values are inherited by HTTP and WebSocket scopes."""
+
+    async def stateful_app(scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope["type"] == "lifespan":
+            while True:
+                msg = await receive()
+                if msg["type"] == "lifespan.startup":
+                    scope["state"]["db_conn"] = "connected_pool_123"
+                    await send({"type": "lifespan.startup.complete"})
+                elif msg["type"] == "lifespan.shutdown":
+                    await send({"type": "lifespan.shutdown.complete"})
+                    break
+            return
+
+        if scope["type"] == "http":
+            db = scope.get("state", {}).get("db_conn", "missing")
+            body = db.encode("latin1")
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 200,
+                    "headers": [(b"content-length", str(len(body)).encode("latin1"))],
+                }
+            )
+            await send({"type": "http.response.body", "body": body, "more_body": False})
+
+    async with (
+        EventLoopThreadPool(num_threads=2) as pool,
+        MultiloopASGIWorker(app=stateful_app, pool=pool, port=0) as worker,
+    ):
+        port = worker.port
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(f"GET /state HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n".encode("latin1"))
+        await writer.drain()
+
+        status = await asyncio.wait_for(reader.readline(), timeout=2.0)
+        assert b"200 OK" in status
+        while True:
+            line = await asyncio.wait_for(reader.readline(), timeout=2.0)
+            if not line or line == b"\r\n":
+                break
+        res_body = await asyncio.wait_for(
+            reader.readexactly(len(b"connected_pool_123")), timeout=2.0
+        )
+        assert res_body == b"connected_pool_123"
+        writer.close()
+        await writer.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_websocket_continuation_frames() -> None:
+    """Verify RFC 6455 continuation frame (0x0) fragmented message reassembly."""
+    async with (
+        EventLoopThreadPool(num_threads=2) as pool,
+        MultiloopASGIWorker(websocket_echo_app, pool=pool, port=0) as worker,
+    ):
+        port = worker.port
+        reader, writer = await ws_connect_and_handshake("127.0.0.1", port)
+
+        # Send fragmented text: Frame 1 (FIN=0, opcode=1, text="hello_"), Frame 2 (FIN=1, opcode=0, text="world")
+        part1 = b"hello_"
+        mask1 = b"\x12\x34\x56\x78"
+        h1 = bytearray([0x01, 0x80 | len(part1)])  # FIN=0, opcode=0x1
+        h1.extend(mask1)
+        m_part1 = bytes(b ^ mask1[i % 4] for i, b in enumerate(part1))
+        writer.write(bytes(h1) + m_part1)
+        await writer.drain()
+
+        await asyncio.sleep(0.01)
+
+        part2 = b"world"
+        mask2 = b"\x22\x33\x44\x55"
+        h2 = bytearray([0x80, 0x80 | len(part2)])  # FIN=1, opcode=0x0 (Continuation)
+        h2.extend(mask2)
+        m_part2 = bytes(b ^ mask2[i % 4] for i, b in enumerate(part2))
+        writer.write(bytes(h2) + m_part2)
+        await writer.drain()
+
+        # Read echo response (should be unfragmented "echo:hello_world")
+        head = await asyncio.wait_for(reader.readexactly(2), timeout=2.0)
+        b1, b2 = head[0], head[1]
+        assert (b1 & 0x0F) == 0x1  # Text frame
+        length = b2 & 0x7F
+        resp_payload = await asyncio.wait_for(reader.readexactly(length), timeout=2.0)
+        assert resp_payload == b"echo:hello_world"
+
+        writer.close()
+        await writer.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_asgi_http11_split_body_packets() -> None:
+    """Verify HTTP/1.1 body split across multiple TCP packets does not cause header reparsing."""
+
+    async def echo_body_app(scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope["type"] != "http":
+            return
+        body = bytearray()
+        while True:
+            msg = await receive()
+            body.extend(msg.get("body", b""))
+            if not msg.get("more_body", False):
+                break
+        body_bytes = bytes(body)
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"content-length", str(len(body_bytes)).encode("latin1"))],
+            }
+        )
+        await send({"type": "http.response.body", "body": body_bytes, "more_body": False})
+
+    async with (
+        EventLoopThreadPool(num_threads=2) as pool,
+        MultiloopASGIWorker(app=echo_body_app, pool=pool, port=0) as worker,
+    ):
+        port = worker.port
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+
+        full_payload = b"A" * 1000 + b"B" * 1000
+        header_part = (
+            f"POST /split HTTP/1.1\r\n"
+            f"Host: 127.0.0.1:{port}\r\n"
+            f"Content-Length: {len(full_payload)}\r\n\r\n"
+        ).encode("latin1")
+
+        # Send headers only
+        writer.write(header_part)
+        await writer.drain()
+        await asyncio.sleep(0.02)
+
+        # Send first 1000 bytes
+        writer.write(full_payload[:1000])
+        await writer.drain()
+        await asyncio.sleep(0.02)
+
+        # Send remaining 1000 bytes
+        writer.write(full_payload[1000:])
+        await writer.drain()
+
+        status = await asyncio.wait_for(reader.readline(), timeout=2.0)
+        assert b"200 OK" in status
+        while True:
+            line = await asyncio.wait_for(reader.readline(), timeout=2.0)
+            if not line or line == b"\r\n":
+                break
+        res_body = await asyncio.wait_for(reader.readexactly(len(full_payload)), timeout=2.0)
+        assert res_body == full_payload
+
+        writer.close()
+        await writer.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_asgi_lifespan_off_fast_shutdown() -> None:
+    """Verify that lifespan='off' starts up and shuts down immediately without 10s timeout."""
+    import time
+
+    async with EventLoopThreadPool(num_threads=2) as pool:
+        worker = MultiloopASGIWorker(app=lifespan_app, pool=pool, port=0, lifespan="off")
+        start_t = time.monotonic()
+        await worker.start()
+        await worker.close()
+        elapsed = time.monotonic() - start_t
+        assert elapsed < 1.0, f"Shutdown took too long with lifespan='off': {elapsed}s"
+
+
+@pytest.mark.asyncio
+async def test_websocket_pre_handshake_rejection_http_403() -> None:
+    """Verify that websocket.close before websocket.accept returns HTTP 403 Forbidden."""
+
+    async def reject_app(scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope["type"] == "websocket":
+            await receive()
+            await send({"type": "websocket.close", "code": 4403})
+
+    async with (
+        EventLoopThreadPool(num_threads=2) as pool,
+        MultiloopASGIWorker(reject_app, pool=pool, port=0) as worker,
+    ):
+        port = worker.port
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        req = (
+            f"GET /ws HTTP/1.1\r\n"
+            f"Host: 127.0.0.1:{port}\r\n"
+            f"Upgrade: websocket\r\n"
+            f"Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+            f"Sec-WebSocket-Version: 13\r\n\r\n"
+        )
+        writer.write(req.encode("latin1"))
+        await writer.drain()
+
+        resp_status = await asyncio.wait_for(reader.readline(), timeout=2.0)
+        assert b"403 Forbidden" in resp_status
+        writer.close()
+        await writer.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_asgi_http11_crlf_header_injection_rejection() -> None:
+    """Verify that CRLF in response headers is blocked."""
+
+    async def crlf_app(scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope["type"] == "http":
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 200,
+                    "headers": [(b"X-Injected", b"val\r\nInjected-Header: evil")],
+                }
+            )
+            await send({"type": "http.response.body", "body": b"ok"})
+
+    async with (
+        EventLoopThreadPool(num_threads=2) as pool,
+        MultiloopASGIWorker(crlf_app, pool=pool, port=0) as worker,
+    ):
+        reader, writer = await asyncio.open_connection("127.0.0.1", worker.port)
+        writer.write(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        await writer.drain()
+
+        resp = await reader.read(4096)
+        assert b"500 Internal Server Error" in resp
+        writer.close()
+        await writer.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_asgi_http11_conflicting_content_length_400() -> None:
+    """Verify that multiple conflicting Content-Length headers trigger 400 Bad Request."""
+
+    async def simple_app(scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope["type"] == "http":
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b"ok"})
+
+    async with (
+        EventLoopThreadPool(num_threads=2) as pool,
+        MultiloopASGIWorker(simple_app, pool=pool, port=0) as worker,
+    ):
+        reader, writer = await asyncio.open_connection("127.0.0.1", worker.port)
+        writer.write(
+            b"POST / HTTP/1.1\r\n"
+            b"Host: 127.0.0.1\r\n"
+            b"Content-Length: 5\r\n"
+            b"Content-Length: 10\r\n\r\n"
+            b"12345"
+        )
+        await writer.drain()
+
+        resp = await reader.read(4096)
+        assert b"400 Bad Request" in resp
+        writer.close()
+        await writer.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_asgi_http11_cl_te_smuggling_400() -> None:
+    """Verify that simultaneous Content-Length and Transfer-Encoding: chunked trigger 400 Bad Request."""
+
+    async def simple_app(scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope["type"] == "http":
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b"ok"})
+
+    async with (
+        EventLoopThreadPool(num_threads=2) as pool,
+        MultiloopASGIWorker(simple_app, pool=pool, port=0) as worker,
+    ):
+        reader, writer = await asyncio.open_connection("127.0.0.1", worker.port)
+        writer.write(
+            b"POST / HTTP/1.1\r\n"
+            b"Host: 127.0.0.1\r\n"
+            b"Content-Length: 5\r\n"
+            b"Transfer-Encoding: chunked\r\n\r\n"
+            b"0\r\n\r\n"
+        )
+        await writer.drain()
+
+        resp = await reader.read(4096)
+        assert b"400 Bad Request" in resp
+        writer.close()
+        await writer.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_websocket_invalid_version_426() -> None:
+    """Verify that Sec-WebSocket-Version != 13 returns 426 Upgrade Required."""
+
+    async def dummy_ws_app(scope: dict[str, Any], receive: Any, send: Any) -> None:
+        pass
+
+    async with (
+        EventLoopThreadPool(num_threads=2) as pool,
+        MultiloopASGIWorker(dummy_ws_app, pool=pool, port=0) as worker,
+    ):
+        reader, writer = await asyncio.open_connection("127.0.0.1", worker.port)
+        req = (
+            f"GET /ws HTTP/1.1\r\n"
+            f"Host: 127.0.0.1:{worker.port}\r\n"
+            f"Upgrade: websocket\r\n"
+            f"Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+            f"Sec-WebSocket-Version: 8\r\n\r\n"
+        )
+        writer.write(req.encode("latin1"))
+        await writer.drain()
+
+        resp = await reader.read(4096)
+        assert b"426 Upgrade Required" in resp
+        assert b"Sec-WebSocket-Version: 13" in resp
+        writer.close()
+        await writer.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_websocket_invalid_utf8_close_1007() -> None:
+    """Verify that invalid UTF-8 payload in text frame triggers RFC 6455 1007 Close frame."""
+    async with (
+        EventLoopThreadPool(num_threads=2) as pool,
+        MultiloopASGIWorker(websocket_echo_app, pool=pool, port=0) as worker,
+    ):
+        reader, writer = await ws_connect_and_handshake("127.0.0.1", worker.port)
+
+        # Send masked text frame with invalid UTF-8 bytes: \xff\xfe
+        mask = [0x11, 0x22, 0x33, 0x44]
+        raw_payload = b"\xff\xfe\xfd"
+        masked_payload = bytes(b ^ mask[i % 4] for i, b in enumerate(raw_payload))
+        frame = bytearray([0x81, 0x80 | len(raw_payload)]) + bytearray(mask) + masked_payload
+        writer.write(frame)
+        await writer.drain()
+
+        # Read Close Frame from server (opcode 0x8, code 1007)
+        resp_head = await asyncio.wait_for(reader.readexactly(2), timeout=2.0)
+        assert resp_head[0] == 0x88  # FIN + Close opcode
+        resp_len = resp_head[1] & 0x7F
+        close_payload = await reader.readexactly(resp_len)
+        close_code = struct.unpack("!H", close_payload[:2])[0]
+        assert close_code == 1007
+
+        writer.close()
+        await writer.wait_closed()

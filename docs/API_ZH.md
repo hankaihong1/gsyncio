@@ -46,6 +46,7 @@
 - [网络与 ASGI Worker](#网络与-asgi-worker-networking--asgi-workers)
   - [`ConnectionPinningServer`](#connectionpinningserver)
   - [`MultiloopASGIWorker`](#multiloopasgiworker)
+  - [`MultiloopWSGIWorker`](#multiloopwsgiworker)
 - [异常](#异常-exceptions)
   - [`MultiloopError`](#multilooperror)
   - [`ChannelClosedError`](#channelclosederror)
@@ -921,7 +922,7 @@ async with ConnectionPinningServer(pool, host="127.0.0.1", port=8080) as server:
 
 ### `MultiloopASGIWorker`
 
-把 FastAPI / Starlette / ASGI 3.0 应用直接挂载到 `EventLoopThreadPool` 上。完整支持 HTTP/1.1 分块流式传输、RFC 6455 全双工 WebSocket 以及 RFC 9113 HTTP/2.0 单连接二进制分帧并发多路复用。
+把 FastAPI / Starlette / ASGI 3.0 应用直接挂载到 `EventLoopThreadPool` 上。完整支持 HTTP/1.1 分块流式传输、RFC 6455 全双工 WebSocket 以及 Keep-Alive 长连接复用。
 
 ```python
 from fastapi import FastAPI
@@ -933,9 +934,7 @@ app = FastAPI()
 async def main():
     async with EventLoopThreadPool(num_threads=4) as pool:
         async with MultiloopASGIWorker(app, pool, port=8000):
-            print(
-                "FastAPI (HTTP/1.1, HTTP/2, WebSocket) running on multi-threaded multiloop pool..."
-            )
+            print("FastAPI (HTTP/1.1, WebSocket) running on multi-threaded multiloop pool...")
             await asyncio.sleep(3600)
 ```
 

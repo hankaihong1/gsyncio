@@ -58,7 +58,7 @@ from multiloop.rwlock import AsyncRWMutex
 from multiloop.server import ConnectionPinningServer
 from multiloop.wsgi import MultiloopWSGIWorker
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 
 async def run_in_pool(coro: Any, *args: Any, num_threads: int = 0, **kwargs: Any) -> Any:

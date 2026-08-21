@@ -1,6 +1,6 @@
 [project]
 name = "multiloop"
-version = "0.1.1"
+version = "0.1.2"
 description = "High-performance multi-event-loop concurrency engine for Python 3.14t with Rust core"
 readme = "README.md"
 license = "MIT"
@@ -61,7 +61,6 @@ module-name = "multiloop._multiloop_core"
 
 [dependency-groups]
 dev = [
-    "h2>=4.1.0",
     "httpx>=0.28.1",
     "maturin[zig]>=1.13.3",
     "mypy>=2.3.0",

@@ -2,9 +2,16 @@
 
 from __future__ import annotations
 
+import threading
+import time
+from typing import TYPE_CHECKING
+
 import pytest
 
-from multiloop.cli import build_parser, detect_interface, import_app
+from multiloop.cli import _watch_files_thread, build_parser, detect_interface, import_app
+
+if TYPE_CHECKING:
+    import pathlib
 
 
 async def sample_asgi_app(scope: dict[str, object], receive: object, send: object) -> None:
@@ -44,3 +51,31 @@ def test_build_parser() -> None:
     assert args.host == "0.0.0.0"
     assert args.port == 9000
     assert args.workers == "8"
+
+
+def test_cli_file_watcher_thread(tmp_path: pathlib.Path) -> None:
+    """Verify background file watcher detects modifications asynchronously."""
+    test_file = tmp_path / "app.py"
+    test_file.write_text("a = 1")
+
+    reload_event = threading.Event()
+    stop_event = threading.Event()
+
+    t = threading.Thread(
+        target=_watch_files_thread,
+        args=(reload_event, stop_event, tmp_path, 0.05),
+        daemon=True,
+    )
+    t.start()
+
+    try:
+        assert not reload_event.is_set()
+        time.sleep(0.1)
+        # Modify file
+        test_file.write_text("a = 2")
+        # Wait for watcher to trigger
+        triggered = reload_event.wait(timeout=2.0)
+        assert triggered
+    finally:
+        stop_event.set()
+        t.join(timeout=1.0)

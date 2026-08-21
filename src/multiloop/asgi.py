@@ -10,11 +10,10 @@ from __future__ import annotations
 
 import asyncio
 import types
-from typing import TYPE_CHECKING, Any, Self, cast
+from typing import TYPE_CHECKING, Any, Self
 
 from multiloop._http11 import Http11Protocol
 from multiloop._lifespan import LifespanManager
-from multiloop._rust import _try_import_rust_class
 from multiloop._websocket import WebSocketConnection
 from multiloop.server import ConnectionPinningServer
 
@@ -23,53 +22,7 @@ if TYPE_CHECKING:
 
     from multiloop.pool import EventLoopThreadPool
 
-__all__ = ["MultiloopASGIWorker", "_dispatch_h2_stream"]
-
-_serve_h2_connection = _try_import_rust_class("multiloop._multiloop_core", "serve_h2_connection")
-
-
-async def _dispatch_h2_stream(app: Any, scope: dict[str, Any], bridge: Any) -> None:
-    """Dispatches an incoming HTTP/2 stream to the ASGI application.
-
-    Called by the Rust Tokio HTTP/2 Bridge (:mod:`_multiloop_core.serve_h2_connection`).
-    """
-
-    async def receive() -> dict[str, Any]:
-        if hasattr(bridge, "try_recv_body_chunk"):
-            while True:
-                has_item, chunk = bridge.try_recv_body_chunk()
-                if has_item:
-                    if chunk is None:
-                        return {"type": "http.request", "body": b"", "more_body": False}
-                    return {"type": "http.request", "body": bytes(chunk), "more_body": True}
-                await asyncio.sleep(0.001)
-        elif hasattr(bridge, "recv_body_chunk_async"):
-            chunk = await bridge.recv_body_chunk_async()
-            if chunk is None:
-                return {"type": "http.request", "body": b"", "more_body": False}
-            return {"type": "http.request", "body": bytes(chunk), "more_body": True}
-        else:
-            chunk = bridge.recv_body_chunk()
-            if chunk is None:
-                return {"type": "http.request", "body": b"", "more_body": False}
-            return {"type": "http.request", "body": bytes(chunk), "more_body": True}
-
-    status = 200
-    headers: list[tuple[bytes, bytes]] = []
-
-    async def send(message: dict[str, Any]) -> None:
-        nonlocal status, headers
-        m_type = message.get("type")
-        if m_type == "http.response.start":
-            status = message.get("status", 200)
-            headers = list(message.get("headers", []))
-        elif m_type == "http.response.body":
-            body = message.get("body", b"")
-            more_body = message.get("more_body", False)
-            raw_headers = [(bytes(k), bytes(v)) for k, v in headers]
-            bridge.send_response(status, raw_headers, bytes(body), more_body)
-
-    await app(scope, receive, send)
+__all__ = ["MultiloopASGIWorker"]
 
 
 class MultiloopASGIWorker:
@@ -108,13 +61,13 @@ class MultiloopASGIWorker:
         self.host = host
         self.port = port
         self.lifespan = lifespan
+        self._lifespan_mgr = LifespanManager(app=app, lifespan=lifespan)
         self._server = ConnectionPinningServer(
             pool=pool,
             host=host,
             port=port,
             protocol_factory=self._protocol_factory,
         )
-        self._lifespan_mgr = LifespanManager(app=app, lifespan=lifespan)
 
     def __repr__(self) -> str:
         return f"<MultiloopASGIWorker host={self.host} port={self.port} running={self.is_running}>"
@@ -143,36 +96,8 @@ class MultiloopASGIWorker:
             port=self._server.port,
             websocket_handler=self._handle_websocket,
             is_worker_running=lambda: self.is_running,
-            h2_dispatcher=self._dispatch_h2_socket,
+            lifespan_state=self._lifespan_mgr.lifespan_state,
         )
-
-    def _dispatch_h2_socket(self, fd: int, transport: asyncio.Transport) -> None:
-        """Dispatch HTTP/2 socket connection to the Rust Tokio H2 runtime."""
-        if _serve_h2_connection is not None:
-            loop = asyncio.get_running_loop()
-            peer_obj = transport.get_extra_info("peername")
-            if isinstance(peer_obj, tuple):
-                tuple_peer = cast("tuple[object, ...]", peer_obj)
-                if len(tuple_peer) >= 2:
-                    client_host = str(tuple_peer[0])
-                    client_port = int(str(tuple_peer[1]))
-                else:
-                    client_host, client_port = "127.0.0.1", 0
-            else:
-                client_host, client_port = "127.0.0.1", 0
-            server_host, server_port = self.host, self._server.port
-            done_event = asyncio.Event()
-            _serve_h2_connection(
-                fd,
-                b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n",
-                self.app,
-                loop,
-                str(client_host),
-                int(client_port),
-                str(server_host),
-                int(server_port),
-                done_event.set,
-            )
 
     async def _handle_websocket(
         self,
@@ -197,6 +122,7 @@ class MultiloopASGIWorker:
             client_addr=client_addr,
             server_addr=(self.host, self._server.port),
             http_version=http_version,
+            lifespan_state=self._lifespan_mgr.lifespan_state,
         )
         await ws_conn.run()
 

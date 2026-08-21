@@ -5,6 +5,15 @@ Tests multiloop's ASGI 3.0 server engine against representative FastAPI workload
 2. CPU + Async I/O Hybrid Compute (/api/compute) - Python 3.14t No-GIL multi-core speedup
 3. POST Request Body Processing (/api/items) - Payload reading and JSON serialization
 
+Optional Dependencies & Installation:
+--------------------------------------
+- To benchmark with real FastAPI & Pydantic, install them via:
+    uv pip install fastapi pydantic
+  or:
+    pip install fastapi pydantic
+- If FastAPI is not installed, this benchmark automatically falls back to an
+  in-tree specification-compliant ASGI 3.0 router with identical route endpoints.
+
 Cross-Platform Pure-Python Design:
 - Built-in multi-threaded HTTP/1.1 Keep-Alive socket load generator.
 - 100% native on Windows, macOS, and Linux without any external CLI tool dependencies.
@@ -64,9 +73,15 @@ def create_benchmark_app() -> Any:
             thread_counter[t_name] += 1
             return {"received": item.model_dump(), "thread": t_name}
 
+        print("   App Framework: Native FastAPI (fastapi + pydantic)")
         return app
 
     except ImportError:
+        print(
+            "   App Framework: Built-in ASGI 3.0 Fallback (fastapi not installed; "
+            "run `uv pip install fastapi pydantic` to test with native FastAPI)"
+        )
+
         # High-performance, spec-compliant ASGI 3.0 application fallback
         async def asgi_fallback_app(
             scope: dict[str, Any],

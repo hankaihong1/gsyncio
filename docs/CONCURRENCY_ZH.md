@@ -70,6 +70,14 @@ multiloop 借用了 AnyIO 和 Trio 的顶层 API 命名与人体工程学接口�
 | `CancelScope` | 每任务 contextvars 栈 + 单账本 `_injected` | shield 进入时 snapshot 取消计数并清零，退出时恢复；单账本精确跟踪实际注入并对称冲销；严格 RAII 作用域栈生命周期（`_cancel.py`） |
 | `select_channel` | 两阶段仲裁器（Phase 1 伪随机均匀快速 `try_recv`，Phase 2 单播唤醒多通道注册） | 废除 TaskGroup 投机取消，赢家通过 `try_recv()` 消费并在 `finally` 中切除所有通道 watcher 注册（`primitives.py:230-290`） |
 
+### 1.6 HTTP 与 WebSocket 协议并发模型（纯传输邮递员 vs Rust 协议计算器）
+
+| 组件 | 架构职责 | 线程 / 状态保护 | 核心不变式 |
+|---|---|---|---|
+| Rust `FastHttpConnection` | 协议状态机与计算器 | 归属于持有它的 Worker EventLoop 局部线程 | 100% 负责 HTTP 头部解析、RFC 9112 Chunked 流式解码、请求走私防御、CRLF 响应注入拦截、单趟 `PyBytes::new_with` 响应序列化与 RFC 6455 WebSocket 融合（`src/http.rs`）。 |
+| Python `Http11Protocol` | 纯传输邮递员 | 绑定至单一 Worker EventLoop | 约 380 行极简协议，仅负责底层的 Socket I/O、`_body_queue` 背压与 `pump_events()` 消除饥饿死锁、以及 ASGI 3.0 协程调度（`src/multiloop/_http11.py`）。 |
+| Python `WebSocketConnection` | 全双工 RFC 6455 会话 | `_send_lock`（Lock） + Rust `Channel`（`_inbound_channel`） | 跨 Loop 广播必须通过 `run_coroutine_threadsafe` 跳板至 `self._home_loop` 执行；`_inbound_channel` 提供物理级跨线程入站排队（`src/multiloop/_websocket.py`）。 |
+
 ---
 
 ## 2. 已知陷阱模式（Race-Condition Trap Patterns）
@@ -234,6 +242,32 @@ if limiter.available_tokens > 0:  # 例如 0.5 > 0
     await limiter.acquire()  # 若整型容量已借满则必然阻塞!
 ```
 - **正确姿势**：统一推荐 `async with limiter:` 上下文管理器；使用 `limiter.available_capacity >= 1`（或 `available_tokens >= 1.0`）确保可立即无阻借出。
+
+**5. ASGI `scope["state"]` 共享字典修改与跨请求污染**：
+- **陷阱**：直接将共享的 Lifespan 状态字典引用传递给 ASGI 请求的 `scope`，会导致业务处理函数在写入 `request.state` 时覆盖共享数据，引发跨用户上下文泄露（如越权访问）以及 Python 3.14t 下的多核字典并发写冲突。
+- **反例**：
+```python
+scope["state"] = self.lifespan_state  # 共享直接引用!
+```
+- **正确姿势**：
+```python
+scope["state"] = self.lifespan_state.copy()  # 单请求隔离的轻量浅拷贝
+```
+
+**6. `asyncio.Transport` 跨线程直接写入未做 Loop 调度跳板**：
+- **陷阱**：从非持有该 Transport 的 OS 线程直接调用 `transport.write()` 会破坏 `_SelectorSocketTransport` 内部缓冲区并引发数据竞态。
+- **反例**：
+```python
+# 在 Worker Thread B 上:
+transport.write(b"data")  # 线程不安全直接写入!
+```
+- **正确姿势**：
+```python
+# 在 Worker Thread B 上:
+if cur_loop is not home_loop:
+    fut = asyncio.run_coroutine_threadsafe(ws.send(message), home_loop)
+    await asyncio.wrap_future(fut)
+```
 
 ---
 

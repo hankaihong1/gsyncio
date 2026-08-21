@@ -370,10 +370,10 @@ async def test_asgi_streaming_chunked_response() -> None:
         worker = MultiloopASGIWorker(app=streaming_app, pool=pool, host="127.0.0.1", port=0)
         await worker.start()
         reader, writer = await asyncio.open_connection("127.0.0.1", worker.port)
-        writer.write(b"GET /stream HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        writer.write(b"GET /stream HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
         await writer.drain()
 
-        raw_data = await reader.read()
+        raw_data = await asyncio.wait_for(reader.read(4096), timeout=2.0)
         writer.close()
         await writer.wait_closed()
         await worker.close()
@@ -389,6 +389,8 @@ async def test_asgi_streaming_chunked_request_body() -> None:
     received_chunks: list[bytes] = []
 
     async def echo_chunked_app(scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] != "http":
+            return
         while True:
             msg = await receive()
             if msg["type"] == "http.request":

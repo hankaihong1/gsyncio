@@ -9,11 +9,12 @@ import inspect
 import os
 import pathlib
 import signal
+import subprocess
 import sys
+import threading
 from typing import Any
 
 from multiloop._logging import set_log_level
-from multiloop._sync import Event
 from multiloop.asgi import MultiloopASGIWorker
 from multiloop.pool import EventLoopThreadPool
 from multiloop.wsgi import MultiloopWSGIWorker
@@ -51,8 +52,23 @@ def detect_interface(app: Any) -> str:
     if callable(app) and inspect.iscoroutinefunction(app.__call__):
         return "asgi"
 
+    if (
+        hasattr(app, "routes")
+        or hasattr(app, "router")
+        or hasattr(app, "middleware_stack")
+        or hasattr(app, "build_middleware_stack")
+    ):
+        return "asgi"
+    if hasattr(app, "wsgi_app"):
+        return "wsgi"
+
     try:
         sig = inspect.signature(app)
+        param_names = [p.name.lower() for p in sig.parameters.values()]
+        if "environ" in param_names or "start_response" in param_names:
+            return "wsgi"
+        if "scope" in param_names or "receive" in param_names or "send" in param_names:
+            return "asgi"
         param_count = len(sig.parameters)
         if param_count == 3:
             return "asgi"
@@ -61,17 +77,31 @@ def detect_interface(app: Any) -> str:
     except (TypeError, ValueError):
         pass
 
-    if hasattr(app, "routes") or hasattr(app, "router") or hasattr(app, "middleware_stack"):
-        return "asgi"
-    if hasattr(app, "wsgi_app"):
-        return "wsgi"
-
     return "asgi"
 
 
-async def _watch_files_for_reload(reload_event: Event, poll_interval: float = 0.5) -> None:
-    """Watch source files in current working directory for changes and trigger reload."""
-    watch_dir = pathlib.Path.cwd()
+def _scan_mtimes(watch_dir: pathlib.Path, ignored_patterns: set[str]) -> dict[pathlib.Path, float]:
+    mtimes: dict[pathlib.Path, float] = {}
+    for root, dirs, files in os.walk(watch_dir):
+        dirs[:] = [d for d in dirs if d not in ignored_patterns and not d.startswith(".")]
+        for file in files:
+            if file.endswith((".py", ".html", ".json")):
+                p = pathlib.Path(root) / file
+                try:
+                    mtimes[p] = p.stat().st_mtime
+                except OSError:
+                    pass
+    return mtimes
+
+
+def _watch_files_thread(
+    reload_event: threading.Event,
+    stop_event: threading.Event,
+    watch_dir: pathlib.Path,
+    poll_interval: float = 0.3,
+    debounce_interval: float = 0.2,
+) -> None:
+    """Background thread watching source files for changes without blocking event loops."""
     ignored_patterns = {
         ".git",
         "__pycache__",
@@ -79,29 +109,178 @@ async def _watch_files_for_reload(reload_event: Event, poll_interval: float = 0.
         "venv",
         ".pytest_cache",
         ".ruff_cache",
+        ".mypy_cache",
+        ".benchmarks",
+        "node_modules",
         "target",
+        ".hermes",
+        ".codegraph",
+        "dist",
+        "build",
+        ".tox",
+        ".coverage",
+        ".idea",
+        ".vscode",
     }
-
-    def _get_mtimes() -> dict[pathlib.Path, float]:
-        mtimes: dict[pathlib.Path, float] = {}
-        for root, dirs, files in os.walk(watch_dir):
-            dirs[:] = [d for d in dirs if d not in ignored_patterns]
-            for file in files:
-                if file.endswith((".py", ".html", ".json")):
-                    p = pathlib.Path(root) / file
-                    try:
-                        mtimes[p] = p.stat().st_mtime
-                    except OSError:
-                        pass
-        return mtimes
-
-    last_mtimes = _get_mtimes()
-    while not reload_event.is_set():
-        await asyncio.sleep(poll_interval)
-        current_mtimes = _get_mtimes()
-        if current_mtimes != last_mtimes:
-            reload_event.set()
+    last_mtimes = _scan_mtimes(watch_dir, ignored_patterns)
+    current_poll = poll_interval
+    while not stop_event.is_set():
+        if stop_event.wait(timeout=current_poll):
             break
+        current_mtimes = _scan_mtimes(watch_dir, ignored_patterns)
+        if current_mtimes != last_mtimes:
+            # Reset poll interval upon detected changes
+            current_poll = poll_interval
+            # Debounce: wait for quiet period to prevent restart storms on multi-file edits
+            while not stop_event.is_set():
+                if stop_event.wait(timeout=debounce_interval):
+                    return
+                new_mtimes = _scan_mtimes(watch_dir, ignored_patterns)
+                if new_mtimes == current_mtimes:
+                    break
+                current_mtimes = new_mtimes
+            if not stop_event.is_set():
+                reload_event.set()
+            break
+        else:
+            # Smooth backoff up to 0.8s to avoid spinning on large projects
+            current_poll = min(current_poll + 0.1, 0.8)
+
+
+def _terminate_child(child_proc: subprocess.Popen[Any], sig: int = signal.SIGINT) -> None:
+    if child_proc.poll() is not None:
+        return
+    if sys.platform != "win32":
+        try:
+            os.killpg(os.getpgid(child_proc.pid), sig)
+        except (ProcessLookupError, OSError):
+            try:
+                child_proc.send_signal(sig)
+            except OSError:
+                pass
+    else:
+        child_proc.terminate()
+
+
+def _kill_child(child_proc: subprocess.Popen[Any]) -> None:
+    if child_proc.poll() is not None:
+        return
+    if sys.platform != "win32":
+        try:
+            os.killpg(os.getpgid(child_proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, OSError):
+            try:
+                child_proc.kill()
+            except OSError:
+                pass
+    else:
+        child_proc.kill()
+
+
+def _run_supervisor(
+    app_spec: str,
+    host: str,
+    port: int,
+    workers: int | str,
+    interface: str,
+    log_level: str,
+    watch_dir: pathlib.Path | None = None,
+) -> int:
+    """Multi-process supervisor that restarts child worker processes upon source modifications."""
+    target_dir = watch_dir or pathlib.Path.cwd()
+    cmd = [
+        sys.executable,
+        "-m",
+        "multiloop.cli",
+        "run",
+        app_spec,
+        "--host",
+        host,
+        "--port",
+        str(port),
+        "--workers",
+        str(workers),
+        "--interface",
+        interface,
+        "--log-level",
+        log_level,
+    ]
+
+    stop_supervisor = threading.Event()
+
+    def _handle_signal(_signum: int, _frame: Any) -> None:
+        stop_supervisor.set()
+
+    if sys.platform != "win32":
+        signal.signal(signal.SIGINT, _handle_signal)
+        signal.signal(signal.SIGTERM, _handle_signal)
+
+    print(
+        f"[multiloop] Supervisor active for '{app_spec}'. Auto-reload enabled across worker subprocesses."
+    )
+
+    while not stop_supervisor.is_set():
+        reload_event = threading.Event()
+        stop_watcher = threading.Event()
+        watcher_thread = threading.Thread(
+            target=_watch_files_thread,
+            args=(reload_event, stop_watcher, target_dir),
+            daemon=True,
+        )
+        watcher_thread.start()
+
+        child_proc = subprocess.Popen(
+            cmd,
+            start_new_session=(sys.platform != "win32"),
+        )
+
+        child_crashed = False
+        while not stop_supervisor.is_set() and not reload_event.is_set():
+            try:
+                ret = child_proc.wait(timeout=0.2)
+                # Child process exited on its own (e.g. SyntaxError or startup crash)
+                if not stop_supervisor.is_set():
+                    child_crashed = True
+                    print(
+                        f"[multiloop] Worker subprocess exited (code {ret}). "
+                        "Watching for file changes to reload...",
+                        file=sys.stderr,
+                    )
+                    # Block until file modification is detected or supervisor is stopped
+                    while not stop_supervisor.is_set() and not reload_event.is_set():
+                        if stop_supervisor.wait(timeout=0.2):
+                            break
+                break
+            except subprocess.TimeoutExpired:
+                pass
+
+        stop_watcher.set()
+
+        if reload_event.is_set() and not stop_supervisor.is_set():
+            print(
+                "[multiloop] File modification detected. Gracefully restarting worker subprocess..."
+            )
+            if not child_crashed and child_proc.poll() is None:
+                _terminate_child(child_proc, signal.SIGINT)
+                try:
+                    child_proc.wait(timeout=5.0)
+                except subprocess.TimeoutExpired:
+                    _kill_child(child_proc)
+                    child_proc.wait()
+            continue
+
+        if stop_supervisor.is_set():
+            if child_proc.poll() is None:
+                _terminate_child(child_proc, signal.SIGINT)
+                try:
+                    child_proc.wait(timeout=5.0)
+                except subprocess.TimeoutExpired:
+                    _kill_child(child_proc)
+                    child_proc.wait()
+            break
+
+    print("\n[multiloop] Supervisor shutdown complete.")
+    return 0
 
 
 async def serve_app(
@@ -111,7 +290,7 @@ async def serve_app(
     workers: int | str = "auto",
     reload: bool = False,
     interface: str = "auto",
-    shutdown_event: Event | None = None,
+    shutdown_event: asyncio.Event | None = None,
 ) -> None:
     """Start multiloop web server for the specified application."""
     if isinstance(workers, str) and workers == "auto":
@@ -129,8 +308,7 @@ async def serve_app(
     if app_interface == "auto":
         app_interface = detect_interface(app)
 
-    exit_event = shutdown_event or Event()
-    reload_trigger = Event()
+    exit_event = shutdown_event or asyncio.Event()
 
     async with EventLoopThreadPool(num_threads=worker_count) as pool:
         if app_interface == "asgi":
@@ -147,11 +325,6 @@ async def serve_app(
                 f"({worker_count} worker threads, Python {sys.version.split()[0]}t, reload={'on' if reload else 'off'})"
             )
 
-            watcher_task = None
-            if reload:
-                loop = asyncio.get_running_loop()
-                watcher_task = loop.create_task(_watch_files_for_reload(reload_trigger))
-
             loop = asyncio.get_running_loop()
             if sys.platform != "win32":
                 for sig in (signal.SIGINT, signal.SIGTERM):
@@ -160,27 +333,7 @@ async def serve_app(
                     except (NotImplementedError, RuntimeError):
                         pass
 
-            while not exit_event.is_set() and not reload_trigger.is_set():
-                await asyncio.sleep(0.1)
-
-            if watcher_task and not watcher_task.done():
-                watcher_task.cancel()
-                try:
-                    await watcher_task
-                except (asyncio.CancelledError, Exception):
-                    pass
-
-    if reload_trigger.is_set() and not exit_event.is_set():
-        print("[multiloop] File modification detected. Reloading server...")
-        await serve_app(
-            app_spec=app_spec,
-            host=host,
-            port=port,
-            workers=workers,
-            reload=reload,
-            interface=interface,
-            shutdown_event=exit_event,
-        )
+            await exit_event.wait()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -251,6 +404,16 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "run":
         set_log_level(args.log_level.upper())
+        if args.reload:
+            return _run_supervisor(
+                app_spec=args.app,
+                host=args.host,
+                port=args.port,
+                workers=args.workers,
+                interface=args.interface,
+                log_level=args.log_level,
+            )
+
         try:
             asyncio.run(
                 serve_app(
@@ -258,7 +421,7 @@ def main(argv: list[str] | None = None) -> int:
                     host=args.host,
                     port=args.port,
                     workers=args.workers,
-                    reload=args.reload,
+                    reload=False,
                     interface=args.interface,
                 )
             )

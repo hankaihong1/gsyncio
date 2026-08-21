@@ -8,6 +8,7 @@ import inspect
 import socket
 import sys
 import threading
+import time
 from typing import TYPE_CHECKING, Any, Self
 
 if TYPE_CHECKING:
@@ -51,8 +52,8 @@ class ConnectionPinningServer:
         self._server_sockets: list[socket.socket] = []
         self._server_socket: socket.socket | None = None
         self._accept_tasks: list[concurrent.futures.Future[Any]] = []
-        self._conn_tasks: set[asyncio.Task[Any]] = set()
-        self._conn_tasks_lock = threading.Lock()
+        self._worker_conn_tasks: dict[asyncio.AbstractEventLoop, set[asyncio.Task[Any]]] = {}
+        self._tasks_lock = threading.Lock()
         self._running_lock = threading.Lock()
         self._running = False
         self._handler_accepts_addr = False
@@ -177,6 +178,8 @@ class ConnectionPinningServer:
         handler: Callable[[asyncio.StreamReader, asyncio.StreamWriter], Any],
     ) -> None:
         loop = asyncio.get_running_loop()
+        with self._tasks_lock:
+            worker_tasks = self._worker_conn_tasks.setdefault(loop, set())
         backoff = 0.001
         while self.is_running:
             try:
@@ -189,9 +192,14 @@ class ConnectionPinningServer:
                 conn_task = loop.create_task(
                     self._run_pinned_connection(client_sock, loop, handler, addr)
                 )
-                with self._conn_tasks_lock:
-                    self._conn_tasks.add(conn_task)
-                conn_task.add_done_callback(self._discard_conn_task)
+                with self._tasks_lock:
+                    worker_tasks.add(conn_task)
+
+                def _discard_task(t: asyncio.Task[Any]) -> None:
+                    with self._tasks_lock:
+                        worker_tasks.discard(t)
+
+                conn_task.add_done_callback(_discard_task)
                 backoff = 0.001
             except asyncio.CancelledError:
                 break
@@ -211,15 +219,6 @@ class ConnectionPinningServer:
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 0.1)
 
-    def _discard_conn_task(self, task: asyncio.Task[Any]) -> None:
-        if not task.cancelled():
-            try:
-                task.exception()
-            except asyncio.CancelledError:
-                pass
-        with self._conn_tasks_lock:
-            self._conn_tasks.discard(task)
-
     async def _run_pinned_connection(
         self,
         client_sock: socket.socket,
@@ -235,9 +234,9 @@ class ConnectionPinningServer:
                 proto = self.protocol_factory()
                 transport, _ = await target_loop.connect_accepted_socket(lambda: proto, client_sock)
                 sock_guard = None
-                wait_closed_fn = getattr(proto, "wait_closed", None)
+                wait_closed_fn: Any = getattr(proto, "wait_closed", None)
                 if callable(wait_closed_fn):
-                    res = wait_closed_fn()
+                    res: Any = wait_closed_fn()
                     if inspect.isawaitable(res):
                         await res
             else:
@@ -272,8 +271,8 @@ class ConnectionPinningServer:
                 except OSError:
                     pass
 
-    async def close(self) -> None:
-        """Stop listening for new connections and cleanly cancel all in-flight connections."""
+    async def close(self, drain_timeout: float = 5.0) -> None:
+        """Stop listening for new connections and cleanly drain all in-flight connections."""
         with self._running_lock:
             self._running = False
 
@@ -282,33 +281,6 @@ class ConnectionPinningServer:
             self._accept_tasks.clear()
         for fut in accept_tasks:
             fut.cancel()
-
-        for _ in range(2):
-            with self._conn_tasks_lock:
-                tasks = list(self._conn_tasks)
-            if not tasks:
-                break
-            for task in tasks:
-                try:
-                    task.get_loop().call_soon_threadsafe(task.cancel)
-                except RuntimeError:
-                    pass
-            for i in range(self.pool.num_threads):
-                try:
-                    loop = self.pool._get_loop(i)
-                except RuntimeError:
-                    continue
-                if not loop.is_running():
-                    continue
-                try:
-                    await asyncio.wait_for(
-                        asyncio.wrap_future(
-                            asyncio.run_coroutine_threadsafe(asyncio.sleep(0), loop)
-                        ),
-                        timeout=2,
-                    )
-                except Exception:
-                    pass
 
         server_socks = list(getattr(self, "_server_sockets", []))
         if not server_socks and self._server_socket is not None:
@@ -321,6 +293,29 @@ class ConnectionPinningServer:
                     pass
         self._server_sockets = []
         self._server_socket = None
+
+        # Allow in-flight requests to drain naturally up to drain_timeout
+        deadline = time.monotonic() + drain_timeout
+        while time.monotonic() < deadline:
+            with self._tasks_lock:
+                all_tasks_lists = [list(tasks) for tasks in self._worker_conn_tasks.values()]
+            has_active = any(any(not t.done() for t in tasks) for tasks in all_tasks_lists)
+            if not has_active:
+                break
+            await asyncio.sleep(0.05)
+
+        with self._tasks_lock:
+            items_snapshot = [
+                (loop, list(tasks)) for loop, tasks in self._worker_conn_tasks.items()
+            ]
+            self._worker_conn_tasks.clear()
+
+        for loop, tasks in items_snapshot:
+            for task in tasks:
+                try:
+                    loop.call_soon_threadsafe(task.cancel)
+                except RuntimeError:
+                    pass
 
     async def __aenter__(self) -> Self:
         if not self._running:

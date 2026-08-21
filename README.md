@@ -3,7 +3,7 @@
 [![CI](https://img.shields.io/github/actions/workflow/status/hankaihong1/multiloop/ci.yml)](https://github.com/hankaihong1/multiloop/actions/workflows/ci.yml)
 [![Python 3.14t](https://img.shields.io/badge/Python-3.14t%20Free--Threaded-blue.svg)](https://www.python.org/)
 [![Rust Core](https://img.shields.io/badge/Rust-Core%20SIMD-orange.svg)](https://www.rust-lang.org/)
-[![Throughput](https://img.shields.io/badge/ASGI%20Throughput-70%2C000%2B%20QPS-brightgreen.svg)](benchmarks/bench_asgi_throughput.py)
+[![Throughput](https://img.shields.io/badge/ASGI%20Throughput-100%2C000%2B%20QPS-brightgreen.svg)](benchmarks/bench_wrk_asgi.py)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 > ⚡ **A high-performance multi-event-loop concurrency toolkit and Web server engine for Python 3.14t (Free-Threaded / No-GIL), powered by an ultra-fast Rust SIMD core.**
@@ -61,20 +61,26 @@ maturin develop --release
 
 ### Multi-Core Throughput (Python 3.14t)
 
-`multiloop` achieves linear physical multi-core scalability without GIL bottlenecks.
+`multiloop` achieves true physical multi-core scalability without GIL bottlenecks.
 
-*3-round average benchmark metrics on Apple M1 (8 Cores, 8GB RAM, Python 3.14.6 Free-Threaded No-GIL):*
+*Production-grade `wrk` load benchmark metrics on Apple M1 (8 Cores, 8GB RAM, Python 3.14.6 Free-Threaded No-GIL, release build):*
 
-| Workload (Benchmark Scenario) | Single loop (1-Worker) | multiloop 4-worker | multiloop 8-worker | Max Speedup |
-|---|---|---|---|---|
-| **JSON Ping API (`GET /api/ping`)** | 44,302 req/s | 72,134 req/s | 62,234 req/s | **1.63x** |
-| **POST Request Body (`POST /api/items`)** | 35,034 req/s | 58,915 req/s | 62,144 req/s | **1.77x** |
-| **CPU-bound Dispatch (40 × 2M ops)** | 2.88 s | 0.79 s | 0.60 s | **4.83x** |
-| **Mixed I/O + CPU (400 tasks, SHA-256)** | 134.0 req/s | 176.7 req/s | 116.6 req/s | **1.32x** |
+| Workload (Benchmark Scenario) | Single loop (1-Worker) | multiloop 4-worker | multiloop 8-worker | Max Speedup | Avg Latency |
+|---|---|---|---|---|---|
+| **Plaintext 13B (`GET /api/plaintext`)** | 88,893 req/s | **151,366 req/s** | 150,712 req/s | **1.70x** | 0.29 ~ 0.74 ms |
+| **JSON Ping API (`GET /api/ping`)** | 79,079 req/s | **142,622 req/s** | 145,836 req/s | **1.84x** | 0.31 ~ 0.64 ms |
+| **CPU-bound Dispatch (40 × 2M ops)** | 2.88 s | 0.79 s | **0.60 s** | **4.83x** | — |
 
 ### Reproducing Benchmarks
 
-Run the built-in cross-platform pure-Python socket benchmark suite directly on your system (zero external dependencies like `ab` required):
+Run the high-performance C-based `wrk` benchmark suite to measure physical multi-core throughput:
+
+```bash
+# Measure real throughput via wrk (zero client CPU overhead)
+uv run python benchmarks/bench_wrk_asgi.py --duration 5 --concurrency 100 --workers 1,4,8
+```
+
+You can also run the built-in cross-platform pure-Python socket benchmark suite directly (zero external dependencies required):
 
 ```bash
 uv run python benchmarks/bench_asgi_throughput.py

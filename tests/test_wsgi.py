@@ -125,3 +125,97 @@ async def test_wsgi_worker_concurrent_clients() -> None:
         tasks = [make_req(i) for i in range(20)]
         results = await asyncio.gather(*tasks)
         assert all(r == 200 for r in results)
+
+
+@pytest.mark.asyncio
+async def test_wsgi_worker_payload_too_large() -> None:
+    """Verify that requests exceeding max_request_body return 413 Payload Too Large."""
+    async with (
+        EventLoopThreadPool(num_threads=2) as pool,
+        MultiloopWSGIWorker(sample_wsgi_app, pool=pool, port=0, max_request_body=1024) as worker,
+    ):
+        port = worker.port
+        async with httpx.AsyncClient() as client:
+            large_content = b"x" * 2048
+            resp = await client.post(f"http://127.0.0.1:{port}/echo", content=large_content)
+            assert resp.status_code == 413
+
+
+@pytest.mark.asyncio
+async def test_wsgi_worker_client_disconnect_no_deadlock() -> None:
+    """Verify that client disconnect during streaming does not deadlock worker threads."""
+
+    def infinite_stream_app(environ: dict[str, Any], start_response: Any) -> Any:
+        start_response("200 OK", [("content-type", "text/plain")])
+
+        def gen() -> Any:
+            for _ in range(500):
+                yield b"chunk_data_block_"
+
+        return gen()
+
+    async with (
+        EventLoopThreadPool(num_threads=2) as pool,
+        MultiloopWSGIWorker(infinite_stream_app, pool=pool, port=0) as worker,
+    ):
+        port = worker.port
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(f"GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n".encode("latin1"))
+        await writer.drain()
+
+        # Read only status and first chunk, then abruptly close connection
+        await reader.readline()
+        writer.close()
+        await writer.wait_closed()
+        await asyncio.sleep(0.05)
+
+
+@pytest.mark.asyncio
+async def test_wsgi_chunked_upload_and_stream_reader() -> None:
+    """Verify WSGI correctly decodes client Transfer-Encoding: chunked uploads with SyncStreamReader."""
+
+    def chunked_receiver_app(environ: dict[str, Any], start_response: Any) -> list[bytes]:
+        stream = environ["wsgi.input"]
+        # Test readline & read
+        line1 = stream.readline()
+        rest = stream.read()
+        assert environ["HTTP_X_CUSTOM_HEADER"] == "val1, val2"
+        resp = b"read:" + line1 + b":" + rest
+        start_response(
+            "200 OK",
+            [("content-type", "text/plain"), ("content-length", str(len(resp)))],
+        )
+        return [resp]
+
+    async with (
+        EventLoopThreadPool(num_threads=2) as pool,
+        MultiloopWSGIWorker(chunked_receiver_app, pool=pool, host="0.0.0.0", port=0) as worker,
+    ):
+        port = worker.port
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        req = (
+            f"POST /upload HTTP/1.1\r\n"
+            f"Host: testserver:{port}\r\n"
+            f"Transfer-Encoding: chunked\r\n"
+            f"X-Custom-Header: val1\r\n"
+            f"X-Custom-Header: val2\r\n\r\n"
+            f"7\r\nhello\r\n\r\n"
+            f"6\r\nworld!\r\n"
+            f"0\r\n\r\n"
+        )
+        writer.write(req.encode("latin1"))
+        await writer.drain()
+
+        status_line = await asyncio.wait_for(reader.readline(), timeout=2.0)
+        assert b"200 OK" in status_line
+        while True:
+            line = await asyncio.wait_for(reader.readline(), timeout=2.0)
+            if not line or line == b"\r\n":
+                break
+        res_body = await asyncio.wait_for(
+            reader.readexactly(len(b"read:hello\r\n:world!")), timeout=2.0
+        )
+        assert res_body == b"read:hello\r\n:world!"
+
+        writer.close()
+        await writer.wait_closed()

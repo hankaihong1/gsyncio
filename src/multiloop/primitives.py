@@ -303,7 +303,25 @@ class Channel(_BaseChannel):
                 return
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError("send_sync timed out")
-            time.sleep(0.001)
+            time.sleep(0.0005)
+
+    def recv_sync(self, timeout: float | None = None) -> Any:
+        """Synchronously receive an item from the channel from a worker or background OS thread.
+
+        :param timeout: Maximum seconds to block before raising TimeoutError.
+        :returns: The dequeued item.
+        :raises TimeoutError: If timeout expired before an item became available.
+        :raises ChannelClosedError: If the channel is closed and drained.
+        """
+        deadline = (time.monotonic() + timeout) if timeout is not None else None
+        while True:
+            try:
+                return self.try_recv()
+            except WouldBlock:
+                pass
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError("recv_sync timed out")
+            time.sleep(0.0005)
 
     async def _recv_impl(self) -> Any:
         if self._use_raw:
