@@ -373,7 +373,15 @@ async def test_asgi_streaming_chunked_response() -> None:
         writer.write(b"GET /stream HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
         await writer.drain()
 
-        raw_data = await asyncio.wait_for(reader.read(4096), timeout=2.0)
+        raw_buf = bytearray()
+        while True:
+            chunk = await asyncio.wait_for(reader.read(4096), timeout=2.0)
+            if not chunk:
+                break
+            raw_buf.extend(chunk)
+            if b"chunk2" in raw_buf and b"0\r\n\r\n" in raw_buf:
+                break
+        raw_data = bytes(raw_buf)
         writer.close()
         await writer.wait_closed()
         await worker.close()

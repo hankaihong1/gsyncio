@@ -206,16 +206,27 @@ class ConnectionPinningServer:
             except (BlockingIOError, InterruptedError):
                 continue
             except OSError as err:
+                if not self.is_running:
+                    break
                 if err.errno in (
                     errno.EAGAIN,
                     errno.EWOULDBLOCK,
                     errno.ECONNABORTED,
                     errno.EINTR,
+                    getattr(errno, "EBADF", 9),
+                    getattr(errno, "ENOTSOCK", 38),
                 ):
+                    continue
+                winerror = getattr(err, "winerror", None)
+                if winerror in (995, 10038, 10022, 10054):
+                    if not self.is_running:
+                        break
                     continue
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 0.1)
             except RuntimeError:
+                if not self.is_running:
+                    break
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 0.1)
 
