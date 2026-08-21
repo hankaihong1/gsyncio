@@ -3,7 +3,7 @@
 [![CI](https://img.shields.io/github/actions/workflow/status/hankaihong1/multiloop/ci.yml)](https://github.com/hankaihong1/multiloop/actions/workflows/ci.yml)
 [![Python 3.14t](https://img.shields.io/badge/Python-3.14t%20Free--Threaded-blue.svg)](https://www.python.org/)
 [![Rust Core](https://img.shields.io/badge/Rust-Core%20SIMD-orange.svg)](https://www.rust-lang.org/)
-[![Throughput](https://img.shields.io/badge/ASGI%20Throughput-70%2C000%2B%20QPS-brightgreen.svg)](benchmarks/bench_asgi_throughput.py)
+[![Throughput](https://img.shields.io/badge/ASGI%20Throughput-100%2C000%2B%20QPS-brightgreen.svg)](benchmarks/bench_wrk_asgi.py)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 > ⚡ **专为 Python 3.14t（Free-Threaded / No-GIL 无全局解释器锁）设计的高性能多事件循环并发工具包与 Web 服务器引擎，底层由超高性能 Rust SIMD 核心驱动。**
@@ -63,18 +63,24 @@ maturin develop --release
 
 `multiloop` 在无 GIL 锁环境下实现物理多核算力的线性扩展与超高网络吞吐。
 
-*在 Apple M1（8 核心、8GB 内存、Python 3.14.6 Free-Threaded No-GIL 纯线程环境）下进行 3 轮独立压测的平均指标：*
+*在 Apple M1（8 核心、8GB 内存、Python 3.14.6 Free-Threaded No-GIL 纯线程环境，release 编译模式）下使用 `wrk` 进行生产级压测的指标：*
 
-| 工作负载 (Benchmark 压测场景) | 单 loop (1-Worker) | multiloop 4-worker | multiloop 8-worker | 最高加速比 |
-|---|---|---|---|---|
-| **JSON Ping 接口 (`GET /api/ping`)** | 44,302 req/s | 72,134 req/s | 62,234 req/s | **1.63x** |
-| **POST 请求体解析 (`POST /api/items`)** | 35,034 req/s | 58,915 req/s | 62,144 req/s | **1.77x** |
-| **CPU 密集任务调度 (40 × 200 万次运算)** | 2.88 s | 0.79 s | 0.60 s | **4.83x** |
-| **I/O + CPU 混合计算 (400 任务，SHA-256)** | 134.0 req/s | 176.7 req/s | 116.6 req/s | **1.32x** |
+| 工作负载 (Benchmark 压测场景) | 单 loop (1-Worker) | multiloop 4-worker | multiloop 8-worker | 最高加速比 | 平均时延 |
+|---|---|---|---|---|---|
+| **Plaintext 13B (`GET /api/plaintext`)** | 88,893 req/s | **151,366 req/s** | 150,712 req/s | **1.70x** | 0.29 ~ 0.74 ms |
+| **JSON Ping 接口 (`GET /api/ping`)** | 79,079 req/s | **142,622 req/s** | 145,836 req/s | **1.84x** | 0.31 ~ 0.64 ms |
+| **CPU 密集任务调度 (40 × 200 万次运算)** | 2.88 s | 0.79 s | **0.60 s** | **4.83x** | — |
 
 ### 一键复现基准测试
 
-在您自己的机器上运行纯 Python 跨平台基准压测套件（零外部命令依赖）：
+运行基于 C 语言零开销的 `wrk` 基准压测套件测量真实物理多核吞吐：
+
+```bash
+# 使用 wrk 压测真实多核吞吐（零客户端 CPU 占用）
+uv run python benchmarks/bench_wrk_asgi.py --duration 5 --concurrency 100 --workers 1,4,8
+```
+
+您也可以在自己的机器上运行纯 Python 跨平台基准压测套件（零外部命令依赖）：
 
 ```bash
 uv run python benchmarks/bench_asgi_throughput.py

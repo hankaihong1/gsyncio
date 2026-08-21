@@ -76,6 +76,14 @@ lock → await → unregister under the lock on cancellation」
 | `CancelScope` | per-task contextvars stack + single-ledger `_injected` | shield snapshots and clears the cancellation count on entry, restores it on exit; single ledger tracks exact injections and symmetrically uncancels only what was injected; strict RAII scope stack lifetime (`_cancel.py`) |
 | `select_channel` | 2-phase arbiter (Phase 1 fast `try_recv` with pseudo-random uniform start, Phase 2 multi-channel registration with unicast wakeup) | readiness is reported without TaskGroup speculative cancellation; winner consumes via `try_recv()` and unregisters all watcher tokens in `finally` (`primitives.py:230-290`) |
 
+### 1.6 HTTP & WebSocket Protocol Concurrency Model (Pure Messenger vs Rust Protocol Calculator)
+
+| Component | Architecture Role | Threading / State Guard | Key Invariant |
+|---|---|---|---|
+| Rust `FastHttpConnection` | Protocol State Machine & Calculator | Thread-local to owning Worker EventLoop | 100% of HTTP parsing, Chunked stream decoding, RFC 9112 smuggling defense, CRLF injection sanitization, single-pass `PyBytes::new_with` wire serialization, and WebSocket RFC 6455 frame fusion (`src/http.rs`). |
+| Python `Http11Protocol` | Pure Transport Messenger | Pinned to single Worker EventLoop | ~380 lines handling raw Socket I/O, `_body_queue` backpressure with `pump_events()` residue draining, and ASGI 3.0 lifecycle dispatching (`src/multiloop/_http11.py`). |
+| Python `WebSocketConnection` | Full-Duplex RFC 6455 Session | `_send_lock` (Lock) + Rust `Channel` (`_inbound_channel`) | Cross-loop broadcasts must trampoline to `self._home_loop` via `run_coroutine_threadsafe`; `_inbound_channel` provides multi-thread safe queueing (`src/multiloop/_websocket.py`). |
+
 ---
 
 ## 2. Known Trap Patterns (Race-Condition Trap Patterns)
@@ -265,6 +273,32 @@ if limiter.available_tokens > 0:  # e.g. 0.5 > 0
     await limiter.acquire()  # Blocks if integer capacity (2) is already borrowed!
 ```
 - **Correct approach**: Always use `async with limiter:`; require `limiter.available_capacity >= 1` (or `available_tokens >= 1.0`) for non-blocking expectations.
+
+**5. ASGI `scope["state"]` shared dictionary mutation and cross-request pollution**:
+- **Trap**: Passing a shared mutable lifespan state dictionary directly to ASGI request scopes allows endpoints to overwrite shared state, causing cross-request data leaks (e.g. leaking authenticated user context) and multi-thread dictionary write contention under Python 3.14t.
+- **Negative example**:
+```python
+scope["state"] = self.lifespan_state  # Direct shared reference!
+```
+- **Correct approach**:
+```python
+scope["state"] = self.lifespan_state.copy()  # Per-request isolated shallow copy
+```
+
+**6. `asyncio.Transport` cross-thread write without event loop trampoline**:
+- **Trap**: Calling `transport.write()` from an OS thread other than the transport's own event loop corrupts internal `_SelectorSocketTransport` buffers and causes race conditions.
+- **Negative example**:
+```python
+# On Worker Thread B:
+transport.write(b"data")  # Thread-unsafe direct write!
+```
+- **Correct approach**:
+```python
+# On Worker Thread B:
+if cur_loop is not home_loop:
+    fut = asyncio.run_coroutine_threadsafe(ws.send(message), home_loop)
+    await asyncio.wrap_future(fut)
+```
 
 ---
 

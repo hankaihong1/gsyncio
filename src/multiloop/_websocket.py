@@ -24,6 +24,14 @@ _WS_MAGIC = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 _fast_websocket_unmask = _try_import_rust_class(
     "multiloop._multiloop_core", "fast_websocket_unmask"
 )
+_fast_websocket_unmask_slice = _try_import_rust_class(
+    "multiloop._multiloop_core", "fast_websocket_unmask_slice"
+)
+_FastWebSocketParser = _try_import_rust_class("multiloop._multiloop_core", "FastWebSocketParser")
+
+_MAX_WS_FRAME_SIZE = 16 * 1024 * 1024  # 16MB
+_MAX_WS_MESSAGE_SIZE = 32 * 1024 * 1024  # 32MB
+_CURSOR_COMPACT_THRESHOLD = 64 * 1024  # 64KB
 
 
 class WebSocketState(enum.Enum):
@@ -57,6 +65,7 @@ class WebSocketConnection:
         client_addr: tuple[str, int] | None,
         server_addr: tuple[str, int],
         http_version: str = "1.1",
+        lifespan_state: dict[str, Any] | None = None,
     ) -> None:
         self.app = app
         self.reader = reader
@@ -68,6 +77,7 @@ class WebSocketConnection:
         self.client_addr = client_addr
         self.server_addr = server_addr
         self.http_version = http_version
+        self.lifespan_state = lifespan_state or {}
 
         self.state = WebSocketState.CONNECTING
         self._home_loop = asyncio.get_running_loop()
@@ -81,8 +91,19 @@ class WebSocketConnection:
     async def run(self) -> None:
         """Run the full WebSocket connection lifecycle."""
         ws_key = self.headers_dict.get("sec-websocket-key", "")
+        ws_version = self.headers_dict.get("sec-websocket-version", "")
         if not ws_key:
             self.writer.write(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+            await self.writer.drain()
+            self.state = WebSocketState.CLOSED
+            return
+
+        if ws_version != "13":
+            self.writer.write(
+                b"HTTP/1.1 426 Upgrade Required\r\n"
+                b"Sec-WebSocket-Version: 13\r\n"
+                b"Content-Length: 0\r\n\r\n"
+            )
             await self.writer.drain()
             self.state = WebSocketState.CLOSED
             return
@@ -109,6 +130,7 @@ class WebSocketConnection:
             "client": self.client_addr or ("127.0.0.1", 0),
             "server": self.server_addr,
             "subprotocols": subprotocols,
+            "state": self.lifespan_state.copy(),
         }
 
         reader_task = self._home_loop.create_task(self._reader_loop())
@@ -125,12 +147,10 @@ class WebSocketConnection:
             self._inbound_channel.close()
 
     async def receive(self) -> dict[str, Any]:
-        """ASGI receive callback for WebSocket messages."""
-        cur_loop = asyncio.get_running_loop()
-        if cur_loop is not self._home_loop:
-            fut = asyncio.run_coroutine_threadsafe(self.receive(), self._home_loop)
-            return await asyncio.wrap_future(fut)
+        """ASGI receive callback for WebSocket messages.
 
+        Directly awaits the thread-safe Rust/Python channel without cross-loop dispatching.
+        """
         if not self._connect_sent:
             self._connect_sent = True
             return {"type": "websocket.connect"}
@@ -174,6 +194,19 @@ class WebSocketConnection:
                 payload = message["bytes"]
                 await self._send_frame(0x2, payload)
         elif m_type == "websocket.close":
+            if not self._handshake_done.is_set():
+                self.state = WebSocketState.CLOSED
+                self._closed_event.set()
+                self.writer.write(
+                    b"HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                )
+                try:
+                    await self.writer.drain()
+                except Exception:  # noqa: BLE001, S110
+                    pass
+                self.writer.close()
+                return
+
             self.state = WebSocketState.CLOSING
             code = message.get("code", 1000)
             reason = message.get("reason", "")
@@ -187,71 +220,256 @@ class WebSocketConnection:
             self.writer.close()
 
     async def _send_frame(self, opcode: int, payload: bytes) -> None:
-        """Send an RFC 6455 frame atomically."""
+        """Send an RFC 6455 frame atomically protected by send lock."""
+        header = bytearray()
+        header.append(0x80 | (opcode & 0x0F))
+        length = len(payload)
+        if length < 126:
+            header.append(length)
+        elif length <= 0xFFFF:
+            header.append(126)
+            header.extend(struct.pack("!H", length))
+        else:
+            header.append(127)
+            header.extend(struct.pack("!Q", length))
+        frame_data = bytes(header) + payload
+
         async with self._send_lock:
-            header = bytearray()
-            header.append(0x80 | (opcode & 0x0F))
-            length = len(payload)
-            if length < 126:
-                header.append(length)
-            elif length <= 0xFFFF:
-                header.append(126)
-                header.extend(struct.pack("!H", length))
-            else:
-                header.append(127)
-                header.extend(struct.pack("!Q", length))
-            self.writer.write(bytes(header) + payload)
-            await self.writer.drain()
+            self.writer.write(frame_data)
+            try:
+                await self.writer.drain()
+            except Exception:
+                pass
 
     async def _reader_loop(self) -> None:
-        """Background coroutine reading incoming RFC 6455 WebSocket frames."""
+        """Background coroutine reading incoming RFC 6455 WebSocket frames with continuation support."""
         await self._handshake_done.wait()
+        raw_buf = bytearray()
+        buf_cursor = 0
+        fragment_buffer = bytearray()
+        fragmented_opcode = 0
+
+        def compact_raw_buf() -> None:
+            nonlocal buf_cursor
+            if buf_cursor >= _CURSOR_COMPACT_THRESHOLD:
+                del raw_buf[:buf_cursor]
+                buf_cursor = 0
+
         try:
             while not self._closed_event.is_set():
-                head = await self.reader.readexactly(2)
-                b1, b2 = head[0], head[1]
-                opcode = b1 & 0x0F
-                masked = (b2 & 0x80) != 0
-                payload_len = b2 & 0x7F
+                if _FastWebSocketParser is not None:
+                    parsed = _FastWebSocketParser.parse_frame_header(
+                        memoryview(raw_buf)[buf_cursor:]
+                    )
+                    if parsed is None:
+                        chunk = await self.reader.read(4096)
+                        if not chunk:
+                            break
+                        raw_buf.extend(chunk)
+                        continue
 
-                if payload_len == 126:
-                    len_bytes = await self.reader.readexactly(2)
-                    payload_len = struct.unpack("!H", len_bytes)[0]
-                elif payload_len == 127:
-                    len_bytes = await self.reader.readexactly(8)
-                    payload_len = struct.unpack("!Q", len_bytes)[0]
+                    opcode, fin, masked, payload_len, mask_key, header_len = parsed
+                    # RFC 6455 §5.1: Client-to-server frames MUST be masked
+                    if not masked:
+                        await self._send_frame(0x8, struct.pack("!H", 1002) + b"Unmasked Frame")
+                        break
 
-                mask_key = b""
-                if masked:
+                    # RFC 6455 §5.5: Control frames must have payload <= 125 bytes and fin == True
+                    if opcode >= 0x8 and (payload_len > 125 or not fin):
+                        await self._send_frame(
+                            0x8, struct.pack("!H", 1002) + b"Invalid Control Frame"
+                        )
+                        break
+
+                    if payload_len > _MAX_WS_FRAME_SIZE:
+                        # RFC 6455 1009 (Message Too Big)
+                        await self._send_frame(0x8, struct.pack("!H", 1009) + b"Message Too Big")
+                        break
+
+                    total_frame_len = header_len + payload_len
+                    while len(raw_buf) - buf_cursor < total_frame_len:
+                        chunk = await self.reader.read(4096)
+                        if not chunk:
+                            break
+                        raw_buf.extend(chunk)
+                        if len(raw_buf) - buf_cursor < total_frame_len and self.reader.at_eof():
+                            break
+
+                    if len(raw_buf) - buf_cursor < total_frame_len:
+                        break
+
+                    if mask_key and len(mask_key) == 4:
+                        mask_bytes = bytes(mask_key)
+                        if _fast_websocket_unmask_slice is not None:
+                            payload = _fast_websocket_unmask_slice(
+                                raw_buf, buf_cursor + header_len, payload_len, mask_bytes
+                            )
+                        elif _fast_websocket_unmask is not None:
+                            raw_payload = bytes(
+                                raw_buf[buf_cursor + header_len : buf_cursor + total_frame_len]
+                            )
+                            payload = _fast_websocket_unmask(raw_payload, mask_bytes)
+                        else:
+                            raw_payload = bytes(
+                                raw_buf[buf_cursor + header_len : buf_cursor + total_frame_len]
+                            )
+                            payload = bytes(
+                                b ^ mask_bytes[i % 4] for i, b in enumerate(raw_payload)
+                            )
+                    else:
+                        payload = bytes(
+                            raw_buf[buf_cursor + header_len : buf_cursor + total_frame_len]
+                        )
+
+                    buf_cursor += total_frame_len
+                    compact_raw_buf()
+                else:
+                    head = await self.reader.readexactly(2)
+                    b1, b2 = head[0], head[1]
+                    fin = (b1 & 0x80) != 0
+                    opcode = b1 & 0x0F
+                    masked = (b2 & 0x80) != 0
+                    payload_len = b2 & 0x7F
+
+                    # RFC 6455 §5.1: Client-to-server frames MUST be masked
+                    if not masked:
+                        await self._send_frame(0x8, struct.pack("!H", 1002) + b"Unmasked Frame")
+                        break
+
+                    if payload_len == 126:
+                        len_bytes = await self.reader.readexactly(2)
+                        payload_len = struct.unpack("!H", len_bytes)[0]
+                    elif payload_len == 127:
+                        len_bytes = await self.reader.readexactly(8)
+                        payload_len = struct.unpack("!Q", len_bytes)[0]
+
+                    # RFC 6455 §5.5: Control frames must have payload <= 125 bytes and fin == True
+                    if opcode >= 0x8 and (payload_len > 125 or not fin):
+                        await self._send_frame(
+                            0x8, struct.pack("!H", 1002) + b"Invalid Control Frame"
+                        )
+                        break
+
+                    if payload_len > _MAX_WS_FRAME_SIZE:
+                        await self._send_frame(0x8, struct.pack("!H", 1009) + b"Message Too Big")
+                        break
+
                     mask_key = await self.reader.readexactly(4)
 
-                payload = await self.reader.readexactly(payload_len) if payload_len > 0 else b""
-                if masked and mask_key:
+                    raw_payload = (
+                        await self.reader.readexactly(payload_len) if payload_len > 0 else b""
+                    )
                     if _fast_websocket_unmask is not None and len(mask_key) == 4:
-                        payload = _fast_websocket_unmask(payload, mask_key)
+                        payload = _fast_websocket_unmask(raw_payload, mask_key)
                     else:
-                        payload = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
+                        payload = bytes(b ^ mask_key[i % 4] for i, b in enumerate(raw_payload))
 
-                if opcode == 0x1:  # Text
-                    await self._inbound_channel.send(
-                        {
-                            "type": "websocket.receive",
-                            "text": payload.decode("utf-8"),
-                            "bytes": None,
-                        }
-                    )
-                elif opcode == 0x2:  # Binary
-                    await self._inbound_channel.send(
-                        {"type": "websocket.receive", "bytes": payload, "text": None}
-                    )
+                # Process parsed frame
+                if opcode == 0x0:  # Continuation Frame (RFC 6455 §5.4)
+                    if fragmented_opcode == 0:
+                        # Unexpected continuation frame without leading data frame
+                        await self._send_frame(0x8, struct.pack("!H", 1002) + b"Protocol Error")
+                        break
+                    if len(fragment_buffer) + len(payload) > _MAX_WS_MESSAGE_SIZE:
+                        await self._send_frame(0x8, struct.pack("!H", 1009) + b"Message Too Big")
+                        await self._inbound_channel.send(
+                            {"type": "websocket.disconnect", "code": 1009}
+                        )
+                        self.state = WebSocketState.CLOSED
+                        self._closed_event.set()
+                        break
+                    fragment_buffer.extend(payload)
+                    if fin:
+                        complete_payload = bytes(fragment_buffer)
+                        fragment_buffer.clear()
+                        target_op = fragmented_opcode
+                        fragmented_opcode = 0
+                        if target_op == 0x1:
+                            try:
+                                text_msg = complete_payload.decode("utf-8")
+                            except UnicodeDecodeError:
+                                await self._send_frame(
+                                    0x8, struct.pack("!H", 1007) + b"Invalid UTF-8"
+                                )
+                                await self._inbound_channel.send(
+                                    {"type": "websocket.disconnect", "code": 1007}
+                                )
+                                self.state = WebSocketState.CLOSED
+                                self._closed_event.set()
+                                break
+                            await self._inbound_channel.send(
+                                {
+                                    "type": "websocket.receive",
+                                    "text": text_msg,
+                                    "bytes": None,
+                                }
+                            )
+                        elif target_op == 0x2:
+                            await self._inbound_channel.send(
+                                {
+                                    "type": "websocket.receive",
+                                    "bytes": complete_payload,
+                                    "text": None,
+                                }
+                            )
+                elif opcode in (0x1, 0x2):  # Text or Binary Frame
+                    if fragmented_opcode != 0:
+                        # New data frame arriving before previous fragmented frame finished
+                        await self._send_frame(0x8, struct.pack("!H", 1002) + b"Protocol Error")
+                        break
+                    if fin:
+                        if opcode == 0x1:
+                            try:
+                                text_msg = payload.decode("utf-8")
+                            except UnicodeDecodeError:
+                                await self._send_frame(
+                                    0x8, struct.pack("!H", 1007) + b"Invalid UTF-8"
+                                )
+                                await self._inbound_channel.send(
+                                    {"type": "websocket.disconnect", "code": 1007}
+                                )
+                                self.state = WebSocketState.CLOSED
+                                self._closed_event.set()
+                                break
+                            await self._inbound_channel.send(
+                                {
+                                    "type": "websocket.receive",
+                                    "text": text_msg,
+                                    "bytes": None,
+                                }
+                            )
+                        else:
+                            await self._inbound_channel.send(
+                                {
+                                    "type": "websocket.receive",
+                                    "bytes": payload,
+                                    "text": None,
+                                }
+                            )
+                    else:
+                        if len(payload) > _MAX_WS_MESSAGE_SIZE:
+                            await self._send_frame(
+                                0x8, struct.pack("!H", 1009) + b"Message Too Big"
+                            )
+                            await self._inbound_channel.send(
+                                {"type": "websocket.disconnect", "code": 1009}
+                            )
+                            self.state = WebSocketState.CLOSED
+                            self._closed_event.set()
+                            break
+                        fragmented_opcode = opcode
+                        fragment_buffer.clear()
+                        fragment_buffer.extend(payload)
                 elif opcode == 0x9:  # Ping -> Pong
                     await self._send_frame(0xA, payload)
-                elif opcode == 0x8:  # Close
+                elif opcode == 0x8:  # Close Frame
                     code = struct.unpack("!H", payload[:2])[0] if len(payload) >= 2 else 1000
-                    try:
-                        await self._send_frame(0x8, payload)
-                    except Exception:  # noqa: BLE001, S110
-                        pass
+                    if self.state != WebSocketState.CLOSING:
+                        self.state = WebSocketState.CLOSING
+                        try:
+                            await self._send_frame(0x8, payload)
+                        except Exception:  # noqa: BLE001, S110
+                            pass
                     await self._inbound_channel.send({"type": "websocket.disconnect", "code": code})
                     self.state = WebSocketState.CLOSED
                     self._closed_event.set()

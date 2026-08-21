@@ -43,7 +43,7 @@ multiloop/
 │   │   ├── _sync.py          # Lock, Semaphore, Event, Condition, Barrier
 │   │   ├── _taskgroup.py     # TaskGroup, TaskHandle
 │   │   ├── rwlock.py         # AsyncRWMutex (async read-write lock, Rust-backed)
-│   │   ├── asgi.py           # MultiloopASGIWorker (ASGI 3.0, Lifespan, WebSockets, H2)
+│   │   ├── asgi.py           # MultiloopASGIWorker (ASGI 3.0, Lifespan, WebSockets)
 │   │   ├── _http11.py        # Http11Protocol (Rust SIMD httparse & fused TCP write)
 │   │   ├── _websocket.py     # WebSocketProtocol (Rust SIMD unmasking & RFC 6455)
 │   │   ├── _lifespan.py      # ASGILifespanManager (ASGI lifespan state machine)
@@ -64,10 +64,9 @@ multiloop/
 │   ├── waitgroup.rs          # RawAsyncWaitGroup & WaitGroupInner
 │   ├── rwlock.rs             # RawAsyncRWMutex (64-bit atomic state machine)
 │   ├── websocket.rs          # FastWebSocketParser & SIMD fast_websocket_unmask
-│   ├── http.rs               # FastHttpParser (SIMD httparse & zero-alloc ASGI assembly)
-│   └── h2.rs                 # PyH2Bridge, serve_h2_connection (Tokio H2 Runtime)
+│   └── http.rs               # FastHttpParser (SIMD httparse & zero-alloc ASGI assembly)
 ├── tests/                    # 27 test files (pytest + pytest-asyncio)
-├── benchmarks/               # 4 benchmark scripts
+├── benchmarks/               # 5 benchmark scripts (including bench_wrk_asgi.py)
 ├── examples/                 # Runnable examples (python examples/00_*.py)
 ├── docs/
 │   ├── API.md                # Complete API reference
@@ -270,9 +269,9 @@ pops so no single worker greedily drains the global queue.
 | `AtomicMetrics` | `src/metrics.rs` | `std::sync::atomic` | 64-byte-padded per-worker counters (`active`, `completed`, `global_pull_count`, `park_count`, etc.) — prevents false sharing |
 | `RawAsyncWaitGroup` | `src/waitgroup.rs` | parking_lot `Mutex<WaitGroupInner>` | Go-style atomic counter + generation + waiter list with single-mutex state machine |
 | `RawAsyncRWMutex` | `src/rwlock.rs` | parking_lot `Mutex<RWMutexInner>` | 64-bit atomic state machine, writer-preference async read-write lock with cancellation cleanup |
-| `FastHttpParser` | `src/http.rs` | httparse | SIMD zero-copy HTTP/1.x header parser with zero-alloc ASGI PyList direct assembly & interned methods |
-| `FastWebSocketParser` & `fast_websocket_unmask` | `src/websocket.rs` | PyO3 | SIMD 64-bit chunked XOR frame unmasking and zero-copy RFC 6455 frame header parsing |
-| `PyH2Bridge` & `serve_h2_connection` | `src/h2.rs` | tokio + h2 | Tokio HTTP/2 async multiplexing runtime bridge |
+| `FastHttpConnection` | `src/http.rs` | httparse + PyO3 | Stateful HTTP/1.1 & WebSocket connection state machine, RFC 9112 chunk parser, request smuggling defense & zero-alloc response serializer |
+| `FastHttpParser` | `src/http.rs` | httparse | SIMD zero-copy HTTP/1.x header parser with 22 interned headers, zero-alloc path/value interning & PyBuffer zero-copy |
+| `FastWebSocketParser` & `fast_websocket_unmask` | `src/websocket.rs` | PyO3 | 32-byte 4-way SIMD vectorization unmasking, Option<[u8; 4]> allocation-free mask parsing, and RFC 6455 frame header parsing |
 
 ### Python-side patterns
 
@@ -291,7 +290,7 @@ pops so no single worker greedily drains the global queue.
   while re-acquiring the lock after being notified, it automatically forwards
   the notification to the next waiter to conserve notification tokens.
 
-### Nine non-obvious design decisions
+### Thirteen non-obvious design decisions
 
 These are the places where a change that looks like a simplification usually
 breaks a real correctness or performance property. **Read each before modifying
@@ -345,14 +344,40 @@ the related code.**
    severe worker starvation and degrading multi-core throughput to single-worker limits (~50k QPS).
    `server.py` restricts `SO_REUSEPORT` to Linux only; on macOS/Darwin, workers share a single
    listening socket and race concurrently on `loop.sock_accept(shared_sock)`, guaranteeing
-   perfect 25% load distribution and ~91k+ multi-core QPS.
+   perfect 25% load distribution and ~96k+ multi-core QPS.
 
-9. **Python 3.14t Free-Threaded memory safety via `PyBytes::new_with`** (`src/websocket.rs:80-110`):
+9. **Python 3.14t Free-Threaded memory safety via `PyBytes::new_with`** (`src/websocket.rs:80-110`, `src/http.rs`):
    Under Python 3.14t (No-GIL), modifying Python buffer objects in-place across threads
    causes data races and invalidates Python's immutability invariant. Rust SIMD extensions must
    allocate Python objects through atomic single-pass constructors like
-   `PyBytes::new_with(py, len, |buf| ...)` to populate unmasked payload bytes without
-   intermediate copies or in-place mutations.
+   `PyBytes::new_with(py, len, |buf| ...)` to populate unmasked payload bytes and serialized
+   HTTP responses without intermediate copies or in-place mutations.
+
+10. **Unified Protocol Calculator (Rust) & Pure Transport Messenger (Python)** (`src/http.rs`, `_http11.py`):
+    `multiloop` strictly unifies HTTP/1.1 and WebSocket processing by eliminating parsing brain-split.
+    Rust `FastHttpConnection` owns 100% of protocol computation: SIMD header parsing, RFC 9112 chunked
+    streaming decoding with trailer verification, request smuggling defense (CL-TE/TE-TE rejection),
+    zero-allocation response wire serialization, and WebSocket frame fusion. Python `Http11Protocol` acts
+    purely as an asynchronous transport messenger (~380 lines), driving socket I/O, managing `_body_queue`
+    backpressure with `pump_events()` residue draining, and dispatching ASGI 3.0 coroutines.
+
+11. **Worker EventLoop Network Disconnection Exception Filtering** (`src/multiloop/pool.py:230-240`):
+    During high-concurrency client disconnects or abrupt socket termination, background transport socket
+    buffer flushes in `_SelectorSocketTransport` trigger `BrokenPipeError`, `ConnectionResetError`, or
+    `ConnectionAbortedError` without an active awaiter. Custom loop exception handler intercepts and suppresses
+    these normal network disconnection events, preventing unretrieved Future logs while keeping unexpected
+    runtime bugs intact.
+
+12. **Multi-Thread `server.close()` Task Set Snapshot Isolation** (`src/multiloop/server.py:290-305`):
+    Under Python 3.14t true physical multi-core execution, multiple worker threads concurrently finish
+    requests and discard tasks from `self._worker_conn_tasks` while `server.close()` iterates over them.
+    `server.py` snapshots task collections with `list(tasks)` and `list(self._worker_conn_tasks.values())`
+    to prevent `RuntimeError: Set changed size during iteration`.
+
+13. **ASGI Lifespan State Isolation via `.copy()`** (`src/multiloop/_http11.py:170`, `src/multiloop/_websocket.py:133`):
+    To conform to the ASGI 3.0 specification and prevent cross-request context pollution (e.g. `request.state.user_id`
+    leaking between users) and multi-core dictionary write contention under Python 3.14t, `scope["state"]` is
+    instantiated via `self.lifespan_state.copy()`.
 
 ---
 

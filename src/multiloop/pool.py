@@ -227,6 +227,13 @@ class EventLoopThreadPool:
                         self._idle_workers.discard(index)
 
     def _worker(self, index: int, loop: asyncio.AbstractEventLoop) -> None:
+        def _exception_handler(_loop: asyncio.AbstractEventLoop, context: dict[str, Any]) -> None:
+            exc = context.get("exception")
+            if isinstance(exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)):
+                return
+            _loop.default_exception_handler(context)
+
+        loop.set_exception_handler(_exception_handler)
         asyncio.set_event_loop(loop)
         notify_event = asyncio.Event()
         with self._lock:

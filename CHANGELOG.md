@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.2] - 2026-08-21
+
+### Added & Optimized
+- **wrk High-Concurrency Multi-Core Benchmark Suite (`benchmarks/bench_wrk_asgi.py`)**:
+  - Production-grade wrk benchmark suite for physical multi-core scaling under Python 3.14t No-GIL.
+  - Achieves **151,366+ QPS** (4-Worker) on `/api/plaintext` and **145,836+ QPS** on `/api/ping` with sub-millisecond latency (0.29ms avg).
+- **Rust SIMD HTTP Sliced Streaming & Zero-Allocation Fast-Path (`src/http.rs`, `src/multiloop/_http11.py`)**:
+  - `FastHttpConnection` streaming body sliced event dispatch (`ReceivingContentLength`) eliminating cursor rewind and $O(N^2)$ header re-parsing on split TCP packets.
+  - $O(1)$ buffer compaction via `compact_buffer` clearing on cursor drain without memory copies.
+  - Fast-path for zero-body GET/HEAD requests with module-level singleton `_EMPTY_BODY_MSG`, completely eliminating `asyncio.Queue` heap allocation and event loop dispatch overhead.
+- **ASGI Transport Backpressure & Pipelining Concurrency Protection (`src/multiloop/_http11.py`, `src/multiloop/_websocket.py`)**:
+  - Physical write backpressure flow control (`_drain_event`) in `Http11Protocol.send()` eliminating server OOM under slow clients.
+  - Serial HTTP Pipelining request queueing (`_pending_pipeline_events`) guaranteeing strictly ordered, non-interleaved TCP responses.
+  - RFC 6455 WebSocket thread-safe send frame lock synchronization (`_send_lock`), eliminating `RuntimeError: concurrent drain calls` on high-concurrency data/control frame writes.
+- **WSGI True Streaming Channel & Client Disconnect Decoupling (`src/multiloop/wsgi.py`)**:
+  - `SyncStreamReader` backed by lock-free cross-thread `Channel(maxsize=16)`, eliminating the 10MB pre-buffering requirement and enabling true streaming request body consumption.
+  - Automatic channel closure and feeder cancellation upon client disconnection, preventing orphaned synchronous WSGI worker tasks from occupying the thread pool.
+- **No-GIL Task Collection Thread Safety & Adaptive CLI Watcher (`src/multiloop/server.py`, `src/multiloop/cli.py`)**:
+  - `ConnectionPinningServer` multi-worker task collection mutex protection (`_tasks_lock`), eliminating `RuntimeError: Set changed size during iteration` during `server.close()` under Python 3.14t physical multi-core execution.
+  - CLI file watcher with extended ignored directories and adaptive smooth polling backoff (0.3s~0.8s), reducing idle CPU usage while maintaining fast hot-reload responsiveness.
+
 ## [0.1.1] - 2026-08-18
 
 ### Added & Optimized

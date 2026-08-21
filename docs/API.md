@@ -45,6 +45,7 @@ Complete API documentation for `multiloop`: a multi-event-loop engine and concur
 - [Networking & ASGI Workers](#networking--asgi-workers)
   - [`ConnectionPinningServer`](#connectionpinningserver)
   - [`MultiloopASGIWorker`](#multiloopasgiworker)
+  - [`MultiloopWSGIWorker`](#multiloopwsgiworker)
 - [Exceptions](#exceptions)
   - [`MultiloopError`](#multilooperror)
   - [`ChannelClosedError`](#channelclosederror)
@@ -867,7 +868,7 @@ async with ConnectionPinningServer(pool, host="127.0.0.1", port=8080) as server:
 
 ### `MultiloopASGIWorker`
 
-Mounts FastAPI / Starlette / ASGI 3.0 applications directly onto `EventLoopThreadPool`. Supports HTTP/1.1 chunked streaming, RFC 6455 Full-Duplex WebSockets, and RFC 9113 HTTP/2.0 binary frame multiplexing over single TCP connections.
+Mounts FastAPI / Starlette / ASGI 3.0 applications directly onto `EventLoopThreadPool`. Supports HTTP/1.1 chunked streaming, RFC 6455 Full-Duplex WebSockets, and Keep-Alive multiplexing over single TCP connections.
 
 ```python
 from fastapi import FastAPI
@@ -879,9 +880,7 @@ app = FastAPI()
 async def main():
     async with EventLoopThreadPool(num_threads=4) as pool:
         async with MultiloopASGIWorker(app, pool, port=8000):
-            print(
-                "FastAPI (HTTP/1.1, HTTP/2, WebSocket) running on multi-threaded multiloop pool..."
-            )
+            print("FastAPI (HTTP/1.1, WebSocket) running on multi-threaded multiloop pool...")
             await asyncio.sleep(3600)
 ```
 
